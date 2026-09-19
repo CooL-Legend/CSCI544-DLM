@@ -42,6 +42,8 @@ def format_prompt(puzzle):
 
 {board}
 
+Fill every empty cell while preserving all given numbers.
+
 Return ONLY the completed Sudoku as exactly 81 digits.
-Do not include explanation or formatting.
+Do not include spaces, explanations, labels, or any other text.
 """
