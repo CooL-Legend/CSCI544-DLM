@@ -1,0 +1,28 @@
+.env
+# Python and development environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ipynb_checkpoints/
+.vscode/
+.DS_Store
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+
+# Downloaded data, model weights, caches, and experiment outputs
+.cache/
+.firecrawl/
+models/
+data/
+results/
+*.safetensors
+*.pt
+*.pth
+*.bin
+*.arrow
+*.parquet

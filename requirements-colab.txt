@@ -1,0 +1,9 @@
+# Keep Colab's preinstalled CUDA-enabled PyTorch.
+# The LLaDA upstream repository specifies Transformers 4.38.2.
+transformers==4.38.2
+huggingface-hub>=0.25.0,<1.0
+datasets==5.0.1
+accelerate==1.12.0
+safetensors>=0.4.2,<1.0
+numpy>=1.26,<3.0
+PyYAML>=6.0,<7.0
