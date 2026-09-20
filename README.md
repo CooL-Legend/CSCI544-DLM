@@ -1,159 +1,158 @@
 # CSCI544-DLM
 
-Evaluate **LLaDA-8B-Instruct** on Sudoku puzzles for CSCI 544 Applied NLP. Develop locally, run model inference on **Google Colab Pro**, and keep model weights and experiment results in **Google Drive**.
+Evaluate **LLaDA-8B-Instruct** and **iLLaDA-8B-Instruct** on Sudoku for CSCI 544 Applied NLP. Develop locally, run inference on **Google Colab Pro**, and keep model weights and experiment artifacts in **Google Drive**.
 
-[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/CooL-Legend/CSCI544-DLM/blob/main/notebooks/LLaDA_Sudoku_Colab.ipynb)
+| Model | Notebook on `adi` | Dependency profile |
+| --- | --- | --- |
+| LLaDA | [Open LLaDA in Colab](https://colab.research.google.com/github/CooL-Legend/CSCI544-DLM/blob/adi/notebooks/LLaDA_Sudoku_Colab.ipynb) | Transformers 4.38.2 |
+| iLLaDA | [Open iLLaDA in Colab](https://colab.research.google.com/github/CooL-Legend/CSCI544-DLM/blob/adi/notebooks/iLLaDA_Sudoku_Colab.ipynb) | Transformers 4.57.1, Tokenizers 0.22.2, Hugging Face Hub 0.36.2 |
 
-This is a private repository. Sign in to GitHub and authorize Colab to read private repositories when opening the notebook. If that route is unavailable, download `notebooks/LLaDA_Sudoku_Colab.ipynb` and use **File → Upload notebook** in Colab.
+This repository is private. Authorize Colab to read it through GitHub, or download the desired notebook and use **File → Upload notebook**. An older notebook copy saved in Drive does not automatically receive repository changes. Both notebooks check out `adi` and display its commit before running.
 
 ## Run on Colab Pro
 
-1. Open the notebook using the badge above and save a working copy in Drive if desired.
-2. Choose **Runtime → Change runtime type → GPU → L4 or A100**, subject to availability. A T4 does not have enough memory headroom for this unquantized setup. Additional system RAM can help during model loading.
-3. Give the clone cell read access to this private repository. Create a fine-grained GitHub token scoped to this repository with **Contents: read-only**. Add it to Colab's **Secrets** as `GITHUB_TOKEN` and grant this notebook access, or use the cell's hidden prompt. Do not paste a token into notebook source or a repository URL.
-4. Run notebook steps **1–5** in order to get the code, install dependencies, mount Drive, prepare the configuration, and cache the model. Approve the Google Drive mount when Colab asks.
-5. **Verify one puzzle:** keep `NUM_SAMPLES = 1`, run step **6**, and inspect the metrics, raw response, and chart in step **7**. `status: completed` means the run finished; it does not mean the puzzle was solved.
-6. **Compare generation lengths:** run step **8**. It evaluates the same first **three puzzles** at **128 and 256 tokens**, with the prompt, **128 sampling steps**, **32-token blocks**, model, temperature, and remasking settings held fixed. The model loads once for both runs. This comparison always uses three puzzles, regardless of `NUM_SAMPLES`.
-7. **Inspect saved results:** step **9** displays the comparison table and all six raw responses/charts. Review completion, clue preservation, Sudoku validity, exact accuracy, and cell accuracy together. Check each run's saved configuration and predictions. More generated tokens do not guarantee a correct Sudoku solution.
-8. **Scale only after review:** if appropriate, change `NUM_SAMPLES` to 10 or 100 in step **3**, rerun configuration step **4**, then evaluation and inspection steps **6–7**. To change the generation length for this larger run, edit `config["generation"]["gen_length"]` in step **4** before it writes `RUN_CONFIG`. The three-puzzle comparison is a diagnostic, not a reliable benchmark.
+1. Open the notebook for the model you want. Select **Runtime → Change runtime type → GPU → L4 or A100**, subject to availability. The notebooks check BF16 support and GPU memory before loading unquantized weights.
+2. Give the clone cell read access to the private repository: use a fine-grained GitHub token with **Contents: read** access, stored in Colab **Secrets** as `GITHUB_TOKEN`, or use the hidden prompt. Do not paste tokens into notebook source or Git URLs.
+3. Run steps **1–5** to get `adi`, install the selected model's dependencies, mount Drive, load the base configuration, and download/stage the model. A clean checkout can switch to `adi`; local modifications or divergent commits stop the update without discarding work.
+4. In **Config Updater**, set `NUM_SAMPLES = 1` for the first verification. It writes the actual configuration and checks the dataset. The first dataset preparation can process the million-row CSV before selecting your slice.
+5. Run **step 6**, then inspect all saved predictions and plots in **step 7**. `status: completed` means inference and artifact saving finished, not that the puzzles were solved.
+6. Set `NUM_SAMPLES = 3`, rerun **Config Updater**, and rerun **steps 6–7** for the configured experiment. Defaults preserve the `adi` notebook's generation length **256**, **256 steps**, **128-token blocks**, temperature **0.0**, and **low_confidence** remasking.
+7. Check cache reuse by rerunning **step 5** and then evaluation. Unchanged weight files are reused; each evaluation creates a new experiment timestamp. Inspect Sudoku validity and clue preservation before increasing to 10 or 100 puzzles.
 
-Open the updated notebook from GitHub (or upload the updated file) to get these new cells; an older copy saved in Drive does not automatically receive notebook edits. All committed cell outputs and execution counts are cleared. The verification inspection selects the run just created, and the comparison table reads its explicitly named folder, so neither silently falls back to an older run.
+Change generation settings in **Config Updater** before rerunning evaluation. The displayed configuration name is derived from those settings. The removed length-comparison cells are not reintroduced.
 
-The notebook installs the project dependencies while keeping Colab's CUDA-enabled PyTorch. It runs evaluation in a fresh Python process, so updated packages are used without keeping old model objects in the notebook kernel.
+Each evaluation uses a fresh Python process and loads the model once. If you switch model notebooks in the same runtime, rerun the selected notebook's dependency installation cell first. Inference sees the freshly installed packages; the notebook kernel does not load either 8B model. Keep Colab's CUDA-enabled PyTorch.
 
-### Persistent files
+## Drive layout and artifacts
 
 ```text
 MyDrive/CSCI544-DLM/
-├── models/LLaDA-8B-Instruct/  # tokenizer, configuration, code, and weight shards
-├── cache/                   # dataset download/preparation cache
-├── results/<run timestamp>/
-│   ├── config.json
-│   ├── predictions.jsonl
-│   └── metrics.json
-└── comparisons/<comparison timestamp>/
-    ├── puzzles.json          # same three inputs for both runs
-    ├── comparison.json       # status, metrics, and exact result paths
-    ├── comparison.csv        # comparison table
-    ├── length-128/<run timestamp>/  # config, predictions, metrics
-    └── length-256/<run timestamp>/  # config, predictions, metrics
+├── models/
+│   ├── LLaDA-8B-Instruct/
+│   └── iLLaDA-8B-Instruct/
+├── cache/
+│   ├── hub/
+│   └── datasets/
+├── LLaDA/Sudoku/
+│   └── gen256-steps256-blk128-temp0-lowconf/
+│       └── 20:09:26:14:35:07/
+│           ├── config.json
+│           ├── metrics.json
+│           ├── predictions.jsonl
+│           └── plots/
+│               ├── puzzle_000.png
+│               ├── puzzle_001.png
+│               └── puzzle_002.png
+└── iLLaDA/Sudoku/
+    └── gen256-steps256-blk128-temp0-lowconf/
+        └── 20:09:26:14:35:07/  # same artifact structure
 ```
 
-Allow at least **20 GB of free Drive storage** for the model and dataset, with extra room for results. Colab Pro compute and Google Drive storage are separate allowances.
+The naming pattern is `gen<length>-steps<steps>-blk<block>-temp<temperature>-<remasking>`, with `low_confidence` shortened to `lowconf`. Timestamps use **DD:MM:YY:HH:mm:SS**, including minutes, in **America/Los_Angeles** by default. Set `EXPERIMENT_TIMEZONE` in the mount cell before loading the configuration to change the timezone. Same-second collisions receive `-02`, `-03`, etc.; existing runs are never overwritten. Inspection follows the exact directory returned by that invocation, not alphabetical timestamp order.
 
-The first model download writes approximately 16 GB to Drive. Later sessions check Hugging Face's metadata and reuse the same fixed snapshot. Keep the hidden `.cache/huggingface` directory inside the model folder. The snapshot revision is recorded in `scripts/cache_model.py` and in notebook run metadata.
+Every processed prediction is appended to `predictions.jsonl`; its record includes the puzzle, reference, unchanged raw response, parsed answer, validation flags, scores, and relative `plot_file`. PNGs are saved automatically during evaluation, including invalid and incomplete outputs. The notebook displays those same saved images, with your puzzle-index titles. Saving plots does not depend on running the display cell.
 
-By default, the notebook copies the model files from Drive to the runtime's `/content/models` directory before loading. This takes time each fresh session but avoids repeated weight reads from mounted Drive during subsequent model loads. Set `COPY_MODEL_TO_RUNTIME = False` to load directly from the Drive copy instead. This does **not** reduce GPU memory requirements: the weights still load onto the GPU once for each evaluation invocation. Runtime disk copies disappear when Colab deletes the VM; the Drive copy remains.
+`config.json` records the resolved settings, actual sample count, model identity/revision, Git commit, experiment name, timezone, and local/UTC start times. `metrics.json` updates after each prediction and saved plot; `plots_saved` reports progress. The run becomes `completed` only after every expected plot is saved. Interrupted runs retain completed artifacts and remain `running`; rerunning creates another folder rather than resuming.
 
-## Local setup
+This layout applies to **new runs only**. Older Drive result folders and existing LLaDA model files are not moved or deleted.
 
-From the repository root, create a Python 3.11 environment:
+## Persistent model caching
+
+Allow at least **20 GB of free Drive storage per model snapshot**, with extra space for the shared dataset cache and experiment artifacts. Keeping both models requires storage for both snapshots. Colab Pro compute and Drive storage are separate allowances.
+
+Each notebook downloads its model to a separate persistent directory. Downloads are pinned to:
+
+- LLaDA: `08b83a6feb34df1a6011b80c3c00c7563e963b07`
+- iLLaDA: `5769f049224b2cff61106ebce0429ede5deeb434`
+
+The downloader includes tokenizer files, chat templates (including `.jinja`), configuration, Python model code, and the safetensors shards listed in the checkpoint's index. It checks the selected model family and snapshot identity. Keep the hidden `.cache/huggingface` directory for download reuse. Interrupted downloads can be rerun.
+
+By default, model files are staged to `/content/models/<model-name>` for faster subsequent loads in the same session. Unchanged runtime files are skipped; incomplete copies are repaired. `COPY_MODEL_TO_RUNTIME = False` loads directly from Drive. Runtime files disappear when Colab discards its VM; Drive files remain. This copying choice does not reduce GPU memory requirements.
+
+## Configuration and inference
+
+LLaDA uses `configs/sudoku.yaml`; iLLaDA uses `configs/illada_sudoku.yaml`. Both expose the same generation settings. The shared loader accepts `model.family: llada` or `illada`; older configurations without `family` default to LLaDA.
+
+The iLLaDA tokenizer needs the newer dependency profile and its own chat template. The wrapper uses mask token **5** for iLLaDA and **126336** for LLaDA. Both use the same **fixed-length masked sampler**, single-puzzle inference, and unchanged Sudoku prompt. iLLaDA's optional variable-length decoding is not enabled. Sudoku rules only validate model responses; no solver fills, repairs, or replaces them.
+
+- `gen_length`: output token positions, excluding the prompt.
+- `steps`: total denoising iterations.
+- `block_length`: token positions per block.
+- `temperature`: token-sampling randomness; zero uses no sampling noise.
+- `remasking`: `low_confidence` or `random` position selection.
+
+Generation length must divide into whole blocks. Steps must be positive, no greater than generation length, and divisible by the number of blocks. Increasing output length or steps does not guarantee correct Sudoku answers.
+
+`experiment_root` selects the directory above `<model>/Sudoku/<config-name>`. Local runs default to the repository's ignored `results/` directory; Colab sets this to `MyDrive/CSCI544-DLM`. Legacy configurations containing only `output_dir` still treat that directory as the experiment parent. The explicit `--output-dir` CLI override also bypasses model/dataset grouping.
+
+## Scores and plots
+
+All rates use **processed puzzles**, including incomplete responses, as the denominator:
+
+- **Exact accuracy:** fraction matching the reference solution in all 81 cells.
+- **Cell accuracy:** matching cells divided by `81 × processed puzzles`. Unparseable outputs receive zero matching cells.
+- **Completion rate:** fraction with a parsed 81-digit answer.
+- **Clue-preservation rate:** fraction whose parsed answer preserves every given clue.
+- **Sudoku-validity rate:** fraction whose parsed answer contains digits 1–9 exactly once in each row, column, and 3×3 box. This is independent of clue preservation.
+
+The parser accepts exactly 81 digits in 1–9 after removing whitespace, or a standalone contiguous 81-digit answer embedded in text. It does not truncate excess digits or pad missing ones. Raw outputs are retained. The dataset loads `puzzle` and `solution` as strings, preventing integer overflow and preserving leading zeros.
+
+Incomplete numeric lines remain at their original row positions in the plot. Eight rows of eight digits are labeled **Incomplete: 64/81 digits**, with the ninth row and column blank. Layouts that cannot be represented without reshaping appear as raw text. Complete invalid grids are flagged; red digits conflict with given clues.
+
+## Local commands
+
+Use separate Python environments for the two dependency profiles. For the existing LLaDA environment:
 
 ```bash
 conda env create -f environment.yaml
 conda activate diff-dev
-```
-
-If `diff-dev` already exists, install the project packages inside it instead of creating another environment:
-
-```bash
-conda activate diff-dev
+# Or, inside an existing environment:
 python -m pip install -r requirements.txt -r requirements-dev.txt
 ```
 
-The project uses `transformers==4.38.2`, matching upstream LLaDA's instructions. This may downgrade a newer Transformers installation; use an isolated environment. For an NVIDIA machine, ensure its PyTorch installation includes CUDA support.
+For iLLaDA, in a separate Python 3.11 environment with suitable PyTorch installed:
 
-Check data loading on a Mac or other CPU machine without downloading model weights:
+```bash
+python -m pip install -r requirements-illada-colab.txt -r requirements-dev.txt
+```
+
+Dataset-only checks need no model weights or GPU:
 
 ```bash
 python Llada-Sudoku/run_sudoku.py --dataset-only --num-samples 1
+python Llada-Sudoku/run_illada_sudoku.py --dataset-only --num-samples 1
 ```
 
-Run inference on a suitable CUDA GPU:
+Download iLLaDA and evaluate it on a suitable CUDA GPU:
 
 ```bash
-python Llada-Sudoku/run_sudoku.py --config configs/sudoku.yaml --num-samples 100
+python scripts/cache_model.py --model illada --drive-dir /path/to/models/iLLaDA-8B-Instruct
+python Llada-Sudoku/run_illada_sudoku.py \
+  --model-path /path/to/models/iLLaDA-8B-Instruct \
+  --local-files-only --num-samples 3
 ```
 
-The current model setup targets NVIDIA CUDA. Apple MPS inference has not been configured or tested. CPU checks and data preparation work independently of model inference.
+Use `--model llada` and `run_sudoku.py` for LLaDA. The downloader defaults to LLaDA when `--model` is omitted. Add `--runtime-dir` to stage downloaded files locally. `--local-files-only` applies to model loading; uncached datasets can still require network access. Apple MPS inference is not configured.
 
-### Use an existing model directory
-
-Download the complete model once to a persistent directory:
-
-```bash
-python scripts/cache_model.py --drive-dir /path/to/persistent/LLaDA-8B-Instruct
-```
-
-Run with that local copy:
-
-```bash
-python Llada-Sudoku/run_sudoku.py \
-  --model-path /path/to/persistent/LLaDA-8B-Instruct \
-  --local-files-only \
-  --num-samples 10
-```
-
-`--local-files-only` applies to model loading. Dataset loading may still need network access unless its files are already cached.
-
-## Configuration and outputs
-
-Edit `configs/sudoku.yaml` to set the number of puzzles, model directory, device, precision, generation parameters, and output directory. Command-line overrides include `--num-samples`, `--model-path`, and `--output-dir`. Run `python Llada-Sudoku/run_sudoku.py --help` for all options.
-
-Defaults are one puzzle, BF16, batch size one, 128 generation tokens, 128 sampling steps, 32-token blocks, and temperature zero. The generation length must be divisible by block length; the sampling steps must be divisible by the number of blocks and no greater than the generation length.
-
-Each run creates a new timestamped folder. The configuration is saved before evaluation. Each completed puzzle adds a JSON line containing its board, target, raw model output, extracted prediction, digit count, scores, and `parse_success`, `clues_preserved`, and `valid_sudoku` flags. Metrics update after every puzzle and show `status: completed` only after the loop finishes. Interrupted runs keep completed records and remain marked `running`; rerunning starts a new run rather than automatically resuming. Comparison summaries update after each completed length, preserving the first run if the second is interrupted.
-
-- **Exact accuracy:** fraction of predictions matching all 81 digits of the reference solution.
-- **Cell accuracy:** matching cells divided by 81 times the number of processed puzzles. Unparseable responses count as zero correct cells, retaining the existing scoring definition.
-- **Completion rate** (`completion_rate`): fraction of processed responses with a complete parsed 81-digit answer. Completion does not imply correctness.
-- **Clue-preservation rate** (`clue_preservation_rate`): fraction of processed responses whose parsed answer preserves every given clue.
-- **Sudoku-validity rate** (`sudoku_validity_rate`): fraction of processed responses whose parsed answer has digits 1–9 exactly once in every row, column, and 3×3 box. This checks Sudoku structure independently of the clues; a valid grid for a different puzzle can still fail clue preservation.
-
-All rates use **processed puzzles**, including incomplete answers, as the denominator. The parser accepts exactly 81 digits in the range 1–9 after removing whitespace, or a standalone contiguous 81-digit answer embedded in text. It does not truncate excess digits or pad missing ones. Failed parsing produces an empty `prediction`, zero matching cells, and false validation flags. Raw responses are always retained.
-
-The chart preserves incomplete numeric lines in their original row positions. For example, eight rows of eight digits appear as eight rows of eight, with the ninth column and ninth row blank and the label **“Incomplete: 64/81 digits”**. Complete parsed grids are visibly flagged when they conflict with clues or break Sudoku rules. Responses whose layout cannot fit in nine rows of nine columns appear as raw text rather than being reshaped. Red digits indicate clue conflicts at the displayed positions.
-
-This remains **LLaDA-only evaluation**: Sudoku rules report validity; no solver repairs, fills, or replaces model answers.
-
-To run the same fixed three-puzzle comparison outside the notebook, use a configuration pointing to your model and dataset cache:
-
-```bash
-python Llada-Sudoku/compare_generation.py --config /path/to/sudoku-run.yaml
-```
-
-The default comparison destination is `results/comparisons/<timestamp>` in the repository. Use `--output-dir /path/to/new/comparison` to choose a new folder. The notebook sets this to a timestamped folder on Drive.
-
-The dataset uses explicit string features for `puzzle` and `solution`. This prevents integer overflow and preserves leading zeros. Even `--num-samples 1` can prepare all one million CSV rows on the first load before selecting the requested slice.
-
-## Repository layout
-
-```text
-Llada-Sudoku/                  # model wrapper, sampler, dataset, evaluation CLI
-notebooks/LLaDA_Sudoku_Colab.ipynb
-configs/sudoku.yaml           # experiment settings
-scripts/cache_model.py        # persistent download and optional runtime copy
-tests/                       # CPU checks without real model downloads
-environment.yaml             # Python 3.11 Conda environment
-requirements*.txt             # local, Colab, and development dependencies
-.github/workflows/checks.yaml # GitHub Actions checks
-THIRD_PARTY_NOTICES.md        # upstream sampler attribution
-```
-
-Model weights, datasets, tokens, local environments, and generated results are excluded from Git. Keep the full model and dataset outside the repository or in ignored directories.
+The earlier `compare_generation.py` CLI remains available for the fixed 128/256-token comparison; it is not part of the current notebooks and uses its explicitly selected comparison directory.
 
 ## Validation
+
+Run in each dependency environment:
 
 ```bash
 python -m pytest -q
 ```
 
-GitHub Actions runs CPU checks for CSV string handling, prompt formatting, interrupted-run persistence, configuration validation, model file staging, and notebook structure. Regression checks cover the supplied 64-digit response and its plotted coordinates, valid and invalid complete grids, clue conflicts, aggregate metrics, and identical inputs/settings across the two comparison runs. These checks do not download the 8B model and do not establish GPU performance or Sudoku accuracy. Run notebook steps **6–9** on Colab Pro to verify actual one-puzzle and comparison behavior.
+GitHub Actions tests both profiles on CPU. Checks cover string data loading, scoring, incomplete/invalid plots, model and mask selection, snapshot files, warm staging, experiment names and timezones, same-second collisions, partial artifact persistence, safe branch checkout, and both notebooks' structure and cleared outputs.
+
+CPU tests do not establish 8B model quality or GPU behavior. Verify each notebook's one-puzzle run, three-puzzle run, warm-cache rerun, and saved Drive artifacts on Colab Pro.
+
+Model weights, datasets, credentials, environments, and generated results remain excluded from Git. See `THIRD_PARTY_NOTICES.md` for upstream sampler attribution.
 
 ## References
 
-- [LLaDA source and inference instructions](https://github.com/ML-GSAI/LLaDA)
-- [LLaDA-8B-Instruct model](https://huggingface.co/GSAI-ML/LLaDA-8B-Instruct)
-- [Sudoku-1M-Puzzles dataset](https://huggingface.co/datasets/certen/Sudoku-1M-Puzzles)
-- [Hugging Face persistent downloads](https://huggingface.co/docs/huggingface_hub/guides/download#download-files-to-a-local-folder)
-- [Colab resources and storage FAQ](https://research.google.com/colaboratory/faq.html)
+- [LLaDA source and sampler](https://github.com/ML-GSAI/LLaDA)
+- [LLaDA-8B-Instruct](https://huggingface.co/GSAI-ML/LLaDA-8B-Instruct)
+- [iLLaDA-8B-Instruct](https://huggingface.co/GSAI-ML/iLLaDA-8B-Instruct)
+- [Sudoku dataset](https://huggingface.co/datasets/certen/Sudoku-1M-Puzzles)

@@ -47,6 +47,7 @@ def run_comparison(config, dataset, model, output_dir):
     columns = ["gen_length", "steps", "block_length", "processed", *METRICS, "run_dir"]
     for run_config in configs:
         length = run_config["generation"]["gen_length"]
+        run_config.pop("experiment_root", None)
         run_config["output_dir"] = str(output_dir / f"length-{length}")
         run_dir, summary = run_experiment(run_config, puzzles, model)
         report["runs"].append({

@@ -1,8 +1,9 @@
 """Display generated Sudoku text without repairing it or shifting partial rows."""
 
 import re
+from pathlib import Path
 
-from run_sudoku import is_valid_sudoku, preserves_clues, score_prediction
+from sudoku_evaluation import is_valid_sudoku, preserves_clues, score_prediction
 
 
 def prediction_display(record):
@@ -84,5 +85,24 @@ def plot_prediction(record):
                      fontfamily="monospace", wrap=True)
     fig.text(0.5, 0.025, "Red digits conflict with given clues. Missing cells stay blank; no solver repairs are applied.",
              ha="center", fontsize=11)
-    fig.tight_layout(rect=(0, 0.06, 1, 1))
+    if "index" in record:
+        fig.suptitle(f"Puzzle Index {record['index']}", fontsize=16)
+    fig.tight_layout(rect=(0, 0.06, 1, 0.90 if "index" in record else 1))
     return fig
+
+
+def save_prediction_plot(record, path):
+    """Save every answer, including failed parsing, without an interactive backend."""
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    import matplotlib.pyplot as plt
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig = plot_prediction(record)
+    try:
+        FigureCanvasAgg(fig)
+        temporary = path.with_suffix(".png.tmp")
+        fig.savefig(temporary, format="png", dpi=150, bbox_inches="tight")
+        temporary.replace(path)
+    finally:
+        plt.close(fig)

@@ -1,12 +1,18 @@
 """Evaluate LLaDA on Sudoku and save each prediction as it completes."""
 
 import argparse
-from datetime import datetime, timezone
+from datetime import timezone
 import json
 from pathlib import Path
-import re
+import copy
+import subprocess
+from zoneinfo import ZoneInfo
 
 import yaml
+
+from experiment_paths import DEFAULT_TIMEZONE, create_run_directory, experiment_name
+from model_profiles import get_profile
+from sudoku_evaluation import is_valid_sudoku, preserves_clues, score_prediction
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -20,6 +26,8 @@ def load_config(path):
 
 
 def validate_config(config):
+    get_profile(config["model"].get("family", "llada"))
+    ZoneInfo(config.get("experiment_timezone", DEFAULT_TIMEZONE))
     n = config["data"]["num_samples"]
     if type(n) is not int or not 1 <= n <= 1_000_000:
         raise ValueError("data.num_samples must be between 1 and 1,000,000.")
@@ -38,73 +46,6 @@ def validate_config(config):
         raise ValueError("dtype must be bfloat16, float16, or float32.")
 
 
-def score_prediction(output, target):
-    """Score only a complete parsed answer; partial output earns no cell credit."""
-    compact = re.sub(r"\s+", "", output)
-
-    if re.fullmatch(r"[1-9]{81}", compact):
-        prediction = compact
-    else:
-        match = re.search(r"(?<!\d)([1-9]{81})(?!\d)", output)
-        prediction = match.group(1) if match else ""
-
-    return {
-        "prediction": prediction,
-        "parse_success": len(prediction) == 81,
-        "generated_digit_count": len(re.findall(r"[0-9]", output)),
-        "exact": prediction == target,
-        "correct_cells": sum(
-            p == t for p, t in zip(prediction, target)
-        ),
-    }
-
-
-def preserves_clues(puzzle, prediction):
-    if not re.fullmatch(r"[0-9]{81}", puzzle) or not re.fullmatch(r"[1-9]{81}", prediction):
-        return False
-
-    return all(
-        given == "0" or given == pred
-        for given, pred in zip(puzzle, prediction)
-    )
-
-
-def is_valid_sudoku(prediction):
-    if not re.fullmatch(r"[1-9]{81}", prediction):
-        return False
-
-    grid = [
-        [int(x) for x in prediction[i:i+9]]
-        for i in range(0, 81, 9)
-    ]
-
-    required = set(range(1, 10))
-
-    # Rows
-    if any(set(row) != required for row in grid):
-        return False
-
-    # Columns
-    if any(
-        {grid[r][c] for r in range(9)} != required
-        for c in range(9)
-    ):
-        return False
-
-    # 3x3 boxes
-    for br in range(0, 9, 3):
-        for bc in range(0, 9, 3):
-            box = {
-                grid[r][c]
-                for r in range(br, br + 3)
-                for c in range(bc, bc + 3)
-            }
-            if box != required:
-                return False
-
-    return True
-
-
 def save_json(path, value):
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(json.dumps(value, indent=2) + "\n")
@@ -112,17 +53,39 @@ def save_json(path, value):
 
 
 def run_experiment(config, dataset, model):
-    output_dir = Path(config["output_dir"]).expanduser()
-    if not output_dir.is_absolute():
-        output_dir = ROOT / output_dir
-    run_dir = output_dir / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-    run_dir.mkdir(parents=True, exist_ok=False)
+    from sudoku_visualization import save_prediction_plot
+
+    config = copy.deepcopy(config)
+    config["data"]["num_samples"] = len(dataset)
+    family = config["model"].setdefault("family", "llada")
+    profile = get_profile(family)
+    config["model"].setdefault("model_path", profile["repo_id"])
+    run_dir, started = create_run_directory(config)
+    config["output_dir"] = str(run_dir.parent)
+    try:
+        git_commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT,
+                                             text=True, stderr=subprocess.DEVNULL).strip()
+    except (OSError, subprocess.CalledProcessError):
+        git_commit = None
+    identity = getattr(model, "identity", {
+        "family": family, "model_path": config["model"]["model_path"],
+        "repo_id": profile["repo_id"], "revision": profile["revision"],
+        "mask_id": profile["mask_id"],
+    })
+    config["provenance"] = {**config.get("provenance", {}), "git_commit": git_commit,
+                            "model": identity}
+    config["run"] = {
+        "directory": str(run_dir), "experiment_name": experiment_name(config["generation"]),
+        "timezone": config.get("experiment_timezone", DEFAULT_TIMEZONE),
+        "started_at": started.isoformat(), "started_at_utc": started.astimezone(timezone.utc).isoformat(),
+    }
     save_json(run_dir / "config.json", config)
     summary = {
         "status": "running", "requested": len(dataset), "processed": 0,
         "exact_accuracy": 0.0, "cell_accuracy": 0.0,
         "completion_rate": 0.0, "clue_preservation_rate": 0.0,
         "sudoku_validity_rate": 0.0,
+        "plots_saved": 0,
     }
     save_json(run_dir / "metrics.json", summary)
     print(f"Saving results to {run_dir}", flush=True)
@@ -136,7 +99,8 @@ def run_experiment(config, dataset, model):
             score = score_prediction(output, item["solution"])
             score["clues_preserved"] = preserves_clues(item["puzzle"], score["prediction"])
             score["valid_sudoku"] = is_valid_sudoku(score["prediction"])
-            record = {"index": index, **item, "raw_output": output, **score}
+            plot_file = f"plots/puzzle_{index:03d}.png"
+            record = {"index": index, **item, "raw_output": output, **score, "plot_file": plot_file}
             handle.write(json.dumps(record) + "\n")
             handle.flush()
             exact += score["exact"]
@@ -154,6 +118,9 @@ def run_experiment(config, dataset, model):
                 sudoku_validity_rate=valid_sudoku / processed,
             )
             save_json(run_dir / "metrics.json", summary)
+            save_prediction_plot(record, run_dir / plot_file)
+            summary["plots_saved"] += 1
+            save_json(run_dir / "metrics.json", summary)
             print(
                 f"{index:03d} | complete={score['parse_success']} | "
                 f"clues={score['clues_preserved']} | valid={score['valid_sudoku']} | "
@@ -167,12 +134,13 @@ def run_experiment(config, dataset, model):
     return run_dir, summary
 
 
-def main():
+def main(default_config=None, expected_family=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", type=Path, default=ROOT / "configs/sudoku.yaml")
+    parser.add_argument("--config", type=Path, default=default_config or ROOT / "configs/sudoku.yaml")
     parser.add_argument("--num-samples", type=int)
     parser.add_argument("--model-path", help="Hugging Face ID or local model directory")
-    parser.add_argument("--output-dir")
+    parser.add_argument("--output-dir", help="Explicit experiment parent (overrides model/dataset grouping)")
+    parser.add_argument("--run-manifest", type=Path, help="Write the exact created run directory here")
     parser.add_argument("--local-files-only", action="store_true")
     parser.add_argument("--dataset-only", action="store_true", help="Check the dataset without loading model weights")
     args = parser.parse_args()
@@ -182,10 +150,13 @@ def main():
     if args.model_path is not None:
         config["model"]["model_path"] = args.model_path
     if args.output_dir is not None:
+        config.pop("experiment_root", None)
         config["output_dir"] = args.output_dir
     if args.local_files_only:
         config["model"]["local_files_only"] = True
     validate_config(config)
+    if expected_family and config["model"].get("family", "llada") != expected_family:
+        parser.error(f"This entry point requires model.family: {expected_family}.")
 
     from sudoku_dataset import SudokuDataset, format_prompt
     dataset = SudokuDataset(n=config["data"]["num_samples"], cache_dir=config["data"].get("cache_dir"))
@@ -194,7 +165,10 @@ def main():
         return
     from Llada import LLaDA
     model = LLaDA(**config["model"])
-    run_experiment(config, dataset, model)
+    run_dir, summary = run_experiment(config, dataset, model)
+    if args.run_manifest:
+        args.run_manifest.parent.mkdir(parents=True, exist_ok=True)
+        save_json(args.run_manifest, {"run_dir": str(run_dir), "status": summary["status"]})
 
 
 if __name__ == "__main__":

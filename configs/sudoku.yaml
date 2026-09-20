@@ -1,19 +1,21 @@
-# Start with one puzzle, then increase to 10 or 100.
+# Custom defaults from the adi notebook; use --num-samples 1 for a smoke run.
 data:
-  num_samples: 1
+  num_samples: 3
   cache_dir: null
 
 model:
+  family: llada
   model_path: GSAI-ML/LLaDA-8B-Instruct
   device: cuda
   dtype: bfloat16
   local_files_only: false
 
 generation:
-  steps: 128
-  gen_length: 128
-  block_length: 32
+  steps: 256
+  gen_length: 256
+  block_length: 128
   temperature: 0.0
   remasking: low_confidence
 
-output_dir: results/sudoku
+experiment_root: results
+experiment_timezone: America/Los_Angeles

@@ -127,7 +127,7 @@ def test_invalid_sampling_settings_fail_early(key, value):
 
 def test_partial_run_keeps_completed_results(tmp_path):
     config = load_config(ROOT / "configs/sudoku.yaml")
-    config["output_dir"] = str(tmp_path)
+    config["experiment_root"] = str(tmp_path)
     dataset = [{"puzzle": PUZZLE, "solution": SOLUTION, "num_blanks": PUZZLE.count("0")}] * 2
 
     class InterruptedModel:
@@ -141,7 +141,7 @@ def test_partial_run_keeps_completed_results(tmp_path):
 
     with pytest.raises(RuntimeError, match="interruption"):
         run_experiment(config, dataset, InterruptedModel())
-    run_dir = next(tmp_path.iterdir())
+    run_dir = next(tmp_path.rglob("metrics.json")).parent
     records = (run_dir / "predictions.jsonl").read_text().splitlines()
     assert len(records) == 1
     assert json.loads(records[0])["raw_output"] == SOLUTION
@@ -149,12 +149,14 @@ def test_partial_run_keeps_completed_results(tmp_path):
     assert metrics["processed"] == 1
     assert metrics["status"] == "running"
     assert metrics["exact_accuracy"] == 1.0
+    assert metrics["plots_saved"] == 1
+    assert (run_dir / "plots/puzzle_000.png").is_file()
     assert metrics["completion_rate"] == metrics["clue_preservation_rate"] == metrics["sudoku_validity_rate"] == 1.0
 
 
 def test_completed_run_counts_invalid_outputs(tmp_path):
     config = load_config(ROOT / "configs/sudoku.yaml")
-    config["output_dir"] = str(tmp_path)
+    config["experiment_root"] = str(tmp_path)
     dataset = [{"puzzle": PUZZLE, "solution": SOLUTION}] * 2
 
     class Model:
@@ -171,7 +173,7 @@ def test_completed_run_counts_invalid_outputs(tmp_path):
 
 def test_aggregate_metrics_distinguish_completion_clues_and_validity(tmp_path):
     config = load_config(ROOT / "configs/sudoku.yaml")
-    config["output_dir"] = str(tmp_path)
+    config["experiment_root"] = str(tmp_path)
     dataset = [{"puzzle": PUZZLE, "solution": SOLUTION}] * 4
     outputs = [SOLUTION, "1" + SOLUTION[1:], SOLUTION.translate(str.maketrans("12", "21")), INCOMPLETE_OUTPUT]
 
@@ -194,6 +196,12 @@ def test_aggregate_metrics_distinguish_completion_clues_and_validity(tmp_path):
     assert [record["prediction"] for record in records] == outputs[:3] + [""]
     assert [record["valid_sudoku"] for record in records] == [True, False, True, False]
     assert [record["clues_preserved"] for record in records] == [True, True, False, False]
+    assert metrics["plots_saved"] == 4
+    for record in records:
+        assert (run_dir / record["plot_file"]).read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
+    saved = json.loads((run_dir / "config.json").read_text())
+    assert saved["run"]["timezone"] == "America/Los_Angeles"
+    assert saved["provenance"]["git_commit"]
 
 
 def test_comparison_reuses_first_three_puzzles_and_only_changes_length(tmp_path):
