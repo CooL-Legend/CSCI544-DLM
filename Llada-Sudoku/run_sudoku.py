@@ -39,6 +39,7 @@ def validate_config(config):
 
 
 def score_prediction(output, target):
+    """Score only a complete parsed answer; partial output earns no cell credit."""
     compact = re.sub(r"\s+", "", output)
 
     if re.fullmatch(r"[1-9]{81}", compact):
@@ -50,14 +51,16 @@ def score_prediction(output, target):
     return {
         "prediction": prediction,
         "parse_success": len(prediction) == 81,
+        "generated_digit_count": len(re.findall(r"[0-9]", output)),
         "exact": prediction == target,
         "correct_cells": sum(
             p == t for p, t in zip(prediction, target)
         ),
     }
 
+
 def preserves_clues(puzzle, prediction):
-    if len(prediction) != 81:
+    if not re.fullmatch(r"[0-9]{81}", puzzle) or not re.fullmatch(r"[1-9]{81}", prediction):
         return False
 
     return all(
@@ -67,7 +70,7 @@ def preserves_clues(puzzle, prediction):
 
 
 def is_valid_sudoku(prediction):
-    if len(prediction) != 81:
+    if not re.fullmatch(r"[1-9]{81}", prediction):
         return False
 
     grid = [
@@ -118,10 +121,12 @@ def run_experiment(config, dataset, model):
     summary = {
         "status": "running", "requested": len(dataset), "processed": 0,
         "exact_accuracy": 0.0, "cell_accuracy": 0.0,
+        "completion_rate": 0.0, "clue_preservation_rate": 0.0,
+        "sudoku_validity_rate": 0.0,
     }
     save_json(run_dir / "metrics.json", summary)
     print(f"Saving results to {run_dir}", flush=True)
-    exact = correct_cells = 0
+    exact = correct_cells = complete = clues_preserved = valid_sudoku = 0
     from sudoku_dataset import format_prompt
 
     with (run_dir / "predictions.jsonl").open("w") as handle:
@@ -129,22 +134,31 @@ def run_experiment(config, dataset, model):
             item = dataset[index]
             output = model.predict(format_prompt(item["puzzle"]), **config["generation"])
             score = score_prediction(output, item["solution"])
-            score["clues_preserved"] = preserves_clues(item["puzzle"],score["prediction"],)
-
+            score["clues_preserved"] = preserves_clues(item["puzzle"], score["prediction"])
             score["valid_sudoku"] = is_valid_sudoku(score["prediction"])
             record = {"index": index, **item, "raw_output": output, **score}
             handle.write(json.dumps(record) + "\n")
             handle.flush()
             exact += score["exact"]
             correct_cells += score["correct_cells"]
+            complete += score["parse_success"]
+            clues_preserved += score["clues_preserved"]
+            valid_sudoku += score["valid_sudoku"]
             processed = index + 1
             summary.update(
                 processed=processed,
                 exact_accuracy=exact / processed,
                 cell_accuracy=correct_cells / (81 * processed),
+                completion_rate=complete / processed,
+                clue_preservation_rate=clues_preserved / processed,
+                sudoku_validity_rate=valid_sudoku / processed,
             )
             save_json(run_dir / "metrics.json", summary)
-            print(f"{index:03d} | exact={score['exact']} | output={score['prediction']}", flush=True)
+            print(
+                f"{index:03d} | complete={score['parse_success']} | "
+                f"clues={score['clues_preserved']} | valid={score['valid_sudoku']} | "
+                f"exact={score['exact']} | output={score['prediction']}", flush=True,
+            )
 
     summary["status"] = "completed"
     save_json(run_dir / "metrics.json", summary)
