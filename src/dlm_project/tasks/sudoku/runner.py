@@ -6,56 +6,21 @@ import json
 from pathlib import Path
 import copy
 import subprocess
-from zoneinfo import ZoneInfo
 
-import yaml
-
-from experiment_paths import DEFAULT_TIMEZONE, create_run_directory, experiment_name
-from model_profiles import get_profile
-from sudoku_evaluation import is_valid_sudoku, preserves_clues, score_prediction
-
-ROOT = Path(__file__).resolve().parents[1]
-
-
-def load_config(path):
-    with Path(path).open() as handle:
-        config = yaml.safe_load(handle)
-    if not isinstance(config, dict):
-        raise ValueError("The configuration must be a YAML mapping.")
-    return config
-
-
-def validate_config(config):
-    get_profile(config["model"].get("family", "llada"))
-    ZoneInfo(config.get("experiment_timezone", DEFAULT_TIMEZONE))
-    n = config["data"]["num_samples"]
-    if type(n) is not int or not 1 <= n <= 1_000_000:
-        raise ValueError("data.num_samples must be between 1 and 1,000,000.")
-    generation = config["generation"]
-    for key in ("steps", "gen_length", "block_length"):
-        if type(generation[key]) is not int or generation[key] < 1:
-            raise ValueError(f"generation.{key} must be a positive integer.")
-    steps, length, block = (generation[k] for k in ("steps", "gen_length", "block_length"))
-    if length % block or steps > length or steps % (length // block):
-        raise ValueError("gen_length must divide into blocks, and steps must be <= gen_length and divisible by the number of blocks.")
-    if generation["temperature"] < 0:
-        raise ValueError("temperature must be nonnegative.")
-    if generation["remasking"] not in {"low_confidence", "random"}:
-        raise ValueError("remasking must be low_confidence or random.")
-    if config["model"]["dtype"] not in {"bfloat16", "float16", "float32"}:
-        raise ValueError("dtype must be bfloat16, float16, or float32.")
-
-
-def save_json(path, value):
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(value, indent=2) + "\n")
-    temporary.replace(path)
+from dlm_project.experiments.config import load_config, validate_config
+from dlm_project.experiments.artifacts import save_json
+from dlm_project.experiments.paths import DEFAULT_TIMEZONE, create_run_directory, experiment_name
+from dlm_project.models.profiles import get_profile
+from dlm_project.decoding.mcts_decoding import resolve_decoding
+from dlm_project.tasks.sudoku.evaluation import is_valid_sudoku, preserves_clues, score_prediction
+from dlm_project.paths import PROJECT_ROOT as ROOT
 
 
 def run_experiment(config, dataset, model):
-    from sudoku_visualization import save_prediction_plot
+    from dlm_project.tasks.sudoku.visualization import save_prediction_plot
 
     config = copy.deepcopy(config)
+    config["decoding"] = resolve_decoding(config.get("decoding"), config["generation"])
     config["data"]["num_samples"] = len(dataset)
     family = config["model"].setdefault("family", "llada")
     profile = get_profile(family)
@@ -75,7 +40,8 @@ def run_experiment(config, dataset, model):
     config["provenance"] = {**config.get("provenance", {}), "git_commit": git_commit,
                             "model": identity}
     config["run"] = {
-        "directory": str(run_dir), "experiment_name": experiment_name(config["generation"]),
+        "directory": str(run_dir),
+        "experiment_name": experiment_name(config["generation"], config["decoding"]),
         "timezone": config.get("experiment_timezone", DEFAULT_TIMEZONE),
         "started_at": started.isoformat(), "started_at_utc": started.astimezone(timezone.utc).isoformat(),
     }
@@ -86,21 +52,44 @@ def run_experiment(config, dataset, model):
         "completion_rate": 0.0, "clue_preservation_rate": 0.0,
         "sudoku_validity_rate": 0.0,
         "plots_saved": 0,
+        "decoding": config["decoding"],
+        "search_model_calls": None, "completion_model_calls": None,
+        "latency_seconds": None, "peak_gpu_memory_bytes": None,
     }
     save_json(run_dir / "metrics.json", summary)
     print(f"Saving results to {run_dir}", flush=True)
     exact = correct_cells = complete = clues_preserved = valid_sudoku = 0
-    from sudoku_dataset import format_prompt
+    from dlm_project.tasks.sudoku.dataset import format_prompt
 
     with (run_dir / "predictions.jsonl").open("w") as handle:
         for index in range(len(dataset)):
             item = dataset[index]
-            output = model.predict(format_prompt(item["puzzle"]), **config["generation"])
+            trace_file, stats = None, None
+            if hasattr(model, "predict_with_stats"):
+                trace_file = f"traces/puzzle_{index:03d}.jsonl"
+                (run_dir / "traces").mkdir(exist_ok=True)
+                decoding = {**config["decoding"], "seed": (config["decoding"]["seed"] + index) % 2**63}
+                with (run_dir / trace_file).open("w") as trace_handle:
+                    def save_event(event):
+                        trace_handle.write(json.dumps(event, allow_nan=False) + "\n")
+                        trace_handle.flush()
+
+                    prediction = model.predict_with_stats(
+                        format_prompt(item["puzzle"]), **config["generation"],
+                        decoding=decoding, on_event=save_event,
+                    )
+                output, stats = prediction["text"], prediction["stats"]
+            else:
+                if config["decoding"]["method"] != "baseline":
+                    raise TypeError("This decoding method requires model.predict_with_stats().")
+                output = model.predict(format_prompt(item["puzzle"]), **config["generation"])
             score = score_prediction(output, item["solution"])
             score["clues_preserved"] = preserves_clues(item["puzzle"], score["prediction"])
             score["valid_sudoku"] = is_valid_sudoku(score["prediction"])
             plot_file = f"plots/puzzle_{index:03d}.png"
-            record = {"index": index, **item, "raw_output": output, **score, "plot_file": plot_file}
+            record = {"index": index, **item, "raw_output": output, **score, "plot_file": plot_file,
+                      "decoding_method": config["decoding"]["method"],
+                      "decoding_stats": stats, "trace_file": trace_file}
             handle.write(json.dumps(record) + "\n")
             handle.flush()
             exact += score["exact"]
@@ -117,6 +106,12 @@ def run_experiment(config, dataset, model):
                 clue_preservation_rate=clues_preserved / processed,
                 sudoku_validity_rate=valid_sudoku / processed,
             )
+            if stats is not None:
+                for key in ("search_model_calls", "completion_model_calls", "latency_seconds"):
+                    summary[key] = (summary[key] or 0) + stats[key]
+                if stats["peak_gpu_memory_bytes"] is not None:
+                    summary["peak_gpu_memory_bytes"] = max(
+                        summary["peak_gpu_memory_bytes"] or 0, stats["peak_gpu_memory_bytes"])
             save_json(run_dir / "metrics.json", summary)
             save_prediction_plot(record, run_dir / plot_file)
             summary["plots_saved"] += 1
@@ -136,7 +131,7 @@ def run_experiment(config, dataset, model):
 
 def main(default_config=None, expected_family=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", type=Path, default=default_config or ROOT / "configs/sudoku.yaml")
+    parser.add_argument("--config", type=Path, default=default_config or ROOT / "configs/sudoku/llada.yaml")
     parser.add_argument("--num-samples", type=int)
     parser.add_argument("--model-path", help="Hugging Face ID or local model directory")
     parser.add_argument("--output-dir", help="Explicit experiment parent (overrides model/dataset grouping)")
@@ -158,12 +153,12 @@ def main(default_config=None, expected_family=None):
     if expected_family and config["model"].get("family", "llada") != expected_family:
         parser.error(f"This entry point requires model.family: {expected_family}.")
 
-    from sudoku_dataset import SudokuDataset, format_prompt
+    from dlm_project.tasks.sudoku.dataset import SudokuDataset, format_prompt
     dataset = SudokuDataset(n=config["data"]["num_samples"], cache_dir=config["data"].get("cache_dir"))
     if args.dataset_only:
         print(f"Loaded {len(dataset)} puzzle(s). First prompt:\n{format_prompt(dataset[0]['puzzle'])}")
         return
-    from Llada import LLaDA
+    from dlm_project.models.llada import LLaDA
     model = LLaDA(**config["model"])
     run_dir, summary = run_experiment(config, dataset, model)
     if args.run_manifest:

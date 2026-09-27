@@ -6,16 +6,21 @@ import subprocess
 
 import pytest
 
-from experiment_paths import create_run_directory, experiment_name, experiment_parent
-from model_profiles import get_profile
-from run_sudoku import load_config, run_experiment
+from dlm_project.experiments.paths import create_run_directory, experiment_name, experiment_parent
+from dlm_project.models.profiles import get_profile
+from dlm_project.experiments.config import load_config
+from dlm_project.tasks.sudoku.runner import run_experiment
 
-ROOT = Path(__file__).resolve().parents[1]
+from dlm_project.paths import PROJECT_ROOT as ROOT
+
+
+def cell_source(notebook, cell_id):
+    return "".join(next(cell for cell in notebook["cells"] if cell["id"] == cell_id)["source"])
 
 
 @pytest.mark.parametrize("family", ["llada", "illada"])
 def test_model_dataset_naming_local_time_and_collisions(tmp_path, family):
-    config = load_config(ROOT / "configs/sudoku.yaml")
+    config = load_config(ROOT / "configs/sudoku/llada.yaml")
     config["experiment_root"] = str(tmp_path)
     config["model"]["family"] = family
     # 21:35 UTC is 14:35 in Los Angeles on this date.
@@ -34,16 +39,15 @@ def test_model_dataset_naming_local_time_and_collisions(tmp_path, family):
 
 
 def test_legacy_output_parent_remains_supported(tmp_path):
-    config = load_config(ROOT / "configs/sudoku.yaml")
+    config = load_config(ROOT / "configs/sudoku/llada.yaml")
     config.pop("experiment_root")
     config["output_dir"] = str(tmp_path)
     assert experiment_parent(config) == tmp_path
 
 
 def test_plot_failure_preserves_record_and_cannot_mark_run_completed(tmp_path, monkeypatch):
-    import sudoku_visualization
-
-    config = load_config(ROOT / "configs/illada_sudoku.yaml")
+    from dlm_project.tasks.sudoku import visualization as sudoku_visualization
+    config = load_config(ROOT / "configs/sudoku/illada.yaml")
     config["experiment_root"] = str(tmp_path)
 
     class Model:
@@ -67,8 +71,8 @@ def test_plot_failure_preserves_record_and_cannot_mark_run_completed(tmp_path, m
 
 @pytest.mark.parametrize("family,label", [("llada", "LLaDA"), ("illada", "iLLaDA")])
 def test_notebook_config_updater_uses_actual_parameters_and_family(tmp_path, family, label):
-    notebook = json.loads((ROOT / f"notebooks/{label}_Sudoku_Colab.ipynb").read_text())
-    import experiment_paths
+    notebook = json.loads((ROOT / f"notebooks/sudoku/{label}_Sudoku_Colab.ipynb").read_text())
+    from dlm_project.experiments import paths as experiment_paths
     import yaml
 
     scope = {
@@ -77,22 +81,28 @@ def test_notebook_config_updater_uses_actual_parameters_and_family(tmp_path, fam
         "EXPERIMENT_TIMEZONE": "America/Los_Angeles", "profile": get_profile(family),
         "os": type("Env", (), {"environ": {"HF_DATASETS_CACHE": str(tmp_path / "cache")}}),
     }
-    exec("".join(notebook["cells"][10]["source"]), scope)
+    exec(cell_source(notebook, "base-config"), scope)
     calls = []
     scope.update(RUN_CONFIG=tmp_path / "run.yaml", experiment_paths=experiment_paths,
                  sys=type("Python", (), {"executable": "python"}),
                  subprocess=type("Process", (), {"run": lambda *args, **kwargs: calls.append(args[0])}))
-    exec("".join(notebook["cells"][14]["source"]), scope)
+    exec(cell_source(notebook, "config-updater"), scope)
     saved = yaml.safe_load((tmp_path / "run.yaml").read_text())
     assert saved["model"]["family"] == family
-    assert saved["data"]["num_samples"] == 3
-    assert Path(saved["output_dir"]) == tmp_path / label / "Sudoku" / "gen256-steps256-blk128-temp0-lowconf"
+    assert saved["data"]["num_samples"] == (1 if family == "llada" else 3)
+    if family == "llada":
+        assert saved["generation"]["block_length"] == 256
+        assert saved["decoding"]["method"] == "mcts_entropy"
+        assert saved["decoding"]["mcts"]["init_tokens"] == 2
+    else:
+        assert saved["generation"]["block_length"] == 128
+    assert Path(saved["output_dir"]) == tmp_path / label / "Sudoku" / experiment_name(saved["generation"], saved.get("decoding"))
     assert calls[0][-1] == "--dataset-only"
 
 
 def checkout_function(repo_dir, remote):
-    notebook = json.loads((ROOT / "notebooks/LLaDA_Sudoku_Colab.ipynb").read_text())
-    code = "".join(notebook["cells"][4]["source"])
+    notebook = json.loads((ROOT / "notebooks/sudoku/LLaDA_Sudoku_Colab.ipynb").read_text())
+    code = cell_source(notebook, "checkout")
     function = next(node for node in ast.parse(code).body if isinstance(node, ast.FunctionDef) and node.name == "ensure_checkout")
     scope = {"REPO_DIR": repo_dir, "REPO_URL": str(remote), "BRANCH": "adi", "subprocess": subprocess,
              "remote_git": lambda args: subprocess.run(["git", *args], check=True, capture_output=True)}

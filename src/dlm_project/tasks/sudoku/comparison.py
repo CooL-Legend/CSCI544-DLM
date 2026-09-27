@@ -6,7 +6,10 @@ import csv
 from datetime import datetime, timezone
 from pathlib import Path
 
-from run_sudoku import ROOT, load_config, run_experiment, save_json, validate_config
+from dlm_project.experiments.artifacts import save_json
+from dlm_project.experiments.config import load_config, validate_config
+from dlm_project.paths import PROJECT_ROOT as ROOT
+from dlm_project.tasks.sudoku.runner import run_experiment
 
 GENERATION_LENGTHS = (128, 256)
 NUM_PUZZLES = 3
@@ -69,7 +72,7 @@ def run_comparison(config, dataset, model, output_dir):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", type=Path, default=ROOT / "configs/sudoku.yaml")
+    parser.add_argument("--config", type=Path, default=ROOT / "configs/sudoku/llada.yaml")
     parser.add_argument("--output-dir", type=Path, help="A new directory for this comparison")
     args = parser.parse_args()
     config = comparison_config(load_config(args.config))
@@ -78,8 +81,8 @@ def main():
         config["generation"]["gen_length"] = length
         validate_config(config)
     output_dir = args.output_dir or ROOT / "results/comparisons" / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-    from sudoku_dataset import SudokuDataset
-    from Llada import LLaDA
+    from dlm_project.tasks.sudoku.dataset import SudokuDataset
+    from dlm_project.models.llada import LLaDA
 
     dataset = SudokuDataset(n=NUM_PUZZLES, cache_dir=config["data"].get("cache_dir"))
     model = LLaDA(**config["model"])

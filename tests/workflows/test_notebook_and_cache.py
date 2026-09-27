@@ -5,10 +5,10 @@ import nbformat
 import pytest
 import yaml
 
-from cache_model import cache_model, stage_model, validate_snapshot
-from model_profiles import get_profile
+from dlm_project.models.cache import cache_model, stage_model, validate_snapshot
+from dlm_project.models.profiles import get_profile
 
-ROOT = Path(__file__).resolve().parents[1]
+from dlm_project.paths import PROJECT_ROOT as ROOT
 
 
 def make_snapshot(directory, family="llada"):
@@ -51,7 +51,7 @@ def test_staging_skips_complete_copy_and_repairs_truncation(tmp_path, family):
 
 @pytest.mark.parametrize("name", ["LLaDA", "iLLaDA"])
 def test_notebook_is_valid_and_contains_no_saved_outputs(name):
-    notebook = nbformat.read(ROOT / f"notebooks/{name}_Sudoku_Colab.ipynb", as_version=4)
+    notebook = nbformat.read(ROOT / f"notebooks/sudoku/{name}_Sudoku_Colab.ipynb", as_version=4)
     nbformat.validate(notebook)
     for index, cell in enumerate(notebook.cells):
         if cell.cell_type == "code":
@@ -60,14 +60,14 @@ def test_notebook_is_valid_and_contains_no_saved_outputs(name):
             compile(cell.source, f"cell-{index}", "exec")
     source = "\n".join(cell.source for cell in notebook.cells)
     assert 'BRANCH = "adi"' in source
-    assert f"blob/adi/notebooks/{name}_Sudoku_Colab.ipynb" in source
+    assert f"blob/adi/notebooks/sudoku/{name}_Sudoku_Colab.ipynb" in source
     assert "--run-manifest" in source
     assert 'Image(filename=str(plot_path))' in source
     assert "Compare 128" not in source
 
 
 def test_yaml_files_parse():
-    for path in [ROOT / "environment.yaml", ROOT / "configs/sudoku.yaml", ROOT / "configs/illada_sudoku.yaml", ROOT / ".github/workflows/checks.yaml"]:
+    for path in [ROOT / "environment.yaml", ROOT / "configs/sudoku/llada.yaml", ROOT / "configs/sudoku/llada_mcts.yaml", ROOT / "configs/sudoku/illada.yaml", ROOT / ".github/workflows/checks.yaml"]:
         assert isinstance(yaml.safe_load(path.read_text()), dict)
 
 

@@ -3,7 +3,7 @@
 import re
 from pathlib import Path
 
-from sudoku_evaluation import is_valid_sudoku, preserves_clues, score_prediction
+from dlm_project.tasks.sudoku.evaluation import is_valid_sudoku, preserves_clues, score_prediction
 
 
 def prediction_display(record):

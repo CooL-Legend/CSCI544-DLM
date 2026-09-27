@@ -2,8 +2,8 @@ import torch
 import pytest
 from transformers import BertConfig, BertModel, BertTokenizerFast
 
-from Llada import LLaDA
-from model_profiles import get_profile
+from dlm_project.models.llada import LLaDA
+from dlm_project.models.profiles import get_profile
 
 
 def test_wrapper_loads_a_local_checkpoint_without_hub_access(tmp_path):
@@ -23,8 +23,7 @@ def test_wrapper_loads_a_local_checkpoint_without_hub_access(tmp_path):
 
 @pytest.mark.parametrize("family", ["llada", "illada"])
 def test_generation_uses_selected_mask_and_chat_template(monkeypatch, family):
-    import Llada
-
+    from dlm_project.models import llada as Llada
     calls = {}
 
     class Tokenizer:
@@ -79,7 +78,7 @@ def test_generation_uses_selected_mask_and_chat_template(monkeypatch, family):
 
 
 def test_illada_rejects_wrong_mask_token_before_model_loading(monkeypatch):
-    import Llada
+    from dlm_project.models import llada as Llada
     tokenizer = type("Tokenizer", (), {"chat_template": "template", "convert_tokens_to_ids": lambda self, token: 126336})()
     monkeypatch.setattr(Llada.AutoTokenizer, "from_pretrained", lambda *args, **kwargs: tokenizer)
     with pytest.raises(ValueError, match="token 5"):

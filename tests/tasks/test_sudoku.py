@@ -6,12 +6,14 @@ from pathlib import Path
 from datasets import load_dataset
 import pytest
 
-import sudoku_dataset
-from compare_generation import run_comparison
-from run_sudoku import is_valid_sudoku, load_config, preserves_clues, run_experiment, score_prediction, validate_config
-from sudoku_visualization import plot_prediction, prediction_display
+from dlm_project.tasks.sudoku import dataset as sudoku_dataset
+from dlm_project.tasks.sudoku.comparison import run_comparison
+from dlm_project.experiments.config import load_config, validate_config
+from dlm_project.tasks.sudoku.evaluation import is_valid_sudoku, preserves_clues, score_prediction
+from dlm_project.tasks.sudoku.runner import run_experiment
+from dlm_project.tasks.sudoku.visualization import plot_prediction, prediction_display
 
-ROOT = Path(__file__).resolve().parents[1]
+from dlm_project.paths import PROJECT_ROOT as ROOT
 PUZZLE = "009083400005179802823005700107000605200560179604900003971030504000400917000001300"
 SOLUTION = "719283456465179832823645791197328645238564179654917283971832564382456917546791328"
 INCOMPLETE_OUTPUT = """5 7 9 8 3 4 6 1
@@ -119,14 +121,14 @@ def test_ambiguous_raw_layout_is_text_instead_of_a_reshaped_grid(output):
 
 @pytest.mark.parametrize("key,value", [("steps", 3), ("steps", 129), ("gen_length", 127), ("block_length", 0)])
 def test_invalid_sampling_settings_fail_early(key, value):
-    config = load_config(ROOT / "configs/sudoku.yaml")
+    config = load_config(ROOT / "configs/sudoku/llada.yaml")
     config["generation"][key] = value
     with pytest.raises(ValueError):
         validate_config(config)
 
 
 def test_partial_run_keeps_completed_results(tmp_path):
-    config = load_config(ROOT / "configs/sudoku.yaml")
+    config = load_config(ROOT / "configs/sudoku/llada.yaml")
     config["experiment_root"] = str(tmp_path)
     dataset = [{"puzzle": PUZZLE, "solution": SOLUTION, "num_blanks": PUZZLE.count("0")}] * 2
 
@@ -155,7 +157,7 @@ def test_partial_run_keeps_completed_results(tmp_path):
 
 
 def test_completed_run_counts_invalid_outputs(tmp_path):
-    config = load_config(ROOT / "configs/sudoku.yaml")
+    config = load_config(ROOT / "configs/sudoku/llada.yaml")
     config["experiment_root"] = str(tmp_path)
     dataset = [{"puzzle": PUZZLE, "solution": SOLUTION}] * 2
 
@@ -172,7 +174,7 @@ def test_completed_run_counts_invalid_outputs(tmp_path):
 
 
 def test_aggregate_metrics_distinguish_completion_clues_and_validity(tmp_path):
-    config = load_config(ROOT / "configs/sudoku.yaml")
+    config = load_config(ROOT / "configs/sudoku/llada.yaml")
     config["experiment_root"] = str(tmp_path)
     dataset = [{"puzzle": PUZZLE, "solution": SOLUTION}] * 4
     outputs = [SOLUTION, "1" + SOLUTION[1:], SOLUTION.translate(str.maketrans("12", "21")), INCOMPLETE_OUTPUT]
@@ -205,7 +207,7 @@ def test_aggregate_metrics_distinguish_completion_clues_and_validity(tmp_path):
 
 
 def test_comparison_reuses_first_three_puzzles_and_only_changes_length(tmp_path):
-    config = load_config(ROOT / "configs/sudoku.yaml")
+    config = load_config(ROOT / "configs/sudoku/llada.yaml")
     config["data"]["num_samples"] = 10
     config["generation"].update(steps=64, block_length=16, temperature=0.3, remasking="random")
     original_config = copy.deepcopy(config)

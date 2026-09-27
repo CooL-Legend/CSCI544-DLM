@@ -6,6 +6,9 @@ __pycache__/
 venv/
 .pytest_cache/
 .ipynb_checkpoints/
+*.egg-info/
+build/
+dist/
 .vscode/
 .DS_Store
 
@@ -17,9 +20,9 @@ venv/
 # Downloaded data, model weights, caches, and experiment outputs
 .cache/
 .firecrawl/
-models/
-data/
-results/
+/models/
+/data/
+/results/
 *.safetensors
 *.pt
 *.pth
