@@ -22,6 +22,7 @@ def run_experiment(config, dataset, model):
     config = copy.deepcopy(config)
     config["decoding"] = resolve_decoding(config.get("decoding"), config["generation"])
     config["data"]["num_samples"] = len(dataset)
+    board_size = 4 if config["data"].get("source") == "bgpo_4x4" else 9
     family = config["model"].setdefault("family", "llada")
     profile = get_profile(family)
     config["model"].setdefault("model_path", profile["repo_id"])
@@ -39,6 +40,8 @@ def run_experiment(config, dataset, model):
     })
     config["provenance"] = {**config.get("provenance", {}), "git_commit": git_commit,
                             "model": identity}
+    if hasattr(dataset, "provenance"):
+        config["provenance"]["dataset"] = dict(dataset.provenance)
     config["run"] = {
         "directory": str(run_dir),
         "experiment_name": experiment_name(config["generation"], config["decoding"]),
@@ -59,11 +62,12 @@ def run_experiment(config, dataset, model):
     save_json(run_dir / "metrics.json", summary)
     print(f"Saving results to {run_dir}", flush=True)
     exact = correct_cells = complete = clues_preserved = valid_sudoku = 0
-    from dlm_project.tasks.sudoku.dataset import format_prompt
+    from dlm_project.tasks.sudoku.dataset import item_prompt
 
     with (run_dir / "predictions.jsonl").open("w") as handle:
         for index in range(len(dataset)):
             item = dataset[index]
+            prompt = item_prompt(item)
             trace_file, stats = None, None
             if hasattr(model, "predict_with_stats"):
                 trace_file = f"traces/puzzle_{index:03d}.jsonl"
@@ -75,19 +79,20 @@ def run_experiment(config, dataset, model):
                         trace_handle.flush()
 
                     prediction = model.predict_with_stats(
-                        format_prompt(item["puzzle"]), **config["generation"],
+                        prompt, **config["generation"],
                         decoding=decoding, on_event=save_event,
                     )
                 output, stats = prediction["text"], prediction["stats"]
             else:
                 if config["decoding"]["method"] != "baseline":
                     raise TypeError("This decoding method requires model.predict_with_stats().")
-                output = model.predict(format_prompt(item["puzzle"]), **config["generation"])
-            score = score_prediction(output, item["solution"])
-            score["clues_preserved"] = preserves_clues(item["puzzle"], score["prediction"])
-            score["valid_sudoku"] = is_valid_sudoku(score["prediction"])
+                output = model.predict(prompt, **config["generation"])
+            score = score_prediction(output, item["solution"], board_size)
+            score["clues_preserved"] = preserves_clues(item["puzzle"], score["prediction"], board_size)
+            score["valid_sudoku"] = is_valid_sudoku(score["prediction"], board_size)
             plot_file = f"plots/puzzle_{index:03d}.png"
-            record = {"index": index, **item, "raw_output": output, **score, "plot_file": plot_file,
+            record = {"index": index, **item, "prompt": prompt, "board_size": board_size,
+                      "raw_output": output, **score, "plot_file": plot_file,
                       "decoding_method": config["decoding"]["method"],
                       "decoding_stats": stats, "trace_file": trace_file}
             handle.write(json.dumps(record) + "\n")
@@ -101,7 +106,7 @@ def run_experiment(config, dataset, model):
             summary.update(
                 processed=processed,
                 exact_accuracy=exact / processed,
-                cell_accuracy=correct_cells / (81 * processed),
+                cell_accuracy=correct_cells / (board_size ** 2 * processed),
                 completion_rate=complete / processed,
                 clue_preservation_rate=clues_preserved / processed,
                 sudoku_validity_rate=valid_sudoku / processed,
@@ -153,10 +158,10 @@ def main(default_config=None, expected_family=None):
     if expected_family and config["model"].get("family", "llada") != expected_family:
         parser.error(f"This entry point requires model.family: {expected_family}.")
 
-    from dlm_project.tasks.sudoku.dataset import SudokuDataset, format_prompt
-    dataset = SudokuDataset(n=config["data"]["num_samples"], cache_dir=config["data"].get("cache_dir"))
+    from dlm_project.tasks.sudoku.dataset import load_sudoku_dataset, item_prompt
+    dataset = load_sudoku_dataset(config["data"])
     if args.dataset_only:
-        print(f"Loaded {len(dataset)} puzzle(s). First prompt:\n{format_prompt(dataset[0]['puzzle'])}")
+        print(f"Loaded {len(dataset)} puzzle(s). First prompt:\n{item_prompt(dataset[0])}")
         return
     from dlm_project.models.llada import LLaDA
     model = LLaDA(**config["model"])

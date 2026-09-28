@@ -21,7 +21,10 @@ def validate_config(config):
     get_profile(config["model"].get("family", "llada"))
     ZoneInfo(config.get("experiment_timezone", DEFAULT_TIMEZONE))
     n = config["data"]["num_samples"]
-    if type(n) is not int or not 1 <= n <= 1_000_000:
+    maximum = 500 if config["data"].get("source") == "bgpo_4x4" else 1_000_000
+    if maximum == 500 and (type(n) is not int or not 1 <= n <= maximum):
+        raise ValueError("data.num_samples must be between 1 and 500 for bgpo_4x4.")
+    if type(n) is not int or not 1 <= n <= maximum:
         raise ValueError("data.num_samples must be between 1 and 1,000,000.")
     generation = config["generation"]
     for key in ("steps", "gen_length", "block_length"):

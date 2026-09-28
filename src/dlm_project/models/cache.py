@@ -15,7 +15,7 @@ def check_identity(directory, family):
     profile = get_profile(family)
     config_path = directory / "config.json"
     if config_path.is_file():
-        if json.loads(config_path.read_text()).get("model_type") != family:
+        if json.loads(config_path.read_text()).get("model_type") != profile["model_type"]:
             raise ValueError(f"{directory} contains a different model family; choose a separate directory.")
     source = directory / ".model_source.json"
     if source.is_file():

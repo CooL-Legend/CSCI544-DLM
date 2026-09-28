@@ -8,7 +8,7 @@ python -m pip install -r requirements.txt -r requirements/dev.txt
 python -m pip install --no-deps -e .
 ```
 
-On Colab, the notebooks install `requirements/llada-colab.txt` or `requirements/illada-colab.txt`, then install the package with `--no-deps -e`. This keeps Colab's CUDA-enabled PyTorch. The package is intended for an editable checkout: its default config and results paths are relative to that checkout, independent of the launch directory.
+On Colab, the notebooks install `requirements/llada-colab.txt`, `requirements/illada-colab.txt`, or `requirements/bgpo-colab.txt`, then install the package with `--no-deps -e`. This keeps Colab's CUDA-enabled PyTorch. The package is intended for an editable checkout: its default config and results paths are relative to that checkout, independent of the launch directory.
 
 ## Where to read and edit code
 
@@ -20,6 +20,7 @@ On Colab, the notebooks install `requirements/llada-colab.txt` or `requirements/
 | Baseline | `src/dlm_project/decoding/baseline.py` | Upstream fixed-length sampler. |
 | Experiment utilities | `src/dlm_project/experiments/` | Shared configuration validation, run names/directories and atomic JSON saving. |
 | Sudoku | `src/dlm_project/tasks/sudoku/` | Dataset/prompt, scoring, plotting, runner, inspection and length comparison. |
+| Paired 4×4 comparison | `src/dlm_project/tasks/sudoku/model_comparison.py` | Sequential original LLaDA/BGPO subprocesses, alignment checks, combined scores and four-panel plots. |
 | GSM8K | `src/dlm_project/tasks/gsm8k/` | Single-question loading/prompt construction, numeric answer scoring and runner. |
 | Commands | `scripts/` | Thin entry points that call package functions. |
 | Settings | `configs/sudoku/`, `configs/gsm8k/` | Model, generation, search and task settings. |
@@ -44,6 +45,10 @@ python scripts/run_sudoku.py --config configs/sudoku/llada_mcts.yaml
 
 # View one GSM8K user prompt without loading model weights.
 python scripts/run_gsm8k.py --config configs/gsm8k/llada.yaml --prompt-only
+
+# Preview the authors' 4×4 Sudoku test prompts, then compare both models on CUDA.
+python scripts/run_bgpo_sudoku.py --dataset-only --num-samples 1
+python scripts/run_bgpo_sudoku.py --num-samples 3
 
 # Run the tests in the installed dependency environment.
 python -m pytest -q

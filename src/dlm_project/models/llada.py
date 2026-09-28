@@ -1,11 +1,11 @@
-"""Shared fixed-length inference for LLaDA and iLLaDA checkpoints."""
+"""Shared fixed-length inference for original LLaDA, BGPO, and iLLaDA."""
 
 import json
 from pathlib import Path
 from time import perf_counter
 
 import torch
-from transformers import AutoModel, AutoTokenizer
+from transformers import AutoConfig, AutoModel, AutoTokenizer
 from dlm_project.decoding.baseline import generate
 from dlm_project.models.profiles import PROFILES, get_profile
 from dlm_project.decoding.mcts_decoding import MCTSConfig, MCTSSearch, complete_confidence, model_device, resolve_decoding
@@ -54,7 +54,7 @@ class LLaDA:
             config_file = local_path / "config.json"
             if config_file.is_file():
                 model_type = json.loads(config_file.read_text()).get("model_type")
-                if model_type in ("llada", "illada") and model_type != family:
+                if model_type in ("llada", "illada") and model_type != profile["model_type"]:
                     raise ValueError("model.family does not match the local checkpoint.")
         # The registered Hub checkpoints are pinned; arbitrary local checkpoints
         # retain their own identity rather than being mislabeled as the official revision.
@@ -78,6 +78,21 @@ class LLaDA:
             if self.tokenizer.convert_tokens_to_ids("<[MASK]>") != self.mask_id:
                 raise ValueError("The iLLaDA tokenizer must map <[MASK]> to token 5.")
 
+        model_options = {}
+        if family == "llada_bgpo":
+            # The released checkpoint calls flash_attn_func even when the
+            # optional package is absent. Select its native PyTorch SDPA branch.
+            model_config = AutoConfig.from_pretrained(
+                model_path, trust_remote_code=True,
+                local_files_only=local_files_only, **hub_options,
+            )
+            model_config.flash_attention = False
+            model_config.flash_attn_varlen = False
+            model_options["config"] = model_config
+            self.identity["attention_overrides"] = {
+                "flash_attention": False, "flash_attn_varlen": False,
+            }
+
         self.model = AutoModel.from_pretrained(
             model_path,
             trust_remote_code=True,
@@ -85,6 +100,7 @@ class LLaDA:
             local_files_only=local_files_only,
             low_cpu_mem_usage=True,
             device_map={"": device},
+            **model_options,
             **hub_options,
         ).eval()
 

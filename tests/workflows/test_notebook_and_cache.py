@@ -15,15 +15,15 @@ def make_snapshot(directory, family="llada"):
     directory.mkdir()
     for name in ["tokenizer.json", *get_profile(family)["code_files"]]:
         (directory / name).write_text("{}")
-    (directory / "config.json").write_text(json.dumps({"model_type": family}))
-    (directory / "tokenizer_config.json").write_text(json.dumps({"chat_template": "{{ messages }}"} if family == "llada" else {}))
+    (directory / "config.json").write_text(json.dumps({"model_type": get_profile(family)["model_type"]}))
+    (directory / "tokenizer_config.json").write_text(json.dumps({"chat_template": "{{ messages }}"} if family != "illada" else {}))
     if family == "illada":
         (directory / "chat_template.jinja").write_text("{{ messages }}")
     (directory / "model.safetensors.index.json").write_text(json.dumps({"weight_map": {"weight": "model-1.safetensors"}}))
     (directory / "model-1.safetensors").write_bytes(b"fake test weights")
 
 
-@pytest.mark.parametrize("family", ["llada", "illada"])
+@pytest.mark.parametrize("family", ["llada", "illada", "llada_bgpo"])
 def test_incomplete_snapshot_is_rejected(tmp_path, family):
     source = tmp_path / "source"
     make_snapshot(source, family)
@@ -32,7 +32,7 @@ def test_incomplete_snapshot_is_rejected(tmp_path, family):
         validate_snapshot(source, family)
 
 
-@pytest.mark.parametrize("family", ["llada", "illada"])
+@pytest.mark.parametrize("family", ["llada", "illada", "llada_bgpo"])
 def test_staging_skips_complete_copy_and_repairs_truncation(tmp_path, family):
     source, destination = tmp_path / "source", tmp_path / "runtime"
     make_snapshot(source, family)
@@ -49,7 +49,7 @@ def test_staging_skips_complete_copy_and_repairs_truncation(tmp_path, family):
     assert target.read_bytes() == b"fake test weights"
 
 
-@pytest.mark.parametrize("name", ["LLaDA", "iLLaDA"])
+@pytest.mark.parametrize("name", ["LLaDA", "iLLaDA", "LLaDA_BGPO"])
 def test_notebook_is_valid_and_contains_no_saved_outputs(name):
     notebook = nbformat.read(ROOT / f"notebooks/sudoku/{name}_Sudoku_Colab.ipynb", as_version=4)
     nbformat.validate(notebook)
@@ -90,7 +90,7 @@ def test_wrong_family_cannot_overwrite_a_cached_model(tmp_path):
     assert (destination / "config.json").read_bytes() == before
 
 
-@pytest.mark.parametrize("family", ["llada", "illada"])
+@pytest.mark.parametrize("family", ["llada", "illada", "llada_bgpo"])
 def test_download_selects_pinned_snapshot_and_reuses_staged_weights(tmp_path, monkeypatch, family):
     import huggingface_hub
 

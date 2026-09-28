@@ -28,7 +28,9 @@ def experiment_name(generation, decoding=None):
     return name + suffix
 
 
-def experiment_parent(config, *, dataset_name="Sudoku"):
+def experiment_parent(config, *, dataset_name=None):
+    if dataset_name is None:
+        dataset_name = "Sudoku4x4" if config.get("data", {}).get("source") == "bgpo_4x4" else "Sudoku"
     if "experiment_root" in config:
         root = Path(config["experiment_root"]).expanduser()
         label = get_profile(config["model"].get("family", "llada"))["label"]
@@ -39,7 +41,7 @@ def experiment_parent(config, *, dataset_name="Sudoku"):
     return (parent if parent.is_absolute() else ROOT / parent).resolve()
 
 
-def create_run_directory(config, now=None, *, dataset_name="Sudoku"):
+def create_run_directory(config, now=None, *, dataset_name=None):
     zone = ZoneInfo(config.get("experiment_timezone", DEFAULT_TIMEZONE))
     started = datetime.now(zone) if now is None else now.astimezone(zone)
     parent = experiment_parent(config, dataset_name=dataset_name)

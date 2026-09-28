@@ -21,7 +21,7 @@ def test_wrapper_loads_a_local_checkpoint_without_hub_access(tmp_path):
     assert wrapper.tokenizer.encode("puzzle", add_special_tokens=False) == [5]
 
 
-@pytest.mark.parametrize("family", ["llada", "illada"])
+@pytest.mark.parametrize("family", ["llada", "illada", "llada_bgpo"])
 def test_generation_uses_selected_mask_and_chat_template(monkeypatch, family):
     from dlm_project.models import llada as Llada
     calls = {}
@@ -67,6 +67,8 @@ def test_generation_uses_selected_mask_and_chat_template(monkeypatch, family):
 
     monkeypatch.setattr(Llada.AutoTokenizer, "from_pretrained", load_tokenizer)
     monkeypatch.setattr(Llada.AutoModel, "from_pretrained", load_model)
+    model_config = type("Config", (), {"flash_attention": True, "flash_attn_varlen": True})()
+    monkeypatch.setattr(Llada.AutoConfig, "from_pretrained", lambda *args, **kwargs: model_config)
     monkeypatch.setattr(Llada, "generate", generate)
     wrapper = LLaDA(device="cpu", family=family)
     assert wrapper.predict("Sudoku", steps=4, gen_length=4, block_length=2) == "1234"
@@ -75,6 +77,10 @@ def test_generation_uses_selected_mask_and_chat_template(monkeypatch, family):
     assert calls["tokenizer_options"]["revision"] == calls["model_options"]["revision"] == profile["revision"]
     assert calls["messages"] == [{"role": "user", "content": "Sudoku"}]
     assert wrapper.identity["revision"] == profile["revision"]
+    if family == "llada_bgpo":
+        assert calls["model_options"]["config"] is model_config
+        assert model_config.flash_attention is model_config.flash_attn_varlen is False
+        assert wrapper.identity["attention_overrides"] == {"flash_attention": False, "flash_attn_varlen": False}
 
 
 def test_illada_rejects_wrong_mask_token_before_model_loading(monkeypatch):

@@ -1,6 +1,6 @@
 # CSCI544-DLM
 
-Evaluate **LLaDA-8B-Instruct** and **iLLaDA-8B-Instruct** on Sudoku for CSCI 544 Applied NLP. Develop locally, run inference on **Google Colab Pro**, and keep model weights and experiment artifacts in **Google Drive**.
+Evaluate **LLaDA-8B-Instruct**, **iLLaDA-8B-Instruct**, and **LLaDA-8B-BGPO-sudoku** on Sudoku for CSCI 544 Applied NLP. Develop locally, run inference on **Google Colab Pro**, and keep model weights and experiment artifacts in **Google Drive**.
 
 For a simpler look at prompting, the **LLaDA GSM8K notebook** starts with one math word problem and shows the user message, HF chat formatting, token IDs, generated response and answer comparison.
 
@@ -8,6 +8,7 @@ For a simpler look at prompting, the **LLaDA GSM8K notebook** starts with one ma
 | --- | --- | --- |
 | LLaDA | [Open LLaDA in Colab](https://colab.research.google.com/github/CooL-Legend/CSCI544-DLM/blob/adi/notebooks/sudoku/LLaDA_Sudoku_Colab.ipynb) | Transformers 4.38.2 |
 | iLLaDA | [Open iLLaDA in Colab](https://colab.research.google.com/github/CooL-Legend/CSCI544-DLM/blob/adi/notebooks/sudoku/iLLaDA_Sudoku_Colab.ipynb) | Transformers 4.57.1, Tokenizers 0.22.2, Hugging Face Hub 0.36.2 |
+| Original LLaDA vs BGPO — 4×4 Sudoku | [Open comparison in Colab](https://colab.research.google.com/github/CooL-Legend/CSCI544-DLM/blob/adi/notebooks/sudoku/LLaDA_BGPO_Sudoku_Colab.ipynb) | Transformers 4.53.2 |
 | LLaDA — GSM8K prompt walkthrough | [Open GSM8K in Colab](https://colab.research.google.com/github/CooL-Legend/CSCI544-DLM/blob/adi/notebooks/gsm8k/LLaDA_GSM8K_Colab.ipynb) | Transformers 4.38.2 |
 
 This repository is private. Authorize Colab to read it through GitHub, or download the desired notebook and use **File → Upload notebook**. An older notebook copy saved in Drive does not automatically receive repository changes. All notebooks check out `adi` and display its commit before running.
@@ -25,14 +26,44 @@ src/dlm_project/
 scripts/                    # Thin command-line entry points
 configs/{sudoku,gsm8k}/      # Task settings
 notebooks/{sudoku,gsm8k}/    # Colab workflows
-requirements/               # Separate LLaDA, iLLaDA, and test dependencies
+requirements/               # LLaDA, iLLaDA, BGPO comparison, and test dependencies
 tests/{decoding,models,tasks,workflows}/
 docs/                       # Structure guide and MCTS walkthrough
 ```
 
 Install the package with `python -m pip install --no-deps -e .` after installing a dependency profile. The Colab notebooks do this automatically. See [the structure guide](docs/project_structure.md) for file locations, imports, and commands. Model weights and run artifacts stay outside the source package.
 
-## Run on Colab Pro
+## Original LLaDA vs BGPO on 4×4 Sudoku
+
+[`notebooks/sudoku/LLaDA_BGPO_Sudoku_Colab.ipynb`](notebooks/sudoku/LLaDA_BGPO_Sudoku_Colab.ipynb) compares the original **LLaDA-8B-Instruct** checkpoint with **LLaDA-8B-BGPO-sudoku** on the authors' released **500-puzzle 4×4 test set**. BGPO's upstream Sudoku setup is 4×4; the existing notebooks continue evaluating 9×9 puzzles.
+
+Both models receive the dataset's original user prompt and use identical baseline sampling: **256 output tokens, 256 steps, 32-token blocks, temperature 0, low-confidence remasking, seed 1**. The default is three puzzles. Use one for the initial GPU smoke run, then increase `NUM_SAMPLES` up to 500. Selection takes the first N test rows without shuffling, and each puzzle uses seed `1 + index`. References enter scoring only.
+
+The notebook follows checkout → dependencies → Drive → configuration → caching → evaluation → inspection. It caches each checkpoint separately, reusing the existing original LLaDA snapshot, and loads models **sequentially in fresh subprocesses**. Allow at least 40 GB of Drive storage for both snapshots. Select a BF16-capable L4/A100 runtime as in the existing notebooks. The comparison uses `requirements/bgpo-colab.txt` (Transformers 4.53.2); rerun that installation cell when switching notebooks. BGPO uses its PyTorch attention path with `flash_attention=False` and `flash_attn_varlen=False`, so external FlashAttention is not required.
+
+For a local dataset preview or CUDA evaluation, install the comparison dependencies in a separate environment with appropriate PyTorch already installed:
+
+```bash
+python -m pip install -r requirements/bgpo-colab.txt
+python -m pip install --no-deps -e .
+python scripts/run_bgpo_sudoku.py --dataset-only --num-samples 1
+python scripts/run_bgpo_sudoku.py --num-samples 3
+```
+
+The runner accepts `--config`, `--num-samples`, `--dataset-only`, and `--run-manifest`. Its default configuration is `configs/sudoku/llada_bgpo_4x4.yaml`: shared data/generation settings, BGPO under `model`, and original LLaDA under `comparison.baseline_model`. For cached local weights, set each model's `model_path` and `local_files_only` separately; the notebook does this automatically. `python scripts/cache_model.py --model llada_bgpo --drive-dir /path/to/models/LLaDA-8B-BGPO-sudoku` uses revision `101ce156b05e4f9fef9688569b4ddc3241f81356`. The test file is pinned to upstream commit `2d3e819a65b42ff5bd9cce958fb4412d57c1609d`.
+
+Per-model results are saved under `LLaDA/Sudoku4x4/<settings>/<timestamp>/` and `LLaDA-BGPO/Sudoku4x4/<settings>/<timestamp>/`. Combined results are under `Comparisons/Sudoku4x4/<settings>/<timestamp>/`:
+
+- `comparison.json`: measured scores, BGPO-minus-original rate differences, run paths, and provenance.
+- `comparison.csv`: one summary row per model, including mean generation latency and peak allocated GPU memory.
+- `paired_predictions.jsonl`: matched puzzles, references, original prompts, both raw answers and scores, and per-puzzle runtime statistics.
+- `plots/puzzle_000.png`, etc.: puzzle, reference, original LLaDA, and BGPO side by side.
+
+The comparison validates puzzle IDs, prompts, decoding settings/seeds, and checkpoint identities before combining results. Failed or interrupted evaluations retain completed artifacts; only a completed pair with all plots receives `status: completed`. Each rerun creates a fresh timestamp.
+
+4×4 scoring requires **one complete `<answer>` block containing exactly 16 digits from 1–4**, allowing whitespace inside the block. Reasoning digits do not enter the answer. Missing tags, truncated answers, extra digits, and malformed responses fail parsing without repair. Exact, cell, completion, clue-preservation, and Sudoku-validity rates include failed outputs in their denominators; cell accuracy uses 16 cells per puzzle. Validity checks rows, columns, and 2×2 boxes independently of clue preservation. Timings exclude model loading; peak memory includes weights. This workflow reports actual paired inference results using these scoring rules, rather than claiming reproduction of the paper's reported scores.
+
+## Existing 9×9 workflows on Colab Pro
 
 1. Open the notebook for the model you want. Select **Runtime → Change runtime type → GPU → L4 or A100**, subject to availability. The notebooks check BF16 support and GPU memory before loading unquantized weights.
 2. Give the clone cell read access to the private repository: use a fine-grained GitHub token with **Contents: read** access, stored in Colab **Secrets** as `GITHUB_TOKEN`, or use the hidden prompt. Do not paste tokens into notebook source or Git URLs.
@@ -112,7 +143,7 @@ By default, model files are staged to `/content/models/<model-name>` for faster 
 
 ## Configuration and inference
 
-The baseline configurations are `configs/sudoku/llada.yaml` and `configs/sudoku/illada.yaml`. The LLaDA notebook loads `configs/sudoku/llada_mcts.yaml` for the one-puzzle walkthrough. The shared loader accepts `model.family: llada` or `illada`; older configurations without `family` default to LLaDA. An absent `decoding` section preserves baseline behavior, and `predict(...)` still returns a string.
+The 9×9 baseline configurations are `configs/sudoku/llada.yaml` and `configs/sudoku/illada.yaml`. The LLaDA notebook loads `configs/sudoku/llada_mcts.yaml` for the one-puzzle walkthrough. The shared loader accepts `model.family: llada`, `illada`, or `llada_bgpo`; older configurations without `family` default to LLaDA. The profile's `model_type` records its architecture, so both original LLaDA and BGPO use `llada` model code with separate checkpoint identities. An absent `decoding` section preserves baseline behavior, and `predict(...)` still returns a string.
 
 The iLLaDA tokenizer needs the newer dependency profile and its own chat template. The wrapper uses mask token **5** for iLLaDA and **126336** for LLaDA. Both share the original **fixed-length masked baseline sampler**, single-puzzle inference, and unchanged Sudoku prompt. iLLaDA's optional variable-length decoding is not enabled. Sudoku rules only validate model responses; no solver fills, repairs, or replaces them.
 
@@ -166,7 +197,7 @@ Incomplete numeric lines remain at their original row positions in the plot. Eig
 
 ## Local commands
 
-Use separate Python environments for the two dependency profiles. For the existing LLaDA environment:
+Use separate Python environments for the LLaDA, iLLaDA, and BGPO comparison dependency profiles. For the existing LLaDA environment:
 
 ```bash
 conda env create -f environment.yaml
@@ -211,7 +242,7 @@ Run in each dependency environment:
 python -m pytest -q
 ```
 
-GitHub Actions tests both profiles on CPU. Checks cover string data loading, scoring, incomplete/invalid plots, model and mask selection, snapshot files, warm staging, experiment names and timezones, same-second collisions, partial artifact persistence, safe branch checkout, and all three notebooks' structure and cleared outputs. Controlled fake-model tests additionally cover confidence filtering, negative/near-zero entropy rewards, UCB and backups, independent states, fixed commitments, deduplication, exhausted branches, hard call budgets, fallback ranking, trace accounting, and equivalence of `step()` and `run()`.
+GitHub Actions tests all three dependency profiles on CPU. Checks cover string data loading, 4×4 and 9×9 scoring, incomplete/invalid plots, model and mask selection, snapshot files, warm staging, experiment names and timezones, same-second collisions, partial artifact persistence, safe branch checkout, and all four notebooks' structure and cleared outputs. Paired-comparison tests cover prompt/ID/seed alignment, separate checkpoint identities, sequential subprocesses, failed comparisons, and the notebook's shared settings. Controlled fake-model tests additionally cover confidence filtering, negative/near-zero entropy rewards, UCB and backups, independent states, fixed commitments, deduplication, exhausted branches, hard call budgets, fallback ranking, trace accounting, and equivalence of `step()` and `run()`.
 
 CPU tests do not establish 8B model quality or GPU behavior. Verify each notebook's one-puzzle run, three-puzzle run, warm-cache rerun, and saved Drive artifacts on Colab Pro.
 

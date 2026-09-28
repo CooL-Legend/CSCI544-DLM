@@ -17,6 +17,7 @@ from dlm_project.paths import PROJECT_ROOT as ROOT
 @pytest.mark.parametrize("script", [
     "cache_model.py", "run_sudoku.py", "run_illada_sudoku.py",
     "run_gsm8k.py", "inspect_mcts.py", "compare_generation.py",
+    "run_bgpo_sudoku.py",
 ])
 def test_installed_entry_points_work_outside_checkout(tmp_path, script):
     # -I ignores PYTHONPATH and the script directory. Imports must come from
@@ -34,6 +35,7 @@ def test_installed_entry_points_work_outside_checkout(tmp_path, script):
     ("sudoku/LLaDA_Sudoku_Colab.ipynb", "cell-05", "llada-colab.txt"),
     ("sudoku/iLLaDA_Sudoku_Colab.ipynb", "cell-05", "illada-colab.txt"),
     ("gsm8k/LLaDA_GSM8K_Colab.ipynb", "dependencies", "llada-colab.txt"),
+    ("sudoku/LLaDA_BGPO_Sudoku_Colab.ipynb", "dependencies", "bgpo-colab.txt"),
 ])
 def test_notebook_installs_package_and_refreshes_kernel_paths(monkeypatch, notebook, cell_id, profile):
     cells = json.loads((ROOT / "notebooks" / notebook).read_text())["cells"]
