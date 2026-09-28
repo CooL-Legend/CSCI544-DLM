@@ -1,0 +1,30 @@
+# One question, baseline LLaDA: inspect how the user prompt becomes model input.
+data:
+  num_samples: 1
+  dataset_id: openai/gsm8k
+  dataset_config: main
+  split: test
+  question_index: 0
+  cache_dir: null
+prompt:
+  instructions: |-
+    Solve the following math word problem. Explain your solution briefly.
+    End your response with a line in this exact format: #### <number>
+  custom_question: null  # Optional replacement; no dataset reference is used for it.
+model:
+  family: llada
+  model_path: GSAI-ML/LLaDA-8B-Instruct
+  device: cuda
+  dtype: bfloat16
+  local_files_only: false
+generation:
+  gen_length: 256
+  steps: 256
+  block_length: 128
+  temperature: 0.0
+  remasking: low_confidence
+decoding:
+  method: baseline
+  seed: 1
+experiment_root: results
+experiment_timezone: America/Los_Angeles

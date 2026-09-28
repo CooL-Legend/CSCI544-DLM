@@ -1,2 +1,2 @@
--r requirements-colab.txt
+-r requirements/llada-colab.txt
 torch>=2.2,<3.0
