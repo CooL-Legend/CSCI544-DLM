@@ -18,6 +18,7 @@ from dlm_project.paths import PROJECT_ROOT as ROOT
     "cache_model.py", "run_sudoku.py", "run_illada_sudoku.py",
     "run_gsm8k.py", "inspect_mcts.py", "compare_generation.py",
     "run_bgpo_sudoku.py",
+    "run_gsm8k_sweep.py", "run_sudoku_sweep.py",
 ])
 def test_installed_entry_points_work_outside_checkout(tmp_path, script):
     # -I ignores PYTHONPATH and the script directory. Imports must come from

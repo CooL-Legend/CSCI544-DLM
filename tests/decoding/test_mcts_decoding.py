@@ -181,7 +181,8 @@ def test_budget_is_hard_cap_including_root_and_partial_sibling_sets(budget, dept
     assert len(result.trace[-1]["selected_state"]["committed"]) == depth
 
 
-def test_final_ranking_uses_root_reduction_not_last_edge_reward():
+@pytest.mark.parametrize("stop_mode", ["candidates", "budget"])
+def test_final_ranking_uses_root_reduction_not_last_edge_reward(stop_mode):
     # Branch with token at position 0 has a large first gain, tiny second gain.
     # The other branch has a worse final state despite a better last-edge gain.
     def policy(output):
@@ -192,7 +193,7 @@ def test_final_ranking_uses_root_reduction_not_last_edge_reward():
         else:
             row = [0, .5, .25, .25]
         return row
-    tree = search(FakeModel(policy), num_candidates=99)
+    tree = search(FakeModel(policy), num_candidates=99, stop_mode=stop_mode)
     result = tree.run()
     gains = {e["child_id"]: e["reward"] for e in result.trace if e["stage"] == "evaluation"}
     assert result.selected.state[0, 2] != MASK

@@ -19,6 +19,7 @@ On Colab, the notebooks install `requirements/llada-colab.txt`, `requirements/il
 | MCTS | `src/dlm_project/decoding/mcts_decoding.py` | All search components, all four cycle stages, entropy evaluation, greedy completion and trace events in one file. |
 | Baseline | `src/dlm_project/decoding/baseline.py` | Upstream fixed-length sampler. |
 | Experiment utilities | `src/dlm_project/experiments/` | Shared configuration validation, run names/directories and atomic JSON saving. |
+| Decoder sweeps | `src/dlm_project/experiments/{manifests,sweep,sweep_report,sweep_plots}.py` | Frozen examples, paired baseline/confidence/MCTS runs, incremental records, offline tables and figures. |
 | Sudoku | `src/dlm_project/tasks/sudoku/` | Dataset/prompt, scoring, plotting, runner, inspection and length comparison. |
 | Paired 4×4 comparison | `src/dlm_project/tasks/sudoku/model_comparison.py` | Sequential original LLaDA/BGPO subprocesses, alignment checks, combined scores and four-panel plots. |
 | GSM8K | `src/dlm_project/tasks/gsm8k/` | Single-question loading/prompt construction, numeric answer scoring and runner. |
@@ -50,11 +51,19 @@ python scripts/run_gsm8k.py --config configs/gsm8k/llada.yaml --prompt-only
 python scripts/run_bgpo_sudoku.py --dataset-only --num-samples 1
 python scripts/run_bgpo_sudoku.py --num-samples 3
 
+# Same original LLaDA checkpoint; five decoder conditions on frozen examples.
+python scripts/run_gsm8k_sweep.py --profile smoke
+python scripts/run_sudoku_sweep.py --profile smoke
+
 # Run the tests in the installed dependency environment.
 python -m pytest -q
 ```
 
 Use each script's `--help` for additional arguments. iLLaDA uses `scripts/run_illada_sudoku.py` and its separate dependency profile. The cache and fixed-length comparison commands are `scripts/cache_model.py` and `scripts/compare_generation.py`.
+
+See [the milestone sweep guide](milestone1_sweeps.md) for the two sweep configurations,
+budget stopping, Colab launches and saved-metric reporting. Sweep entry points call
+shared experiment code, which reuses task prompts/scorers and the existing decoder.
 
 Python imports now use the package name:
 
