@@ -1,0 +1,33 @@
+data:
+  source: bgpo_4x4
+  num_samples: 3
+  cache_dir: null
+
+model:
+  family: llada_bgpo
+  model_path: THU-KEG/LLaDA-8B-BGPO-sudoku
+  device: cuda
+  dtype: bfloat16
+  local_files_only: false
+
+comparison:
+  baseline_model:
+    family: llada
+    model_path: GSAI-ML/LLaDA-8B-Instruct
+    device: cuda
+    dtype: bfloat16
+    local_files_only: false
+
+generation:
+  steps: 256
+  gen_length: 256
+  block_length: 32
+  temperature: 0.0
+  remasking: low_confidence
+
+decoding:
+  method: baseline
+  seed: 1
+
+experiment_root: results
+experiment_timezone: America/Los_Angeles
