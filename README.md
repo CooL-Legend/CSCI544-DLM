@@ -33,6 +33,17 @@ docs/                       # Structure guide and MCTS walkthrough
 
 Install the package with `python -m pip install --no-deps -e .` after installing a dependency profile. The Colab notebooks do this automatically. See [the structure guide](docs/project_structure.md) for file locations, imports, and commands. Model weights and run artifacts stay outside the source package.
 
+## Milestone 1 decoder sweeps
+
+The [milestone sweep guide](docs/milestone1_sweeps.md) provides two scripts using the **same pinned original LLaDA** model: GSM8K and BGPO's **4×4 dataset**. Each compares baseline, confidence-only, and fixed-branching MCTS with search caps of **128, 256 and 512 forwards**, using the current **one-step entropy evaluator**. It saves frozen manifests, per-example traces/scores/compute, paired summaries, Wilson intervals, and PNG/PDF reports.
+
+```bash
+python scripts/run_gsm8k_sweep.py --profile smoke
+python scripts/run_sudoku_sweep.py --profile smoke
+```
+
+The default smoke profile runs three development examples. `--profile milestone` selects 50 held-out GSM8K questions or 30 disjoint Sudoku puzzles. `--report-only RUN_DIR` rebuilds reports without weights or data downloads. See the guide for YAML controls, cached-model Colab subprocess launches, GPU verification, compute estimates and interrupted-run handling. These scripts do not change the separate original-LLaDA-versus-BGPO model comparison below.
+
 ## Original LLaDA vs BGPO on 4×4 Sudoku
 
 [`notebooks/sudoku/LLaDA_BGPO_Sudoku_Colab.ipynb`](notebooks/sudoku/LLaDA_BGPO_Sudoku_Colab.ipynb) compares the original **LLaDA-8B-Instruct** checkpoint with **LLaDA-8B-BGPO-sudoku** on the authors' released **500-puzzle 4×4 test set**. BGPO's upstream Sudoku setup is 4×4; the existing notebooks continue evaluating 9×9 puzzles.

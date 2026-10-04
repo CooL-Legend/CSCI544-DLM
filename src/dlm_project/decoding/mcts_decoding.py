@@ -20,7 +20,11 @@ import torch
 
 @dataclass(frozen=True)
 class MCTSConfig:
-    """Validated search settings: Lc, C, K1, K2 and the search-only call budget."""
+    """Validated Lc, C, K1, K2 and search-only forward cap (including the root).
+
+    candidates mode stops at the quota, cap or exhausted frontier. budget mode
+    ignores C and searches until the cap or exhaustion; target nodes stay closed.
+    """
     init_tokens: int = 2
     num_candidates: int = 3
     top_k_tokens: int = 2
@@ -29,8 +33,11 @@ class MCTSConfig:
     margin_gamma: float = 10.0
     exploration_c: float = 0.01
     epsilon: float = 1e-8
+    stop_mode: str = "candidates"
 
     def __post_init__(self):
+        if self.stop_mode not in ("candidates", "budget"):
+            raise ValueError("mcts.stop_mode must be candidates or budget.")
         for name in ("init_tokens", "num_candidates", "top_k_tokens",
                      "top_k_actions", "max_model_calls"):
             if type(getattr(self, name)) is not int or getattr(self, name) < 1:
@@ -373,7 +380,7 @@ class MCTSSearch:
             node = node.parent
 
     def _finish_if_needed(self):
-        if len(self.candidates) >= self.config.num_candidates:
+        if self.config.stop_mode == "candidates" and len(self.candidates) >= self.config.num_candidates:
             reason = "candidate_quota"
         elif self.model_calls >= self.config.max_model_calls:
             reason = "model_call_budget"
@@ -392,8 +399,9 @@ class MCTSSearch:
         """Return ordered events for one selection/expansion/evaluation/backup cycle.
 
         Finish the retained sibling set unless the call budget is exhausted.
-        Candidate quotas are checked after the cycle, so a cycle can collect
-        more than C candidates. Calling step() after termination returns [].
+        In candidates mode, quotas are checked after the cycle, so a cycle can
+        collect more than C candidates. budget mode ignores this quota.
+        Calling step() after termination returns [].
         """
         if self.done:
             return []
@@ -459,12 +467,19 @@ class MCTSSearch:
         deepest = max(node.depth for node in pool)
         pool = [node for node in pool if node.depth == deepest]
         selected = min(pool, key=lambda node: (-self._score(node), node.node_id))
-        fallback = self.done and len(candidates) < self.config.num_candidates
+        fallback = self.done and (not candidates if self.config.stop_mode == "budget"
+                                  else len(candidates) < self.config.num_candidates)
+        evaluated = [node for node in self.nodes if node.parent is not None and node.analysis is not None]
+        expanded_parents = len({node.parent.node_id for node in evaluated})
         stats = {"finished": self.done, "stop_reason": self.stop_reason,
+                 "stop_mode": self.config.stop_mode,
                  "search_model_calls": self.model_calls, "cycles": self.cycle,
                  "requested_depth": self.config.init_tokens, "selected_depth": selected.depth,
                  "max_depth": max(node.depth for node in self.nodes),
-                 "candidate_target": self.config.num_candidates, "candidate_count": len(candidates),
+                 "candidate_target": self.config.num_candidates if self.config.stop_mode == "candidates" else None,
+                 "candidate_count": len(candidates),
+                 "evaluated_children": len(evaluated), "expanded_parents": expanded_parents,
+                 "realized_branching_factor": len(evaluated) / expanded_parents if expanded_parents else 0.0,
                  "candidate_ids": [node.node_id for node in candidates],
                  "selected_node_id": selected.node_id, "selected_score": self._score(selected),
                  "fallback_used": fallback,
