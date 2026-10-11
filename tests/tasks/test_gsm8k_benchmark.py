@@ -30,8 +30,9 @@ def manifest():
                         "revision": "a" * 40, "fingerprint": "controlled"}, "examples": examples}
 
 
-def config_for(tmp_path):
-    config = load_config(ROOT / "configs/gsm8k/decoding.yaml")
+def config_for(tmp_path, family="llada"):
+    filename = "illada_decoding.yaml" if family == "illada" else "decoding.yaml"
+    config = load_config(ROOT / "configs/gsm8k" / filename)
     config["experiment_root"] = str(tmp_path)
     config["data"]["num_samples"] = 2
     config["model"].update(device="cpu", dtype="float32")
@@ -39,8 +40,11 @@ def config_for(tmp_path):
     return config
 
 
-def wrapper(texts=None):
+def wrapper(texts=None, family="llada"):
     prompts = []
+    mask_id = 5 if family == "illada" else MASK
+    prompt_ids = torch.tensor([[3, 5]]) if family == "illada" else PROMPT
+    model = FakeModel(lambda _: [.05, .6, .2, .1, .05, 0.]) if family == "illada" else FakeModel()
 
     class Tokenizer:
         def batch_decode(self, *args, **kwargs):
@@ -48,32 +52,35 @@ def wrapper(texts=None):
 
     def encode(prompt):
         prompts.append(prompt)
-        return PROMPT.clone()
+        return prompt_ids.clone()
 
-    profile = get_profile("llada")
-    return SimpleNamespace(device="cpu", mask_id=MASK, model=FakeModel(),
+    profile = get_profile(family)
+    return SimpleNamespace(device="cpu", mask_id=mask_id, model=model, family=family,
                            identity={"repo_id": profile["repo_id"], "revision": profile["revision"],
+                                     "family": family, "mask_id": mask_id,
                                      "controlled_test_model": True},
                            tokenizer=Tokenizer(), encode_prompt=encode), prompts
 
 
 @pytest.mark.parametrize("method", tuple(benchmark.DECODERS))
-def test_benchmark_one_load_reference_isolation_and_cost(tmp_path, monkeypatch, method):
+@pytest.mark.parametrize("family", benchmark.MODEL_FAMILIES)
+def test_benchmark_one_load_reference_isolation_and_cost(tmp_path, monkeypatch, method, family):
     frozen = manifest()
     monkeypatch.setattr(benchmark, "get_manifest", lambda *a, **k: frozen)
-    instance, prompts = wrapper()
+    instance, prompts = wrapper(family=family)
     loads = []
 
     def factory(config):
         loads.append(config)
         return instance
 
-    source = config_for(tmp_path)
+    source = config_for(tmp_path, family)
     before = copy.deepcopy(source)
     directory, metrics = benchmark.run_evaluation(method, source, model_factory=factory)
     assert source == before
     assert len(loads) == metrics["model_load_count"] == 1
     assert metrics["status"] == "completed"
+    assert metrics["model_family"] == family
     assert metrics["accuracy"] == 1 and metrics["correct"] == metrics["processed"] == 2
     assert metrics["parse_failures"] == 0 and metrics["questions_per_second"] > 0
     forwards = 20 if method == "best_of_5" else 4
@@ -87,7 +94,12 @@ def test_benchmark_one_load_reference_isolation_and_cost(tmp_path, monkeypatch, 
     assert all(row["dataset_revision"] == "a" * 40 for row in records)
     assert all((directory / row["trace_file"]).is_file() for row in records)
     assert all(row["peak_gpu_memory_bytes"] is None for row in records)
+    assert all(row["model_family"] == family for row in records)
+    assert all(row["mask_token_id"] == instance.mask_id for row in records)
+    if family == "illada":
+        assert all(torch.equal(state[:, :2], torch.tensor([[3, 5]])) for state in instance.model.seen)
     assert method in directory.parts and "smoke" in directory.parts
+    assert get_profile(family)["label"] in directory.parts
     saved = json.loads((directory / "config.json").read_text())
     assert saved["run"]["manifest_hash"] == digest(frozen)
     assert saved["provenance"]["model"] == instance.identity
@@ -252,7 +264,12 @@ def test_manifest_validation_detects_corruption(corruption):
 
 def test_cli_applies_overrides_without_loading_model(tmp_path, monkeypatch):
     captured = []
-    monkeypatch.setattr(benchmark, "run_evaluation", lambda *a, **k: captured.append((a, k)))
+
+    def run(*args, **kwargs):
+        captured.append((args, kwargs))
+        return tmp_path / "run", {"status": "completed"}
+
+    monkeypatch.setattr(benchmark, "run_evaluation", run)
     monkeypatch.setattr(sys, "argv", ["script", "--profile", "initial", "--num-samples", "10",
                                      "--seed", "17", "--temperature", "0", "--model-path", str(tmp_path),
                                      "--local-files-only", "--manifest", str(tmp_path / "manifest.json"),
@@ -264,6 +281,73 @@ def test_cli_applies_overrides_without_loading_model(tmp_path, monkeypatch):
     assert config["decoding"]["seed"] == 17 and config["generation"]["temperature"] == 0
     assert config["model"]["model_path"] == str(tmp_path) and config["model"]["local_files_only"] is True
     assert kwargs["manifest_path"] == tmp_path / "manifest.json"
+
+
+@pytest.mark.parametrize("family", benchmark.MODEL_FAMILIES)
+@pytest.mark.parametrize("method", tuple(benchmark.DECODERS))
+def test_cli_defaults_and_run_receipt(tmp_path, monkeypatch, family, method):
+    captured = []
+    directory = tmp_path / "exact-run"
+    receipt = tmp_path / "receipts/run.json"
+
+    def run(*args, **kwargs):
+        captured.append((args, kwargs))
+        return directory, {"status": "completed"}
+
+    monkeypatch.setattr(benchmark, "run_evaluation", run)
+    monkeypatch.setattr(sys, "argv", ["script", "--profile", "initial", "--run-manifest", str(receipt)])
+    filename = "illada_decoding.yaml" if family == "illada" else "decoding.yaml"
+    benchmark.main(method, default_config=ROOT / "configs/gsm8k" / filename, expected_family=family)
+    config = captured[0][0][1]
+    assert config["model"]["family"] == family
+    assert config["model"]["model_path"] == get_profile(family)["repo_id"]
+    assert config["data"]["num_samples"] == 100
+    assert json.loads(receipt.read_text()) == {
+        "run_dir": str(directory), "status": "completed", "model_family": family,
+        "method": method, "profile": "initial",
+    }
+
+
+@pytest.mark.parametrize("expected_family", benchmark.MODEL_FAMILIES)
+def test_cli_rejects_other_model_family_before_loading(tmp_path, monkeypatch, capsys, expected_family):
+    filename = "decoding.yaml" if expected_family == "illada" else "illada_decoding.yaml"
+    monkeypatch.setattr(sys, "argv", ["script", "--config", str(ROOT / "configs/gsm8k" / filename)])
+    monkeypatch.setattr(benchmark, "run_evaluation", lambda *a, **k: pytest.fail("Loaded the wrong family"))
+    with pytest.raises(SystemExit) as error:
+        benchmark.main("confidence", expected_family=expected_family)
+    assert error.value.code == 2
+    assert f"requires model.family: {expected_family}" in capsys.readouterr().err
+
+
+def test_failed_evaluation_does_not_publish_run_receipt(tmp_path, monkeypatch):
+    receipt = tmp_path / "run.json"
+
+    def failed(*args, **kwargs):
+        raise RuntimeError("controlled failure")
+
+    monkeypatch.setattr(benchmark, "run_evaluation", failed)
+    monkeypatch.setattr(sys, "argv", ["script", "--run-manifest", str(receipt)])
+    with pytest.raises(RuntimeError, match="controlled failure"):
+        benchmark.main("confidence")
+    assert not receipt.exists()
+
+
+@pytest.mark.parametrize("family", benchmark.MODEL_FAMILIES)
+def test_family_specific_default_checkpoint(tmp_path, family):
+    config = config_for(tmp_path, family)
+    config["model"].pop("model_path")
+    resolved = benchmark.resolve_settings("confidence", config)
+    assert resolved["model"]["model_path"] == get_profile(family)["repo_id"]
+
+
+@pytest.mark.parametrize("family", benchmark.MODEL_FAMILIES)
+def test_checkpoint_verification_rejects_other_family(tmp_path, monkeypatch, family):
+    monkeypatch.setattr(benchmark, "get_manifest", lambda *a, **k: manifest())
+    other = "llada" if family == "illada" else "illada"
+    instance, _ = wrapper(family=other)
+    with pytest.raises(ValueError, match="pinned"):
+        benchmark.run_evaluation("confidence", config_for(tmp_path, family), model_factory=lambda _: instance)
+    assert not instance.model.seen
 
 
 @pytest.mark.parametrize("overrides", [

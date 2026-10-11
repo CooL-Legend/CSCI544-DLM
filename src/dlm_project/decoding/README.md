@@ -1,7 +1,7 @@
-# LLaDA decoding methods
+# LLaDA and iLLaDA decoding methods
 
-Four decoder modules evaluate the same pinned `GSAI-ML/LLaDA-8B-Instruct`
-checkpoint on GSM8K. They share fixed-length masked sampling, block scheduling,
+Four decoder modules evaluate the pinned `GSAI-ML/LLaDA-8B-Instruct` and
+`GSAI-ML/iLLaDA-8B-Instruct` checkpoints on GSM8K. They share fixed-length masked sampling, block scheduling,
 chat formatting, and strict final-answer scoring. No training or MCTS is involved
 in these four evaluation commands.
 
@@ -74,6 +74,11 @@ returns a normalized answer string or `None`. Its metadata includes all five
 raw outputs, extracted answers, seeds, forward counts, votes, and the selected
 candidate index. Candidate generation is sequential and reuses the loaded model.
 
+Use `LLaDA(family="illada")` with the iLLaDA dependency profile to run the same
+API on iLLaDA. The wrapper supplies its checkpoint chat template and mask token
+**5**; the original LLaDA mask token is **126336**. These methods use fixed-length
+generation for both families, without enabling iLLaDA's variable-length option.
+
 ## GSM8K commands
 
 In an environment with suitable PyTorch installed:
@@ -89,6 +94,26 @@ python scripts/eval_gsm8k_best_of_5.py
 ```
 
 Defaults come from [the benchmark configuration](../../../configs/gsm8k/decoding.yaml).
+For iLLaDA, use its dedicated entrypoints and dependency profile in a separate
+environment or rerun the dependency installation in Colab before switching models:
+
+```bash
+python -m pip install -r requirements/illada-colab.txt -r requirements/dev.txt
+python -m pip install --no-deps -e .
+
+python scripts/eval_illada_gsm8k_random_mdm.py
+python scripts/eval_illada_gsm8k_top_k_margin.py
+python scripts/eval_illada_gsm8k_confidence.py
+python scripts/eval_illada_gsm8k_best_of_5.py
+```
+
+These scripts default to [the iLLaDA configuration](../../../configs/gsm8k/illada_decoding.yaml)
+and require `model.family: illada`; the original entrypoints require `llada`.
+The shared runner verifies the selected family's pinned checkpoint revision.
+The [iLLaDA Colab notebook](../../../notebooks/gsm8k/iLLaDA_GSM8K_Colab.ipynb)
+downloads from `adi`, caches the model, streams all four runs, and displays five
+randomly selected saved answers after each method.
+
 Every command supports the same profiles:
 
 | Profile | Default questions | Purpose |
@@ -104,12 +129,15 @@ python scripts/eval_gsm8k_best_of_5.py --profile smoke --num-samples 10
 python scripts/eval_gsm8k_random_mdm.py --model-path /path/to/cached/LLaDA-8B-Instruct --local-files-only
 ```
 
-All four support `--config`, `--profile`, `--num-samples`, `--seed`,
-`--temperature`, `--model-path`, `--local-files-only`, `--manifest`, and
-`--output-dir`. `--num-samples` overrides the profile count with 1–1,319 test
+All evaluation entrypoints support `--config`, `--profile`, `--num-samples`, `--seed`,
+`--temperature`, `--model-path`, `--local-files-only`, `--manifest`,
+`--output-dir`, and `--run-manifest`. `--num-samples` overrides the profile count with 1–1,319 test
 questions. Local model snapshots must retain their `.model_source.json` file so
 the pinned model identity can be verified. Override configuration values for
 GPU device, dtype, dataset cache, generation length, steps, and block size in YAML.
+`--run-manifest /path/to/receipt.json` writes a receipt after successful evaluation,
+containing `run_dir`, `status`, `model_family`, `method`, and `profile`. The iLLaDA
+notebook uses a unique receipt for each invocation so previews select that exact run.
 
 The first invocation freezes the complete `openai/gsm8k`, `main`, `test` split
 at an immutable dataset revision in `<experiment_root>/manifests/gsm8k_test.json`.
@@ -118,7 +146,7 @@ Publication uses an exclusive-create lock and a temporary-file rename, so no
 hard-link support is needed on mounted Google Drive.
 Smoke and initial profiles use the first 20 and 100 test rows; full uses all rows.
 Use the same manifest across methods to keep questions, references, revision,
-and ordering identical. Set `data.revision` to an immutable SHA when a revision
+and ordering identical across both model families. Set `data.revision` to an immutable SHA when a revision
 must be chosen explicitly; mismatches with an existing manifest are rejected.
 
 For source row `i`, the question seed is `(base_seed + 5*i) % 2**63`.
@@ -143,6 +171,10 @@ results/LLaDA/GSM8K/<method>/<profile>/gen256-steps256-blk128-temp1-seed1/<times
 ├── metrics.json
 └── traces/test_0000.jsonl, ...
 ```
+
+For iLLaDA, the artifact root is `results/iLLaDA/GSM8K/` with the same
+method/profile/settings structure and separate checkpoint provenance. Predictions
+and metrics identify `model_family`; predictions also include `mask_token_id`.
 
 Each invocation creates a collision-safe timestamp directory in the configured
 timezone. `--output-dir` replaces the artifact parent; method, profile, settings,

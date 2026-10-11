@@ -2,16 +2,17 @@
 
 Evaluate **LLaDA-8B-Instruct**, **iLLaDA-8B-Instruct**, and **LLaDA-8B-BGPO-sudoku** on Sudoku for CSCI 544 Applied NLP. Develop locally, run inference on **Google Colab Pro**, and keep model weights and experiment artifacts in **Google Drive**.
 
-For a simpler look at prompting, the **LLaDA GSM8K notebook** starts with one math word problem and shows the user message, HF chat formatting, token IDs, generated response and answer comparison.
+The **LLaDA and iLLaDA GSM8K notebooks** evaluate four decoding methods and display accuracy, inference cost, and randomly selected saved answers.
 
 | Model | Notebook on `adi` | Dependency profile |
 | --- | --- | --- |
 | LLaDA | [Open LLaDA in Colab](https://colab.research.google.com/github/CooL-Legend/CSCI544-DLM/blob/adi/notebooks/sudoku/LLaDA_Sudoku_Colab.ipynb) | Transformers 4.38.2 |
 | iLLaDA | [Open iLLaDA in Colab](https://colab.research.google.com/github/CooL-Legend/CSCI544-DLM/blob/adi/notebooks/sudoku/iLLaDA_Sudoku_Colab.ipynb) | Transformers 4.57.1, Tokenizers 0.22.2, Hugging Face Hub 0.36.2 |
 | Original LLaDA vs BGPO — 4×4 Sudoku | [Open comparison in Colab](https://colab.research.google.com/github/CooL-Legend/CSCI544-DLM/blob/adi/notebooks/sudoku/LLaDA_BGPO_Sudoku_Colab.ipynb) | Transformers 4.53.2 |
-| LLaDA — GSM8K prompt walkthrough | [Open GSM8K in Colab](https://colab.research.google.com/github/CooL-Legend/CSCI544-DLM/blob/adi/notebooks/gsm8k/LLaDA_GSM8K_Colab.ipynb) | Transformers 4.38.2 |
+| LLaDA — GSM8K decoders | [Open LLaDA GSM8K in Colab](https://colab.research.google.com/github/CooL-Legend/CSCI544-DLM/blob/adi/notebooks/gsm8k/LLaDA_GSM8K_Colab.ipynb) | Transformers 4.38.2 |
+| iLLaDA — GSM8K decoders | [Open iLLaDA GSM8K in Colab](https://colab.research.google.com/github/CooL-Legend/CSCI544-DLM/blob/adi/notebooks/gsm8k/iLLaDA_GSM8K_Colab.ipynb) | Transformers 4.57.1, Tokenizers 0.22.2, Hugging Face Hub 0.36.2 |
 
-This repository is private. Authorize Colab to read it through GitHub, or download the desired notebook and use **File → Upload notebook**. An older notebook copy saved in Drive does not automatically receive repository changes. All notebooks check out `adi` and display its commit before running.
+This repository is private. Authorize Colab to read it through GitHub, or download the desired notebook and use **File → Upload notebook**. An older notebook copy saved in Drive does not automatically receive repository changes. Both GSM8K notebooks check out `adi` and display its commit before running.
 
 ## Repository structure
 
@@ -37,8 +38,8 @@ Install the package with `python -m pip install --no-deps -e .` after installing
 
 Four separate search-free GSM8K decoders and their evaluation commands are in the
 [decoding methods README](src/dlm_project/decoding/README.md): random MDM,
-Top-K Margin, token-probability confidence decoding, and majority-vote Best-of-5. Each uses the same
-pinned original LLaDA checkpoint and frozen GSM8K examples; the guide defines
+Top-K Margin, token-probability confidence decoding, and majority-vote Best-of-5.
+Both LLaDA and iLLaDA use their pinned checkpoints and the same frozen GSM8K examples; the guide defines
 their accuracy, NFE, runtime and method-specific metrics.
 
 The [milestone sweep guide](docs/milestone1_sweeps.md) provides two scripts using the **same pinned original LLaDA** model: GSM8K and BGPO's **4×4 dataset**. Each compares baseline, confidence-only, and fixed-branching MCTS with search caps of **128, 256 and 512 forwards**, using the current **one-step entropy evaluator**. It saves frozen manifests, per-example traces/scores/compute, paired summaries, Wilson intervals, and PNG/PDF reports.
@@ -96,21 +97,32 @@ Each evaluation uses a fresh Python process and loads the model once. If you swi
 
 The LLaDA Sudoku notebook includes **Check the search on CUDA before loading LLaDA** after dependency installation. It runs three tiny controlled-model tests on the GPU, then the later inspection/generation cells verify the actual HF model reports a CUDA device. Forward passes, softmax, entropy and confidence factors use the GPU; compact tree states and trace bookkeeping remain on CPU to conserve GPU memory. Saved statistics distinguish `model_device` from `search_state_device`.
 
-## GSM8K: start with one prompt
+## GSM8K decoder evaluations
 
-[`notebooks/gsm8k/LLaDA_GSM8K_Colab.ipynb`](notebooks/gsm8k/LLaDA_GSM8K_Colab.ipynb) follows the same checkout → dependencies → Drive → configuration → model cache → generation → inspection flow. It reuses the existing LLaDA model snapshot and starts with **baseline decoding**, one question, and `configs/gsm8k/llada.yaml`.
+The [LLaDA notebook](notebooks/gsm8k/LLaDA_GSM8K_Colab.ipynb) and [iLLaDA notebook](notebooks/gsm8k/iLLaDA_GSM8K_Colab.ipynb) follow the same checkout → dependencies → Drive → configuration → model cache → four decoding methods → answer inspection flow. Run setup steps 1–5, configure the benchmark, and run the methods you want. The iLLaDA notebook installs `requirements/illada-colab.txt` and caches its own pinned snapshot with mask token **5**.
 
-In Config Updater, change `QUESTION_INDEX`, `PROMPT_INSTRUCTIONS`, or `CUSTOM_QUESTION`. The default is the first question from [`openai/gsm8k`, `main`, `test`](https://huggingface.co/datasets/openai/gsm8k). Prompt preview runs without loading weights. Generation loads one model in a fresh CUDA subprocess and saves both the raw user prompt and its chat-token view. The reference solution is used only after generation; custom questions have no reference score.
+The iLLaDA configuration controls default to temperature **1.0**, 256 output positions and steps, 128-token blocks, and seed 1. Set `PROFILE` to `smoke` (20 questions), `initial` (100), or `full` (1,319); `NUM_SAMPLES = None` uses that profile's count. Both models reuse the ordered `openai/gsm8k`, `main`, `test` manifest on Drive. References enter only post-generation scoring, using the strict final `#### <number>` line parser.
 
-After generation, inspect the visible chat control tokens, input token IDs, output mask count, raw response, extracted final answer, and GPU statistics. Answer comparison requires a final `#### <number>` line and normalizes numeric formatting. A missing marker is reported as a parse failure; the scorer does not guess from intermediate calculations. This is a single-example walkthrough, not a benchmark evaluation.
+Each iLLaDA method streams its subprocess output, writes a unique run receipt, and saves artifacts under `iLLaDA/GSM8K/<method>/<profile>/<settings>/<timestamp>/`. Preview cells display metrics and five randomly selected responses from that exact run; rerunning a preview performs no inference. All five Best-of-5 candidates count toward inference cost. The original LLaDA notebook and its saved responses are retained.
 
-Artifacts are saved under `LLaDA/GSM8K/<generation-config>/<timestamp>/`: `config.json`, `prompt.json`, `response.txt`, `predictions.jsonl`, `metrics.json`, and `trace.jsonl`. To preview locally without GPU weights:
+On a configured CUDA machine with the iLLaDA dependency profile installed:
+
+```bash
+python scripts/eval_illada_gsm8k_random_mdm.py --profile smoke
+python scripts/eval_illada_gsm8k_top_k_margin.py --profile smoke
+python scripts/eval_illada_gsm8k_confidence.py --profile smoke
+python scripts/eval_illada_gsm8k_best_of_5.py --profile smoke
+```
+
+Each iLLaDA entrypoint defaults to `configs/gsm8k/illada_decoding.yaml` and rejects configurations for other model families. Add `--run-manifest /path/to/receipt.json` to save its exact completed run directory. See [the decoding README](src/dlm_project/decoding/README.md) for all CLI options and metrics. New notebooks and scripts must be available on `adi` before the Colab checkout can use them.
+
+The single-question LLaDA walkthrough remains available through its original CLI. To preview without GPU weights:
 
 ```bash
 python scripts/run_gsm8k.py --config configs/gsm8k/llada.yaml --prompt-only
 ```
 
-Run the same command without `--prompt-only` on a configured CUDA machine for generation. Set the model path/cache settings in the notebook's configuration as usual. New notebook and runner files must be available on `adi` before using the Colab repository checkout.
+Run the same command without `--prompt-only` on a configured CUDA machine for generation and prompt-token inspection.
 
 ## Drive layout and artifacts
 
@@ -259,7 +271,7 @@ Run in each dependency environment:
 python -m pytest -q
 ```
 
-GitHub Actions tests all three dependency profiles on CPU. Checks cover string data loading, 4×4 and 9×9 scoring, incomplete/invalid plots, model and mask selection, snapshot files, warm staging, experiment names and timezones, same-second collisions, partial artifact persistence, safe branch checkout, and all four notebooks' structure and cleared outputs. Paired-comparison tests cover prompt/ID/seed alignment, separate checkpoint identities, sequential subprocesses, failed comparisons, and the notebook's shared settings. Controlled fake-model tests additionally cover confidence filtering, negative/near-zero entropy rewards, UCB and backups, independent states, fixed commitments, deduplication, exhausted branches, hard call budgets, fallback ranking, trace accounting, and equivalence of `step()` and `run()`.
+GitHub Actions tests all three dependency profiles on CPU. Checks cover string data loading, 4×4 and 9×9 scoring, incomplete/invalid plots, model and mask selection, snapshot files, warm staging, experiment names and timezones, same-second collisions, partial artifact persistence, safe branch checkout, and notebook structure. The new iLLaDA GSM8K notebook has cleared outputs; the supplied LLaDA GSM8K reference retains its saved responses. GSM8K checks cover both model families, all four decoders, exact run receipts, shared manifests, streamed errors, and previews without inference. Paired-comparison tests cover prompt/ID/seed alignment, separate checkpoint identities, sequential subprocesses, failed comparisons, and the notebook's shared settings. Controlled fake-model tests additionally cover confidence filtering, negative/near-zero entropy rewards, UCB and backups, independent states, fixed commitments, deduplication, exhausted branches, hard call budgets, fallback ranking, trace accounting, and equivalence of `step()` and `run()`.
 
 CPU tests do not establish 8B model quality or GPU behavior. Verify each notebook's one-puzzle run, three-puzzle run, warm-cache rerun, and saved Drive artifacts on Colab Pro.
 

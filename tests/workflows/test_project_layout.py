@@ -22,6 +22,8 @@ from dlm_project.paths import PROJECT_ROOT as ROOT
     "eval_gsm8k_random_mdm.py", "eval_gsm8k_topk_margin.py",
     "eval_gsm8k_confidence.py", "eval_gsm8k_best_of_five.py",
     "eval_gsm8k_top_k_margin.py", "eval_gsm8k_best_of_5.py",
+    "eval_illada_gsm8k_random_mdm.py", "eval_illada_gsm8k_top_k_margin.py",
+    "eval_illada_gsm8k_confidence.py", "eval_illada_gsm8k_best_of_5.py",
 ])
 def test_installed_entry_points_work_outside_checkout(tmp_path, script):
     # -I ignores PYTHONPATH and the script directory. Imports must come from
@@ -39,11 +41,12 @@ def test_installed_entry_points_work_outside_checkout(tmp_path, script):
     ("sudoku/LLaDA_Sudoku_Colab.ipynb", "cell-05", "llada-colab.txt"),
     ("sudoku/iLLaDA_Sudoku_Colab.ipynb", "cell-05", "illada-colab.txt"),
     ("gsm8k/LLaDA_GSM8K_Colab.ipynb", "dependencies", "llada-colab.txt"),
+    ("gsm8k/iLLaDA_GSM8K_Colab.ipynb", "dependencies", "illada-colab.txt"),
     ("sudoku/LLaDA_BGPO_Sudoku_Colab.ipynb", "dependencies", "bgpo-colab.txt"),
 ])
 def test_notebook_installs_package_and_refreshes_kernel_paths(monkeypatch, notebook, cell_id, profile):
     cells = json.loads((ROOT / "notebooks" / notebook).read_text())["cells"]
-    source = "".join(next(cell for cell in cells if cell["id"] == cell_id)["source"])
+    source = "".join(next(cell for cell in cells if cell.get("id") == cell_id)["source"])
     commands, refreshed = [], []
 
     def run(command, *, check):

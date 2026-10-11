@@ -26,10 +26,12 @@ from dlm_project.tasks.gsm8k.evaluation import extract_answer, score_answer
 
 DECODERS = {"random_mdm": random_mdm.decode, "top_k_margin": top_k_margin.decode,
             "confidence": confidence.decode, "best_of_5": best_of_5.decode}
+MODEL_FAMILIES = ("llada", "illada")
 
 
 def resolve_settings(method, source, *, profile=None, num_samples=None, seed=None,
-                     temperature=None, model_path=None, local_files_only=None):
+                     temperature=None, model_path=None, local_files_only=None,
+                     expected_family=None):
     """Resolve CLI overrides without changing the caller's configuration."""
     if method not in DECODERS:
         raise ValueError(f"Unknown decoder: {method}")
@@ -53,10 +55,13 @@ def resolve_settings(method, source, *, profile=None, num_samples=None, seed=Non
     if prompt.get("custom_question") is not None:
         raise ValueError("Custom questions are not supported by the GSM8K accuracy benchmark.")
     model = config.setdefault("model", {})
-    model.setdefault("family", "llada")
-    if model["family"] != "llada":
-        raise ValueError("Decoder benchmarks require model.family: llada.")
-    for key, value in (("model_path", get_profile("llada")["repo_id"]), ("device", "cuda"),
+    model.setdefault("family", expected_family or "llada")
+    if model["family"] not in MODEL_FAMILIES:
+        raise ValueError("Decoder benchmarks require model.family: llada or illada.")
+    if expected_family is not None and model["family"] != expected_family:
+        raise ValueError(f"This entrypoint requires model.family: {expected_family}.")
+    model_profile = get_profile(model["family"])
+    for key, value in (("model_path", model_profile["repo_id"]), ("device", "cuda"),
                        ("dtype", "bfloat16"), ("local_files_only", False)):
         model.setdefault(key, value)
     if model_path is not None:
@@ -94,10 +99,11 @@ def _load_model(config):
     return LLaDA(**config["model"])
 
 
-def _verify_model(wrapper):
-    pinned = get_profile("llada")
-    if any(wrapper.identity.get(key) != pinned[key] for key in ("repo_id", "revision")):
-        raise ValueError("The benchmark requires the pinned original LLaDA checkpoint; "
+def _verify_model(wrapper, family):
+    pinned = get_profile(family)
+    if (any(wrapper.identity.get(key) != pinned[key] for key in ("repo_id", "revision"))
+            or wrapper.identity.get("family", family) != family):
+        raise ValueError(f"The benchmark requires the pinned {pinned['label']} checkpoint; "
                          "local snapshots must include .model_source.json.")
 
 
@@ -116,6 +122,7 @@ def _metrics(config, state, records):
     calls = sum(row["total_model_calls"] for row in records)
     memory = [row["peak_gpu_memory_bytes"] for row in records if row["peak_gpu_memory_bytes"] is not None]
     return {"status": state["status"], "method": config["decoding"]["method"],
+            "model_family": config["model"]["family"],
             "profile": config["evaluation"]["profile"],
             "requested_examples": config["data"]["num_samples"], "processed": count,
             "correct": sum(row["exact_match"] for row in records),
@@ -147,7 +154,8 @@ def run_evaluation(method, source, *, manifest_path=None, output_dir=None, model
     generation = config["generation"]
     name = (f"gen{generation['gen_length']}-steps{generation['steps']}-blk{generation['block_length']}-"
             f"temp{generation['temperature']:g}-seed{config['decoding']['seed']}")
-    parent = Path(output_dir).expanduser() if output_dir else root / "LLaDA/GSM8K"
+    model_profile = get_profile(config["model"]["family"])
+    parent = Path(output_dir).expanduser() if output_dir else root / model_profile["label"] / "GSM8K"
     parent = parent / method / config["evaluation"]["profile"] / name
     directory, started = create_run_directory({"output_dir": str(parent),
                                                "experiment_timezone": config.get("experiment_timezone", "America/Los_Angeles")})
@@ -175,7 +183,7 @@ def run_evaluation(method, source, *, manifest_path=None, output_dir=None, model
         wrapper = (model_factory or _load_model)(config)
         _sync(wrapper.device)
         state.update(model_load_count=1, model_loading_seconds=perf_counter() - load_started)
-        _verify_model(wrapper)
+        _verify_model(wrapper, config["model"]["family"])
         config["provenance"]["model"] = wrapper.identity
         save_json(directory / "config.json", config)
         save_progress()
@@ -208,6 +216,7 @@ def run_evaluation(method, source, *, manifest_path=None, output_dir=None, model
                     for event in result.trace:
                         trace.write(json.dumps(event, allow_nan=False) + "\n")
                 row = {"example_id": example["example_id"], "row_id": example["row_id"],
+                       "model_family": config["model"]["family"], "mask_token_id": wrapper.mask_id,
                        "method": method, "seed": seed, "prompt": prompt, "prompt_hash": digest(prompt),
                        "content_hash": example["content_hash"], "reference_solution": example["reference_solution"],
                        "raw_output": text, **score, "model_revision": wrapper.identity["revision"],
@@ -234,9 +243,11 @@ def run_evaluation(method, source, *, manifest_path=None, output_dir=None, model
     return directory, metrics
 
 
-def main(method):
-    parser = argparse.ArgumentParser(description=f"LLaDA GSM8K accuracy with {method} decoding.")
-    parser.add_argument("--config", type=Path, default=PROJECT_ROOT / "configs/gsm8k/decoding.yaml")
+def main(method, *, default_config=None, expected_family="llada"):
+    label = get_profile(expected_family)["label"]
+    parser = argparse.ArgumentParser(description=f"{label} GSM8K accuracy with {method} decoding.")
+    parser.add_argument("--config", type=Path,
+                        default=default_config or PROJECT_ROOT / "configs/gsm8k/decoding.yaml")
     parser.add_argument("--profile", choices=tuple(PROFILE_SIZES))
     parser.add_argument("--num-samples", type=int, help="Override the profile's question count")
     parser.add_argument("--seed", type=int)
@@ -245,11 +256,18 @@ def main(method):
     parser.add_argument("--local-files-only", action="store_true", default=None)
     parser.add_argument("--manifest", type=Path, help="Shared pinned GSM8K test manifest")
     parser.add_argument("--output-dir", type=Path, help="Artifact parent; adds method/profile/settings/timestamp")
+    parser.add_argument("--run-manifest", type=Path, help="Write the exact completed run directory to a JSON receipt")
     args = parser.parse_args()
     try:
         config = resolve_settings(method, load_config(args.config), profile=args.profile,
                                   num_samples=args.num_samples, seed=args.seed, temperature=args.temperature,
-                                  model_path=args.model_path, local_files_only=args.local_files_only)
+                                  model_path=args.model_path, local_files_only=args.local_files_only,
+                                  expected_family=expected_family)
     except (ValueError, TypeError, KeyError) as error:
         parser.error(str(error))
-    run_evaluation(method, config, manifest_path=args.manifest, output_dir=args.output_dir)
+    directory, metrics = run_evaluation(method, config, manifest_path=args.manifest, output_dir=args.output_dir)
+    if args.run_manifest:
+        args.run_manifest.parent.mkdir(parents=True, exist_ok=True)
+        save_json(args.run_manifest, {"run_dir": str(directory), "status": metrics["status"],
+                                      "model_family": config["model"]["family"], "method": method,
+                                      "profile": config["evaluation"]["profile"]})
