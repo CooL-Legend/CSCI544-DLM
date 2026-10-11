@@ -1,0 +1,26 @@
+# Four decoders share these settings and the same ordered GSM8K test manifest.
+model:
+  family: llada
+  model_path: GSAI-ML/LLaDA-8B-Instruct
+  device: cuda
+  dtype: bfloat16
+  local_files_only: false
+data:
+  num_samples: null  # smoke: 20; initial: 100; full: 1,319
+  cache_dir: null
+  revision: null  # Resolve once; later runs reuse the frozen test manifest.
+prompt:
+  instructions: |-
+    Solve the following math word problem. Explain your solution briefly.
+    End your response with a line in this exact format: #### <number>
+generation:
+  gen_length: 256
+  steps: 256
+  block_length: 128
+  temperature: 1.0
+decoding:
+  seed: 1
+evaluation:
+  profile: smoke
+experiment_root: results
+experiment_timezone: America/Los_Angeles

@@ -188,8 +188,10 @@ def generate(model, prompt, attention_mask=None, steps=128, gen_length=128, bloc
 
             x0_p[:, prompt.shape[1] + (num_block + 1) * block_length:] = -np.inf
 
-            x0 = torch.where(mask_index, x0, x)
-            confidence = torch.where(mask_index, x0_p, -np.inf)
+            # Only the current output block may be committed. A padded prompt
+            # can itself contain mask_id; those prompt positions are fixed.
+            x0 = torch.where(candidate_mask_index, x0, x)
+            confidence = torch.where(candidate_mask_index, x0_p, -np.inf)
 
             transfer_index = torch.zeros_like(x0, dtype=torch.bool, device=x0.device)
             for j in range(confidence.shape[0]):

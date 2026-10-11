@@ -35,6 +35,12 @@ Install the package with `python -m pip install --no-deps -e .` after installing
 
 ## Milestone 1 decoder sweeps
 
+Four separate search-free GSM8K decoders and their evaluation commands are in the
+[decoding methods README](src/dlm_project/decoding/README.md): random MDM,
+Top-K Margin, token-probability confidence decoding, and majority-vote Best-of-5. Each uses the same
+pinned original LLaDA checkpoint and frozen GSM8K examples; the guide defines
+their accuracy, NFE, runtime and method-specific metrics.
+
 The [milestone sweep guide](docs/milestone1_sweeps.md) provides two scripts using the **same pinned original LLaDA** model: GSM8K and BGPO's **4×4 dataset**. Each compares baseline, confidence-only, and fixed-branching MCTS with search caps of **128, 256 and 512 forwards**, using the current **one-step entropy evaluator**. It saves frozen manifests, per-example traces/scores/compute, paired summaries, Wilson intervals, and PNG/PDF reports.
 
 ```bash

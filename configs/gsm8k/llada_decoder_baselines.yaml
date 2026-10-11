@@ -1,0 +1,33 @@
+# Four search-free decoding baselines on the same original LLaDA checkpoint.
+model:
+  family: llada
+  model_path: GSAI-ML/LLaDA-8B-Instruct
+  device: cuda
+  dtype: bfloat16
+  local_files_only: false
+data:
+  num_samples: null  # smoke: 3 development; milestone: 50 evaluation
+  cache_dir: null
+  revision: null  # Resolved to a commit SHA in the first frozen manifest.
+prompt:
+  instructions: |-
+    Solve the following math word problem. Explain your solution briefly.
+    End your response with a line in this exact format: #### <number>
+generation:
+  gen_length: 256
+  steps: 256
+  block_length: 256
+  temperature: 0.0
+  remasking: low_confidence  # Per-method rules are implemented in their own files.
+decoding:
+  seed: 1
+  top_k_positions: 1
+  margin_gamma: 10.0
+  best_of_five:
+    score_block_size: 32
+evaluation:
+  profile: smoke
+  sample_seed: 1
+  warmup: true
+experiment_root: results
+experiment_timezone: America/Los_Angeles
