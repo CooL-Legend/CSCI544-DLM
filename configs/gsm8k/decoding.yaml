@@ -10,9 +10,14 @@ data:
   cache_dir: null
   revision: null  # Resolve once; later runs reuse the frozen test manifest.
 prompt:
+  # instructions: |-
+    # Solve the following math word problem. Explain your solution briefly.
+    # End your response with a line in this exact format: #### <number>
   instructions: |-
-    Solve the following math word problem. Explain your solution briefly.
-    End your response with a line in this exact format: #### <number>
+    Solve this math problem in English.
+    Use at most three short calculation lines.
+    End with a final line containing exactly #### followed by a plain number.
+    Do not include units, %, LaTeX, or any text after that number.
 generation:
   gen_length: 256
   steps: 256
