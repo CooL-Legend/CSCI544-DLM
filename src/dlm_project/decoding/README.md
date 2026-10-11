@@ -114,6 +114,8 @@ GPU device, dtype, dataset cache, generation length, steps, and block size in YA
 The first invocation freezes the complete `openai/gsm8k`, `main`, `test` split
 at an immutable dataset revision in `<experiment_root>/manifests/gsm8k_test.json`.
 Later invocations reuse that manifest without accessing the dataset or Hub.
+Publication uses an exclusive-create lock and a temporary-file rename, so no
+hard-link support is needed on mounted Google Drive.
 Smoke and initial profiles use the first 20 and 100 test rows; full uses all rows.
 Use the same manifest across methods to keep questions, references, revision,
 and ordering identical. Set `data.revision` to an immutable SHA when a revision

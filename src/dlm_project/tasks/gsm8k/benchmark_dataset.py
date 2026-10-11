@@ -6,6 +6,8 @@ from pathlib import Path
 import re
 import tempfile
 
+from filelock import SoftFileLock
+
 from dlm_project.experiments.manifests import digest
 from dlm_project.tasks.gsm8k.evaluation import extract_answer
 
@@ -43,9 +45,9 @@ def validate_manifest(manifest, revision=None):
 def get_manifest(path, *, cache_dir=None, revision=None):
     """Reuse offline or freeze all test rows at an immutable Hub revision.
 
-    Publish a completed temporary file using an exclusive link. Concurrent
-    invocations therefore reuse the first complete manifest rather than mixing
-    snapshots or reading a partially written JSON document.
+    Serialize publication with an exclusive-create lock, then rename a complete
+    temporary file. This also works on mounted Google Drive, which does not
+    support hard links. Concurrent writers reuse the first published snapshot.
     """
     path = Path(path).expanduser().resolve()
     if revision is not None and not re.fullmatch(r"[0-9a-f]{40}", str(revision)):
@@ -82,10 +84,13 @@ def get_manifest(path, *, cache_dir=None, revision=None):
             temporary = Path(handle.name)
             json.dump(manifest, handle, ensure_ascii=False, allow_nan=False)
             handle.write("\n")
-        try:
-            os.link(temporary, path)
-        except FileExistsError:
-            manifest = json.loads(path.read_text(encoding="utf-8"))
+        # SoftFileLock uses exclusive file creation rather than flock or hard
+        # links, so publication works on Colab's Drive filesystem as well.
+        with SoftFileLock(str(path) + ".lock", timeout=60):
+            if path.exists():
+                manifest = json.loads(path.read_text(encoding="utf-8"))
+            else:
+                os.replace(temporary, path)
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)

@@ -1,8 +1,10 @@
 """Full test manifests, shared profiles, benchmark metrics, and four CLIs."""
 
 import copy
+from concurrent.futures import ThreadPoolExecutor
 import json
 import sys
+from threading import Barrier
 from types import SimpleNamespace
 
 import pytest
@@ -165,6 +167,67 @@ def test_manifest_is_pinned_and_reused_offline(tmp_path, monkeypatch):
     assert benchmark_dataset.get_manifest(path) == created
     with pytest.raises(ValueError, match="differs"):
         benchmark_dataset.get_manifest(path, revision="b" * 40)
+    assert not list(tmp_path.glob("shared.json.*"))
+
+
+def test_manifest_publication_works_without_hard_links(tmp_path, monkeypatch):
+    import datasets
+
+    frozen = manifest()
+    rows = [{"question": row["question"], "answer": row["reference_solution"]}
+            for row in frozen["examples"]]
+    monkeypatch.setattr(datasets, "load_dataset", lambda *a, **k: rows)
+
+    def unsupported_link(*args, **kwargs):
+        raise PermissionError(1, "Operation not permitted on mounted Google Drive")
+
+    monkeypatch.setattr(benchmark_dataset.os, "link", unsupported_link)
+    path = tmp_path / "gsm8k_test.json"
+    created = benchmark_dataset.get_manifest(path, revision="a" * 40)
+    assert created == json.loads(path.read_text())
+    assert created["dataset"]["revision"] == "a" * 40
+    assert not list(tmp_path.glob("gsm8k_test.json.*"))
+
+
+def test_concurrent_manifest_writers_reuse_first_snapshot(tmp_path, monkeypatch):
+    import datasets
+    import huggingface_hub
+
+    rows = [{"question": row["question"], "answer": row["reference_solution"]}
+            for row in manifest()["examples"]]
+    barrier = Barrier(2)
+    revisions = iter(["a" * 40, "b" * 40])
+    monkeypatch.setattr(huggingface_hub.HfApi, "dataset_info",
+                        lambda *a: SimpleNamespace(sha=next(revisions)))
+
+    def loader(*args, **kwargs):
+        barrier.wait(timeout=10)
+        return rows
+
+    monkeypatch.setattr(datasets, "load_dataset", loader)
+    path = tmp_path / "shared.json"
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(benchmark_dataset.get_manifest, path) for _ in range(2)]
+        results = [future.result(timeout=10) for future in futures]
+    assert results[0] == results[1] == json.loads(path.read_text())
+    assert not list(tmp_path.glob("shared.json.*"))
+
+
+def test_failed_manifest_rename_cleans_up_files(tmp_path, monkeypatch):
+    import datasets
+
+    rows = [{"question": row["question"], "answer": row["reference_solution"]}
+            for row in manifest()["examples"]]
+    monkeypatch.setattr(datasets, "load_dataset", lambda *a, **k: rows)
+
+    def failed_rename(*args, **kwargs):
+        raise OSError("controlled rename failure")
+
+    monkeypatch.setattr(benchmark_dataset.os, "replace", failed_rename)
+    path = tmp_path / "shared.json"
+    with pytest.raises(OSError, match="controlled rename failure"):
+        benchmark_dataset.get_manifest(path, revision="a" * 40)
+    assert not path.exists()
     assert not list(tmp_path.glob("shared.json.*"))
 
 
