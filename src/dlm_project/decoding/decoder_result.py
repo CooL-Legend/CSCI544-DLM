@@ -1,4 +1,4 @@
-"""Small result contract shared by the four non-search decoders."""
+"""Small result contract shared by the GSM8K decoders."""
 
 from dataclasses import dataclass, field
 

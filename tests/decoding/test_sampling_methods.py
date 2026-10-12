@@ -85,6 +85,69 @@ def test_nonfinite_probabilities_raise():
                           gen_length=2, steps=2, block_length=2)
 
 
+def test_confidence_completes_sparse_state_preserving_prompt_and_initial_tokens():
+    initial = torch.cat((PROMPT, torch.tensor([[2, MASK, MASK, 3, MASK, 2]])), dim=1)
+    before = initial.clone()
+    model = FakeModel()
+    result = confidence.decode(model, PROMPT, MASK, gen_length=6, steps=6,
+                               block_length=3, seed=17, initial_state=initial)
+    assert torch.equal(initial, before)
+    fixed = before != MASK
+    for state in [*model.seen, result.token_ids]:
+        assert torch.equal(state[:, :2], PROMPT)
+        assert torch.equal(state[fixed], before[fixed])
+    actions = [action for event in result.trace for action in event["actions"]]
+    assert sorted(action["output_position"] for action in actions) == [1, 2, 4]
+    assert [event["block"] for event in result.trace] == [0, 0, 1]
+    assert model.seen[1][0, 6] == MASK  # The second block's remaining mask stays fixed.
+    assert result.total_nfes == len(model.seen) == 3
+    assert not (result.token_ids[:, 2:] == MASK).any()
+    assert result.token_ids.data_ptr() != initial.data_ptr()
+
+
+def test_confidence_skips_initialized_blocks_and_schedules_remaining_transfers():
+    initial = torch.cat((PROMPT, torch.tensor([[1, 2, 3, MASK, MASK, MASK]])), dim=1)
+    model = FakeModel()
+    result = confidence.decode(model, PROMPT, MASK, gen_length=6, steps=4,
+                               block_length=3, initial_state=initial)
+    assert result.total_nfes == len(model.seen) == 2
+    assert [event["block"] for event in result.trace] == [1, 1]
+    assert [len(event["actions"]) for event in result.trace] == [2, 1]
+    assert torch.equal(result.token_ids[:, :5], initial[:, :5])
+
+
+def test_confidence_completed_initial_state_costs_no_forwards_and_is_copied():
+    initial = torch.cat((PROMPT, torch.tensor([[1, 2, 3, 2]])), dim=1)
+    model = FakeModel()
+    result = confidence.decode(model, PROMPT, MASK, gen_length=4, steps=4,
+                               block_length=2, initial_state=initial)
+    assert result.total_nfes == 0 and model.seen == [] and result.trace == []
+    assert torch.equal(result.token_ids, initial)
+    assert result.token_ids.data_ptr() != initial.data_ptr()
+
+
+@pytest.mark.parametrize("initial", [
+    [3, 0, 1, 2, 3, 1], torch.zeros(6, dtype=torch.long),
+    torch.zeros((2, 6), dtype=torch.long), torch.zeros((1, 5), dtype=torch.long),
+    torch.zeros((1, 6), dtype=torch.float32), torch.ones((1, 6), dtype=torch.long),
+])
+def test_invalid_confidence_initial_state_fails_before_forward(initial):
+    model = FakeModel()
+    with pytest.raises(ValueError, match="initial_state"):
+        confidence.decode(model, PROMPT, MASK, gen_length=4, steps=4,
+                          block_length=2, initial_state=initial)
+    assert model.seen == []
+
+
+def test_all_mask_initial_state_matches_existing_confidence_sampling():
+    initial = torch.cat((PROMPT, torch.full((1, 6), MASK, dtype=torch.long)), dim=1)
+    kwargs = dict(gen_length=6, steps=4, block_length=3, seed=23)
+    baseline = confidence.decode(FakeModel(), PROMPT, MASK, **kwargs)
+    initialized = confidence.decode(FakeModel(), PROMPT, MASK, initial_state=initial, **kwargs)
+    assert torch.equal(baseline.token_ids, initialized.token_ids)
+    assert baseline.trace == initialized.trace
+
+
 @pytest.mark.parametrize("texts,answer,winner,votes", [
     (["#### 2", "#### 1.0", "#### 1", "no answer", "#### 1.00"], "1", 1, {"2": 1, "1": 3}),
     (["bad", "#### 4", "#### 5", "#### 5", "#### 4"], "4", 1, {"4": 2, "5": 2}),

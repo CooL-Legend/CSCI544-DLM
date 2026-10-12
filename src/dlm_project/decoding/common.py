@@ -1,4 +1,4 @@
-"""Shared fixed-length sampling for the four GSM8K decoding methods."""
+"""Shared fixed-length sampling and completion of partially masked outputs."""
 
 import math
 
@@ -23,28 +23,51 @@ def validate_generation(*, gen_length, steps, block_length, temperature, seed=1)
         raise ValueError("seed must be an integer in [0, 2**63).")
 
 
+def validate_prompt(prompt_ids, mask_id):
+    if (not isinstance(prompt_ids, torch.Tensor) or prompt_ids.ndim != 2
+            or prompt_ids.shape[0] != 1 or prompt_ids.dtype != torch.long):
+        raise ValueError("prompt_ids must be int64 with shape [1, P].")
+    if type(mask_id) is not int or mask_id < 0:
+        raise ValueError("mask_id must be a nonnegative integer.")
+
+
+def initialize_state(prompt_ids, mask_id, gen_length, device, initial_state=None):
+    """Create an output of masks or clone a validated prompt-plus-output state."""
+    validate_prompt(prompt_ids, mask_id)
+    prompt_len = prompt_ids.shape[1]
+    shape = (1, prompt_len + gen_length)
+    if initial_state is None:
+        state = torch.full(shape, mask_id, dtype=torch.long, device=device)
+        state[:, :prompt_len] = prompt_ids.to(device)
+        return state
+    if (not isinstance(initial_state, torch.Tensor) or initial_state.dtype != torch.long
+            or tuple(initial_state.shape) != shape):
+        raise ValueError("initial_state must be int64 with shape [1, P + gen_length].")
+    if not torch.equal(initial_state[:, :prompt_len].to(prompt_ids.device), prompt_ids):
+        raise ValueError("initial_state must preserve the supplied prompt tokens.")
+    return initial_state.detach().to(device).clone()
+
+
 @torch.inference_mode()
 def decode_masked(model, prompt_ids, mask_id, *, selection_rule, gen_length=256,
-                  steps=256, block_length=128, temperature=1.0, seed=1):
+                  steps=256, block_length=128, temperature=1.0, seed=1,
+                  initial_state=None):
     """Sample tokens, then commit the scheduled positions in the active block.
 
     Scores use float32 probabilities over legal tokens. Gumbel sampling uses
     the original LLaDA helper, with a constant logit shift to avoid overflow.
-    Equal position scores prefer the earlier output position.
+    Equal position scores prefer the earlier output position. Initial output
+    commitments stay fixed; zero-transfer steps consume no model forwards.
     """
     validate_generation(gen_length=gen_length, steps=steps, block_length=block_length,
                         temperature=temperature, seed=seed)
-    if prompt_ids.ndim != 2 or prompt_ids.shape[0] != 1 or prompt_ids.dtype != torch.long:
-        raise ValueError("prompt_ids must be int64 with shape [1, P].")
-    if type(mask_id) is not int or mask_id < 0:
-        raise ValueError("mask_id must be a nonnegative integer.")
+    validate_prompt(prompt_ids, mask_id)
     if selection_rule not in {"random_position", "top_two_margin", "token_probability"}:
         raise ValueError(f"Unknown position selection rule: {selection_rule}")
     device = torch.device(getattr(model, "device", prompt_ids.device))
     torch.manual_seed(seed)
     prompt_len = prompt_ids.shape[1]
-    state = torch.full((1, prompt_len + gen_length), mask_id, dtype=torch.long, device=device)
-    state[:, :prompt_len] = prompt_ids.to(device)
+    state = initialize_state(prompt_ids, mask_id, gen_length, device, initial_state)
     calls, trace, selected_margins = 0, [], []
     num_blocks = gen_length // block_length
     steps_per_block = steps // num_blocks
@@ -52,8 +75,10 @@ def decode_masked(model, prompt_ids, mask_id, *, selection_rule, gen_length=256,
         start, end = prompt_len + block * block_length, prompt_len + (block + 1) * block_length
         schedule = get_num_transfer_tokens(state[:, start:end] == mask_id, steps_per_block)
         for step in range(steps_per_block):
-            positions = torch.nonzero(state[0, start:end] == mask_id, as_tuple=False).flatten() + start
             count = int(schedule[0, step].item())
+            if count == 0:
+                continue
+            positions = torch.nonzero(state[0, start:end] == mask_id, as_tuple=False).flatten() + start
             prediction = model(state)
             calls += 1
             logits = prediction.logits[0, positions].float().clone()

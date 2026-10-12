@@ -2,6 +2,7 @@
 
 import argparse
 import copy
+from dataclasses import asdict
 from datetime import timezone
 import json
 from pathlib import Path
@@ -11,7 +12,7 @@ from time import perf_counter
 
 import torch
 
-from dlm_project.decoding import best_of_5, confidence, random_mdm, top_k_margin
+from dlm_project.decoding import best_of_5, confidence, mcts_confidence, random_mdm, top_k_margin
 from dlm_project.decoding.common import validate_generation
 from dlm_project.experiments.artifacts import save_json
 from dlm_project.experiments.config import load_config, validate_config
@@ -25,7 +26,8 @@ from dlm_project.tasks.gsm8k.evaluation import extract_answer, score_answer
 
 
 DECODERS = {"random_mdm": random_mdm.decode, "top_k_margin": top_k_margin.decode,
-            "confidence": confidence.decode, "best_of_5": best_of_5.decode}
+            "confidence": confidence.decode, "best_of_5": best_of_5.decode,
+            "mcts_confidence": mcts_confidence.decode}
 MODEL_FAMILIES = ("llada", "illada")
 
 
@@ -73,11 +75,15 @@ def resolve_settings(method, source, *, profile=None, num_samples=None, seed=Non
         generation.setdefault(key, value)
     # Position selection belongs to the entrypoint, not the legacy dispatcher.
     generation.pop("remasking", None)
-    decoding_seed = seed if seed is not None else config.get("decoding", {}).get("seed", 1)
+    decoding_source = config.get("decoding", {})
+    decoding_seed = seed if seed is not None else decoding_source.get("seed", 1)
     config["decoding"] = {"method": method, "seed": decoding_seed}
     if temperature is not None:
         generation["temperature"] = temperature
     validate_generation(**generation, seed=decoding_seed)
+    if method == "mcts_confidence":
+        config["decoding"]["mcts"] = asdict(mcts_confidence.resolve_mcts_config(
+            decoding_source.get("mcts"), gen_length=generation["gen_length"]))
     compatible = {**config, "generation": {**generation, "remasking": "low_confidence"},
                   "decoding": {"method": "baseline", "seed": decoding_seed}}
     validate_config(compatible)
@@ -121,7 +127,7 @@ def _metrics(config, state, records):
     total_seconds = sum(times)
     calls = sum(row["total_model_calls"] for row in records)
     memory = [row["peak_gpu_memory_bytes"] for row in records if row["peak_gpu_memory_bytes"] is not None]
-    return {"status": state["status"], "method": config["decoding"]["method"],
+    metrics = {"status": state["status"], "method": config["decoding"]["method"],
             "model_family": config["model"]["family"],
             "profile": config["evaluation"]["profile"],
             "requested_examples": config["data"]["num_samples"], "processed": count,
@@ -139,6 +145,15 @@ def _metrics(config, state, records):
             "model_loading_seconds": state.get("model_loading_seconds"),
             "model_revision": config.get("provenance", {}).get("model", {}).get("revision"),
             "dataset_revision": config["data"]["revision"], "error": state.get("error")}
+    if config["decoding"]["method"] == "mcts_confidence":
+        for phase in ("search", "completion"):
+            phase_calls = sum(row[f"{phase}_model_calls"] for row in records)
+            metrics[f"total_{phase}_model_calls"] = phase_calls
+            metrics[f"mean_{phase}_model_calls"] = phase_calls / count if count else None
+            metrics[f"{phase}_latency_seconds"] = sum(row[f"{phase}_latency_seconds"] for row in records)
+        metrics["fallback_count"] = sum(row["fallback_used"] for row in records)
+        metrics["mean_selected_depth"] = mean(row["selected_depth"] for row in records) if count else None
+    return metrics
 
 
 def run_evaluation(method, source, *, manifest_path=None, output_dir=None, model_factory=None):
@@ -154,6 +169,11 @@ def run_evaluation(method, source, *, manifest_path=None, output_dir=None, model
     generation = config["generation"]
     name = (f"gen{generation['gen_length']}-steps{generation['steps']}-blk{generation['block_length']}-"
             f"temp{generation['temperature']:g}-seed{config['decoding']['seed']}")
+    if method == "mcts_confidence":
+        m = config["decoding"]["mcts"]
+        name += (f"-lc{m['init_tokens']}-c{m['num_candidates']}-k1_{m['top_k_tokens']}"
+                 f"-k2_{m['top_k_actions']}-budget{m['max_model_calls']}-gamma{m['margin_gamma']:g}"
+                 f"-ucb{m['exploration_c']:g}-eps{m['epsilon']:g}-stop-{m['stop_mode']}")
     model_profile = get_profile(config["model"]["family"])
     parent = Path(output_dir).expanduser() if output_dir else root / model_profile["label"] / "GSM8K"
     parent = parent / method / config["evaluation"]["profile"] / name
@@ -199,6 +219,8 @@ def run_evaluation(method, source, *, manifest_path=None, output_dir=None, model
                 kwargs = {**generation, "seed": seed}
                 if method == "best_of_5":
                     kwargs.update(tokenizer=wrapper.tokenizer, answer_extractor=extract_answer)
+                elif method == "mcts_confidence":
+                    kwargs.update(mcts=config["decoding"]["mcts"], tokenizer=wrapper.tokenizer)
                 result = DECODERS[method](wrapper.model, prompt_ids, wrapper.mask_id, **kwargs)
                 if method == "best_of_5":
                     text = result.details["candidates"][result.details["selected_candidate_index"]]["raw_output"]
@@ -230,8 +252,13 @@ def run_evaluation(method, source, *, manifest_path=None, output_dir=None, model
                 predictions.flush()
                 records.append(row)
                 metrics = save_progress()
+                phase_cost = (f" | search={row['search_model_calls']}"
+                              f" | completion={row['completion_model_calls']}"
+                              f" | depth={row['selected_depth']}"
+                              f" | fallback={row['fallback_used']}"
+                              if method == "mcts_confidence" else "")
                 print(f"{row['example_id']} | {method} | accuracy={metrics['accuracy']:.3f} | "
-                      f"forwards={result.total_nfes} | {latency:.2f}s", flush=True)
+                      f"forwards={result.total_nfes}{phase_cost} | {latency:.2f}s", flush=True)
         state["status"] = "completed"
     except BaseException as error:
         state.update(status="interrupted" if isinstance(error, KeyboardInterrupt) else "failed",

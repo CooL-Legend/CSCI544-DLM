@@ -160,9 +160,15 @@ def test_prompt_only_cli_never_constructs_model(tmp_path, monkeypatch):
     assert json.loads(preview_path.read_text())["question"] == "What is 3 + 2?"
 
 
-def test_gsm8k_notebook_uses_current_four_decoder_workflow():
+def test_gsm8k_notebook_keeps_four_decoders_and_adds_mcts_confidence():
     path = ROOT / "notebooks/gsm8k/LLaDA_GSM8K_Colab.ipynb"
-    notebook = nbformat.read(path, as_version=4)
+    notebook = nbformat.from_dict(json.loads(path.read_text()))
+    # Ignore saved Colab stream metadata only in this in-memory validation copy.
+    # The reference notebook's execution history stays intact on disk.
+    for cell in notebook.cells:
+        if cell.cell_type == "code" and not cell.get("id", "").startswith(("run-mcts", "preview-mcts", "mcts-")):
+            cell.outputs = []
+    notebook = nbformat.reads(json.dumps(notebook), as_version=4)
     nbformat.validate(notebook)
     cells = {c.id: c.source for c in notebook.cells}
     for c in notebook.cells:
@@ -180,6 +186,10 @@ def test_gsm8k_notebook_uses_current_four_decoder_workflow():
     assert "configs/gsm8k/decoding.yaml" in code
     assert "random.sample(records, min(5, len(records)))" in code
     assert "reference_answer" in code and "raw_output" in code
+    assert "eval_gsm8k_mcts_confidence.py" in code
+    assert "MCTS_SETTINGS" in cells["mcts-confidence-config"]
+    assert "--run-manifest" in cells["run-mcts-confidence"]
+    assert "search_model_calls" in cells["preview-mcts-confidence"]
 
 
 @pytest.mark.parametrize("section,key,value", [("data", "num_samples", 2), ("data", "question_index", -1),

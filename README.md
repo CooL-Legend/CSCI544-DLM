@@ -2,7 +2,7 @@
 
 Evaluate **LLaDA-8B-Instruct**, **iLLaDA-8B-Instruct**, and **LLaDA-8B-BGPO-sudoku** on Sudoku for CSCI 544 Applied NLP. Develop locally, run inference on **Google Colab Pro**, and keep model weights and experiment artifacts in **Google Drive**.
 
-The **LLaDA and iLLaDA GSM8K notebooks** evaluate four decoding methods and display accuracy, inference cost, and randomly selected saved answers.
+The **LLaDA and iLLaDA GSM8K notebooks** evaluate four shared decoding methods and display accuracy, inference cost, and randomly selected saved answers. LLaDA also includes MCTS initialization followed by token-probability confidence decoding.
 
 | Model | Notebook on `adi` | Dependency profile |
 | --- | --- | --- |
@@ -104,6 +104,18 @@ The [LLaDA notebook](notebooks/gsm8k/LLaDA_GSM8K_Colab.ipynb) and [iLLaDA notebo
 The iLLaDA configuration controls default to temperature **1.0**, 256 output positions and steps, 128-token blocks, and seed 1. Set `PROFILE` to `smoke` (20 questions), `initial` (100), or `full` (1,319); `NUM_SAMPLES = None` uses that profile's count. Both models reuse the ordered `openai/gsm8k`, `main`, `test` manifest on Drive. References enter only post-generation scoring, using the strict final `#### <number>` line parser.
 
 Each iLLaDA method streams its subprocess output, writes a unique run receipt, and saves artifacts under `iLLaDA/GSM8K/<method>/<profile>/<settings>/<timestamp>/`. Preview cells display metrics and five randomly selected responses from that exact run; rerunning a preview performs no inference. All five Best-of-5 candidates count toward inference cost. The original LLaDA notebook and its saved responses are retained.
+
+The LLaDA notebook appends **MCTS initialization + confidence decoding** as a fifth method. Run its configuration, execution, and preview cells after the shared setup and benchmark configuration. It inherits the active prompt, model/cache paths, generation controls, profile, seed, and current `NUM_SAMPLES = 2` override; set that override to `None` for profile counts. Its run streams errors and selects previews through a unique receipt, displaying accuracy, random saved answers, initialization depth, fallback status, and search/completion costs.
+
+MCTS defaults to a 20-token initialization target, three candidates, K1=3, K2=5, and a **512-forward search cap per question**. The cap includes the root and every evaluated branch; confidence completion adds its own forwards at temperature 1.0. Budget/frontier fallbacks complete the deepest selected state and report its actual depth. At 256 generation steps, completion uses `256 - selected_depth` calls: 512 search calls plus a 20-token initialization total 748 calls. This reuses the existing one-step entropy search; the legacy greedy MCTS workflow retains its semantics.
+
+On a configured CUDA machine with the LLaDA dependency profile installed:
+
+```bash
+python scripts/eval_gsm8k_mcts_confidence.py --profile smoke --num-samples 2
+```
+
+The new CLI defaults to [`configs/gsm8k/mcts_confidence.yaml`](configs/gsm8k/mcts_confidence.yaml), requires `model.family: llada`, and supports the same benchmark overrides and run receipts as the other methods. Edit `decoding.mcts` in YAML or `MCTS_SETTINGS` in the notebook to change the search settings. Results go to `LLaDA/GSM8K/mcts_confidence/<profile>/<generation-and-search-settings>/<timestamp>/`, sharing the frozen test manifest and strict scorer. The four original notebook sections and all their saved outputs remain unchanged.
 
 On a configured CUDA machine with the iLLaDA dependency profile installed:
 
@@ -271,7 +283,7 @@ Run in each dependency environment:
 python -m pytest -q
 ```
 
-GitHub Actions tests all three dependency profiles on CPU. Checks cover string data loading, 4×4 and 9×9 scoring, incomplete/invalid plots, model and mask selection, snapshot files, warm staging, experiment names and timezones, same-second collisions, partial artifact persistence, safe branch checkout, and notebook structure. The new iLLaDA GSM8K notebook has cleared outputs; the supplied LLaDA GSM8K reference retains its saved responses. GSM8K checks cover both model families, all four decoders, exact run receipts, shared manifests, streamed errors, and previews without inference. Paired-comparison tests cover prompt/ID/seed alignment, separate checkpoint identities, sequential subprocesses, failed comparisons, and the notebook's shared settings. Controlled fake-model tests additionally cover confidence filtering, negative/near-zero entropy rewards, UCB and backups, independent states, fixed commitments, deduplication, exhausted branches, hard call budgets, fallback ranking, trace accounting, and equivalence of `step()` and `run()`.
+GitHub Actions tests all three dependency profiles on CPU. Checks cover string data loading, 4×4 and 9×9 scoring, incomplete/invalid plots, model and mask selection, snapshot files, warm staging, experiment names and timezones, same-second collisions, partial artifact persistence, safe branch checkout, and notebook structure. The new iLLaDA GSM8K notebook has cleared outputs; the supplied LLaDA GSM8K reference retains its saved responses. GSM8K checks cover both model families, the four shared decoders, MCTS-to-confidence state handoff, exact run receipts, shared manifests, streamed errors, and previews without inference. Paired-comparison tests cover prompt/ID/seed alignment, separate checkpoint identities, sequential subprocesses, failed comparisons, and the notebook's shared settings. Controlled fake-model tests additionally cover confidence filtering, negative/near-zero entropy rewards, UCB and backups, independent states, fixed commitments, deduplication, exhausted branches, hard call budgets, fallback ranking, trace accounting, and equivalence of `step()` and `run()`.
 
 CPU tests do not establish 8B model quality or GPU behavior. Verify each notebook's one-puzzle run, three-puzzle run, warm-cache rerun, and saved Drive artifacts on Colab Pro.
 
