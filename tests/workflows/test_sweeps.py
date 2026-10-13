@@ -33,6 +33,8 @@ def sources(monkeypatch):
         _fingerprint = "controlled-dataset"
     def load_dataset(repo, subset, *, split, revision, cache_dir):
         calls.append((repo, subset, split, revision))
+        if split == "train[:2]":
+            return Rows({"question": f"Independent training demo {i}", "answer": "1+1=2\n#### 2"} for i in range(2))
         return Rows({"question": f"{split} problem {index}: how many apples?",
                      "answer": f"REFERENCE_ONLY_{index}\n#### {index}"} for index in range(220))
     def dataset_info(repo):
@@ -153,13 +155,13 @@ def test_one_model_five_conditions_fresh_states_forward_accounting_and_increment
     assert sum(row["total_nfes"] for row in rows) + 1 == len(instance.model.seen)
     for start in (0, 5):
         group = rows[start:start+5]
-        assert len({(row["example_id"], row["prompt_hash"], row["seed"]) for row in group}) == 1
-        assert [row["search_nfes"] for row in group] == [0, 0, 2, 5, 7]
-        assert [row["completion_nfes"] for row in group] == [4, 4, 2, 1, 1]
-        assert [row["fallback_used"] for row in group] == [None, None, True, False, False]
-        assert group[-1]["stop_reason"] == "frontier_exhausted"
-        assert group[-1]["evaluated_children"] == 6
-        assert group[-1]["expanded_parents"] == 3
+        assert len({(row["example_id"], row["base_prompt_hash"], row["seed"]) for row in group}) == 1
+        assert [row["search_nfes"] for row in group] == [0, 0, 2, 5, 8]
+        assert [row["completion_nfes"] for row in group] == [4, 4, 4, 3, 3]
+        assert [row["fallback_used"] for row in group] == [None, None, True, True, True]
+        assert group[-1]["stop_reason"] == "model_call_budget"
+        assert group[-1]["evaluated_children"] == 2
+        assert group[-1]["expanded_parents"] == 1
         assert group[-1]["realized_branching_factor"] == 2
     for index, ((prompt, decoding), offset) in enumerate(zip(predictions, offsets)):
         assert "REFERENCE_ONLY" not in prompt and SOLUTION not in prompt
@@ -255,7 +257,9 @@ def test_full_figures_trace_data_and_report_only_without_loads(tmp_path, sources
         inspected = sweep_plots.trace_data(trace, row["selected_node_id"])
         assert len(inspected["selected_path"]) == row["selected_depth"] + 1
         assert len(inspected["evaluations"]) == row["evaluated_children"]
-        assert [item["search_model_calls"] for item in inspected["evaluations"]] == list(range(2, row["search_nfes"] + 1))
+        assert [item["search_model_calls"] for item in inspected["evaluations"]] == [
+            e["search_model_calls"] for e in trace if e["stage"] == "evaluation"]
+        assert sum(e["stage"] == "forward" and e.get("phase") != "completion" for e in trace) == row["search_nfes"]
     if task == "sudoku":
         assert len(list((directory / "examples").glob("*.png"))) == 1
     monkeypatch.setattr(sweep, "_load_model", lambda *a: pytest.fail("Report loaded weights"))

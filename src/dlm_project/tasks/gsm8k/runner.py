@@ -14,6 +14,8 @@ from dlm_project.experiments.config import load_config, validate_config as valid
 from dlm_project.experiments.artifacts import save_json
 from dlm_project.tasks.gsm8k.dataset import load_example, prompt_preview
 from dlm_project.tasks.gsm8k.evaluation import score_answer
+from dlm_project.decoding.medal_prompting import get_gsm8k_demonstrations, gsm8k_prompt
+from dlm_project.experiments.manifests import digest
 
 
 def validate_config(config):
@@ -62,6 +64,16 @@ def run_prompt_experiment(config, example, model):
     save_json(run_dir / "config.json", config)
     save_json(run_dir / "metrics.json", {"status": "running", "processed": 0})
     preview = prompt_preview(config, example)
+    if config["decoding"]["method"] == "mcts_entropy":
+        from huggingface_hub import HfApi
+        revision = config["data"].get("revision") or HfApi().dataset_info("openai/gsm8k").sha
+        demonstrations = get_gsm8k_demonstrations(run_dir.parent / "gsm8k_decomposition_train.json",
+                            revision=revision, cache_dir=config["data"].get("cache_dir"))
+        base_prompt = preview["user_prompt"]
+        effective, metadata = gsm8k_prompt(base_prompt, example["question"], demonstrations)
+        preview.update(user_prompt=effective, base_prompt=base_prompt, decomposition=metadata,
+                       messages=[{"role": "user", "content": effective}])
+        save_json(run_dir / "decomposition_manifest.json", demonstrations)
     # Reuse the wrapper's exact formatting/tokenization method for inspection.
     # This is not a model forward and does not load a second model.
     ids = model.encode_prompt(preview["user_prompt"]).detach().cpu()[0].tolist()
@@ -85,7 +97,9 @@ def run_prompt_experiment(config, example, model):
     (run_dir / "response.txt").write_text(prediction["text"], encoding="utf-8")
     score = score_answer(prediction["text"], example["reference_solution"])
     record = {"index": 0, **example, "user_prompt": preview["user_prompt"],
-              "raw_output": prediction["text"], **score, "decoding_stats": prediction["stats"],
+              "raw_output": prediction["text"], **score,
+              "base_prompt_hash": digest(preview.get("base_prompt", preview["user_prompt"])),
+              "effective_prompt_hash": digest(preview["user_prompt"]), "decomposition": preview.get("decomposition"), "decoding_stats": prediction["stats"],
               "prompt_file": "prompt.json", "trace_file": "trace.jsonl"}
     (run_dir / "predictions.jsonl").write_text(json.dumps(record, allow_nan=False) + "\n")
     metrics = {"status": "completed", "processed": 1, **score, "decoding_stats": prediction["stats"]}
@@ -105,9 +119,20 @@ def main():
     args = parser.parse_args()
     config = load_config(args.config)
     validate_config(config)
+    if config.get("decoding", {}).get("method") == "mcts_entropy" and not config["data"].get("revision"):
+        from huggingface_hub import HfApi
+        config["data"]["revision"] = HfApi().dataset_info("openai/gsm8k").sha
     example = load_example(config)
     if args.prompt_only:
         preview = prompt_preview(config, example)
+        if config.get("decoding", {}).get("method") == "mcts_entropy":
+            root = Path(config.get("experiment_root", "results"))
+            demonstrations = get_gsm8k_demonstrations(root / "manifests/gsm8k_decomposition_train.json",
+                revision=config["data"]["revision"], cache_dir=config["data"].get("cache_dir"))
+            base_prompt = preview["user_prompt"]
+            effective, metadata = gsm8k_prompt(base_prompt, example["question"], demonstrations)
+            preview.update(user_prompt=effective, base_prompt=base_prompt, decomposition=metadata,
+                           messages=[{"role":"user", "content":effective}])
         print(preview["user_prompt"], flush=True)
         if args.preview_path:
             args.preview_path.parent.mkdir(parents=True, exist_ok=True)

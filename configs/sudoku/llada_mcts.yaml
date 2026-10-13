@@ -1,4 +1,4 @@
-# One-puzzle, one-token-at-a-time MEDAL entropy walkthrough.
+# MEDAL paper reconstruction; interpretations are saved in every run.
 data:
   num_samples: 1
   cache_dir: null
@@ -12,19 +12,20 @@ generation:
   steps: 256
   gen_length: 256
   block_length: 256
-  temperature: 0.0
+  temperature: 1.0
   remasking: low_confidence
 decoding:
-  method: mcts_entropy  # baseline | confidence | mcts_entropy
+  method: mcts_entropy
   seed: 1
   mcts:
-    init_tokens: 2      # Lc: number of output tokens committed in a candidate
-    num_candidates: 3  # C: stop after collecting at least this many distinct states
-    top_k_tokens: 2    # K1: tokens retained per position
-    top_k_actions: 2   # K2: actions retained globally
-    max_model_calls: 32  # Root + children; completion is counted separately
+    init_tokens: 20
+    num_candidates: 3
+    top_k_tokens: 3
+    top_k_actions: 5
+    max_model_calls: null
     margin_gamma: 10.0
     exploration_c: 0.01
-    epsilon: 1.0e-8
+    epsilon: 1.0e-08
+    stop_mode: candidates
 experiment_root: results
 experiment_timezone: America/Los_Angeles

@@ -19,6 +19,18 @@ from dlm_project.tasks.gsm8k import benchmark, benchmark_dataset
 from tests.decoding.helpers import FakeModel, MASK, PROMPT
 
 
+@pytest.fixture(autouse=True)
+def decomposition_fixture(monkeypatch):
+    def demonstrations(*a, revision, **kw):
+        examples = []
+        for i in (0,1):
+            content = {"question": f"Training example {i}: what is one plus one?",
+                       "reference_solution": "1 + 1 = 2.\n#### 2"}
+            examples.append({"row_id": i, **content, "content_hash": digest(content)})
+        return {"version": "medal_inline_v1", "dataset": {"repo_id": "openai/gsm8k", "subset": "main",
+                "split": "train", "revision": revision}, "examples": examples}
+    monkeypatch.setattr(benchmark, "get_gsm8k_demonstrations", demonstrations)
+
 def manifest():
     examples = []
     for index in range(benchmark_dataset.TEST_SIZE):
@@ -37,7 +49,7 @@ def config_for(tmp_path, family="llada"):
     config["experiment_root"] = str(tmp_path)
     config["data"]["num_samples"] = 2
     config["model"].update(device="cpu", dtype="float32")
-    config["generation"].update(gen_length=4, steps=4, block_length=2)
+    config["generation"].update(gen_length=4, steps=4, block_length=4)
     config["decoding"]["mcts"] = {"init_tokens": 2, "num_candidates": 1,
                                   "top_k_tokens": 1, "top_k_actions": 1,
                                   "max_model_calls": 8}
@@ -90,7 +102,7 @@ def test_benchmark_one_load_reference_isolation_and_cost(tmp_path, monkeypatch, 
     assert metrics["model_family"] == family
     assert metrics["accuracy"] == 1 and metrics["correct"] == metrics["processed"] == 2
     assert metrics["parse_failures"] == 0 and metrics["questions_per_second"] > 0
-    forwards = {"best_of_5": 20, "mcts_confidence": 5}.get(method, 4)
+    forwards = {"best_of_5": 20, "mcts_confidence": 10}.get(method, 4)
     assert metrics["mean_model_calls"] == forwards
     assert metrics["total_model_calls"] == len(instance.model.seen) == 2 * forwards
     records = [json.loads(line) for line in (directory / "predictions.jsonl").read_text().splitlines()]
@@ -115,16 +127,16 @@ def test_benchmark_one_load_reference_isolation_and_cost(tmp_path, monkeypatch, 
         assert records[0]["votes"] == {"1": 5}
         assert records[0]["candidate_seeds"] == [1, 2, 3, 4, 5]
     elif method == "mcts_confidence":
-        assert metrics["total_search_model_calls"] == 6
+        assert metrics["total_search_model_calls"] == 16
         assert metrics["total_completion_model_calls"] == 4
         assert metrics["fallback_count"] == 0 and metrics["mean_selected_depth"] == 2
         assert metrics["search_latency_seconds"] >= 0 and metrics["completion_latency_seconds"] >= 0
-        assert all(row["search_model_calls"] == 3 and row["completion_model_calls"] == 2
+        assert all(row["search_model_calls"] == 8 and row["completion_model_calls"] == 2
                    for row in records)
         assert "lc2-c1-k1_1-k2_1-budget8" in directory.parent.name
         assert saved["decoding"]["mcts"]["init_tokens"] == 2
         trace = [json.loads(line) for line in (directory / records[0]["trace_file"]).read_text().splitlines()]
-        assert {event["phase"] for event in trace} == {"search", "completion"}
+        assert {event.get("phase") for event in trace} >= {"tree_analysis", "simulation", "candidate_evaluation", "completion"}
 
 
 def test_accuracy_includes_wrong_and_unparseable_outputs(tmp_path, monkeypatch):
@@ -163,9 +175,9 @@ def test_interruption_keeps_completed_prediction_and_metrics(tmp_path, monkeypat
     assert "controlled failure" in metrics["error"]
     assert all("REFERENCE_ONLY" not in prompt for prompt in prompts)
     if method == "mcts_confidence":
-        assert metrics["total_search_model_calls"] == 3
+        assert metrics["total_search_model_calls"] == 8
         assert metrics["total_completion_model_calls"] == 2
-        assert metrics["total_model_calls"] == len(instance.model.seen) == 5
+        assert metrics["total_model_calls"] == len(instance.model.seen) == 10
 
 
 @pytest.mark.parametrize("profile,count", [("smoke", 20), ("initial", 100), ("full", 1319)])
@@ -320,7 +332,14 @@ def test_cli_defaults_and_run_receipt(tmp_path, monkeypatch, family, method):
     monkeypatch.setattr(benchmark, "run_evaluation", run)
     monkeypatch.setattr(sys, "argv", ["script", "--profile", "initial", "--run-manifest", str(receipt)])
     filename = "illada_decoding.yaml" if family == "illada" else "decoding.yaml"
-    benchmark.main(method, default_config=ROOT / "configs/gsm8k" / filename, expected_family=family)
+    config_path = ROOT / "configs/gsm8k" / filename
+    if method == "mcts_confidence":
+        import yaml
+        cfg = load_config(config_path)
+        cfg["generation"]["block_length"] = cfg["generation"]["gen_length"]
+        config_path = tmp_path / "medal.yaml"
+        config_path.write_text(yaml.safe_dump(cfg))
+    benchmark.main(method, default_config=config_path, expected_family=family)
     config = captured[0][0][1]
     assert config["model"]["family"] == family
     assert config["model"]["model_path"] == get_profile(family)["repo_id"]
@@ -408,7 +427,9 @@ def test_mcts_and_confidence_reuse_shared_manifest_prompts_and_seeds(tmp_path):
     first, second = runs
     assert first[0]["run"]["manifest_hash"] == second[0]["run"]["manifest_hash"]
     assert first[0]["provenance"]["dataset"] == second[0]["provenance"]["dataset"]
-    assert first[2] == second[2]
+    assert first[2] != second[2]
+    assert [r["base_prompt"] for r in first[1]] == [r["base_prompt"] for r in second[1]]
+    assert all(r["decomposition"]["demonstrations_dataset"]["split"] == "train" for r in second[1])
     assert [(row["example_id"], row["seed"], row["reference_answer"]) for row in first[1]] == [
         (row["example_id"], row["seed"], row["reference_answer"]) for row in second[1]]
 
@@ -416,7 +437,7 @@ def test_mcts_and_confidence_reuse_shared_manifest_prompts_and_seeds(tmp_path):
 def test_mcts_fallback_metrics_and_recomputed_completion_cost(tmp_path, monkeypatch):
     monkeypatch.setattr(benchmark, "get_manifest", lambda *a, **k: manifest())
     source = config_for(tmp_path)
-    source["decoding"]["mcts"]["max_model_calls"] = 1
+    source["decoding"]["mcts"].update(max_model_calls=1, stop_mode="budget")
     instance, _ = wrapper(iter(["bad", "#### 1"]))
     directory, metrics = benchmark.run_evaluation("mcts_confidence", source, model_factory=lambda _: instance)
     assert metrics["accuracy"] == .5 and metrics["parse_failures"] == 1
@@ -457,10 +478,10 @@ def test_mcts_entrypoint_defaults_and_receipt(tmp_path, monkeypatch):
     assert method == config["decoding"]["method"] == "mcts_confidence"
     assert config["model"]["family"] == "llada" and config["data"]["num_samples"] == 20
     assert config["generation"] == {"gen_length": 256, "steps": 256,
-                                    "block_length": 128, "temperature": 1.0}
+                                    "block_length": 256, "temperature": 1.0}
     assert config["decoding"]["mcts"] == {
         "init_tokens": 20, "num_candidates": 3, "top_k_tokens": 3, "top_k_actions": 5,
-        "max_model_calls": 512, "margin_gamma": 10.0, "exploration_c": .01,
+        "max_model_calls": None, "margin_gamma": 10.0, "exploration_c": .01,
         "epsilon": 1e-8, "stop_mode": "candidates",
     }
     assert json.loads(receipt.read_text()) == {"run_dir": str(tmp_path / "exact-run"),
@@ -486,3 +507,24 @@ def test_mcts_entrypoint_failure_does_not_publish_receipt(tmp_path, monkeypatch)
     with pytest.raises(RuntimeError, match="controlled MCTS failure"):
         runpy.run_path(str(ROOT / "scripts/eval_gsm8k_mcts_confidence.py"), run_name="__main__")
     assert not receipt.exists()
+
+
+def test_interrupted_rollout_keeps_prior_record_and_active_cost_trace(tmp_path, monkeypatch):
+    monkeypatch.setattr(benchmark, 'get_manifest', lambda *a, **k: manifest())
+    instance, _ = wrapper()
+    class Failing(FakeModel):
+        def __call__(self, ids, **kw):
+            if len(self.seen) == 12:
+                raise RuntimeError('failure during second question rollout')
+            return super().__call__(ids, **kw)
+    instance.model = Failing()
+    with pytest.raises(RuntimeError, match='second question'):
+        benchmark.run_evaluation('mcts_confidence', config_for(tmp_path), model_factory=lambda _: instance)
+    directory=next(tmp_path.rglob('metrics.json')).parent
+    metrics=json.loads((directory/'metrics.json').read_text())
+    assert metrics['status']=='failed' and metrics['processed']==1
+    assert metrics['total_model_calls']==10
+    assert metrics['active_prediction_model_calls']==3
+    trace=[json.loads(line) for line in (directory/'traces/test_0001.jsonl').read_text().splitlines()]
+    assert trace[-1]['stage']=='forward' and trace[-1]['search_model_calls']==3
+    assert not any(e['stage']=='backpropagation' for e in trace)

@@ -1,4 +1,4 @@
-# Entropy-based MCTS initialization, then token-probability confidence completion.
+# MEDAL paper reconstruction; interpretations are saved in every run.
 model:
   family: llada
   model_path: GSAI-ML/LLaDA-8B-Instruct
@@ -6,19 +6,21 @@ model:
   dtype: bfloat16
   local_files_only: false
 data:
-  num_samples: null  # smoke: 20; initial: 100; full: 1,319
+  num_samples: null
   cache_dir: null
-  revision: null  # Reuse the frozen manifest shared with the four other methods.
+  revision: null
 prompt:
-  instructions: |-
-    Solve this math problem in English.
+  instructions: 'Solve this math problem in English.
+
     Use at most three short calculation lines.
+
     End with a final line containing exactly #### followed by a plain number.
-    Do not include units, %, LaTeX, or any text after that number.
+
+    Do not include units, %, LaTeX, or any text after that number.'
 generation:
   gen_length: 256
   steps: 256
-  block_length: 128
+  block_length: 256
   temperature: 1.0
 decoding:
   method: mcts_confidence
@@ -28,10 +30,10 @@ decoding:
     num_candidates: 3
     top_k_tokens: 3
     top_k_actions: 5
-    max_model_calls: 512  # Root + all child evaluations; completion is additional.
+    max_model_calls: null
     margin_gamma: 10.0
     exploration_c: 0.01
-    epsilon: 1.0e-8
+    epsilon: 1.0e-08
     stop_mode: candidates
 evaluation:
   profile: smoke

@@ -13,6 +13,8 @@ from dlm_project.experiments.paths import DEFAULT_TIMEZONE, create_run_directory
 from dlm_project.models.profiles import get_profile
 from dlm_project.decoding.mcts_decoding import resolve_decoding
 from dlm_project.tasks.sudoku.evaluation import is_valid_sudoku, preserves_clues, score_prediction
+from dlm_project.decoding.medal_prompting import sudoku_prompt
+from dlm_project.experiments.manifests import digest
 from dlm_project.paths import PROJECT_ROOT as ROOT
 
 
@@ -64,68 +66,85 @@ def run_experiment(config, dataset, model):
     exact = correct_cells = complete = clues_preserved = valid_sudoku = 0
     from dlm_project.tasks.sudoku.dataset import item_prompt
 
-    with (run_dir / "predictions.jsonl").open("w") as handle:
-        for index in range(len(dataset)):
-            item = dataset[index]
-            prompt = item_prompt(item)
-            trace_file, stats = None, None
-            if hasattr(model, "predict_with_stats"):
-                trace_file = f"traces/puzzle_{index:03d}.jsonl"
-                (run_dir / "traces").mkdir(exist_ok=True)
-                decoding = {**config["decoding"], "seed": (config["decoding"]["seed"] + index) % 2**63}
-                with (run_dir / trace_file).open("w") as trace_handle:
-                    def save_event(event):
-                        trace_handle.write(json.dumps(event, allow_nan=False) + "\n")
-                        trace_handle.flush()
+    try:
+        with (run_dir / "predictions.jsonl").open("w") as handle:
+            for index in range(len(dataset)):
+                item = dataset[index]
+                base_prompt = prompt = item_prompt(item)
+                decomposition = None
+                if config["decoding"]["method"] == "mcts_entropy":
+                    prompt, decomposition = sudoku_prompt(base_prompt, board_size, item["puzzle"])
+                trace_file, stats = None, None
+                if hasattr(model, "predict_with_stats"):
+                    trace_file = f"traces/puzzle_{index:03d}.jsonl"
+                    (run_dir / "traces").mkdir(exist_ok=True)
+                    decoding = {**config["decoding"], "seed": (config["decoding"]["seed"] + index) % 2**63}
+                    with (run_dir / trace_file).open("w") as trace_handle:
+                        def save_event(event):
+                            trace_handle.write(json.dumps(event, allow_nan=False) + "\n")
+                            trace_handle.flush()
+                            summary["active_prediction_model_calls"] = event.get("generation_nfes",
+                                event.get("search_model_calls", event.get("stats", {}).get("total_model_calls", 0)))
 
-                    prediction = model.predict_with_stats(
-                        prompt, **config["generation"],
-                        decoding=decoding, on_event=save_event,
-                    )
-                output, stats = prediction["text"], prediction["stats"]
-            else:
-                if config["decoding"]["method"] != "baseline":
-                    raise TypeError("This decoding method requires model.predict_with_stats().")
-                output = model.predict(prompt, **config["generation"])
-            score = score_prediction(output, item["solution"], board_size)
-            score["clues_preserved"] = preserves_clues(item["puzzle"], score["prediction"], board_size)
-            score["valid_sudoku"] = is_valid_sudoku(score["prediction"], board_size)
-            plot_file = f"plots/puzzle_{index:03d}.png"
-            record = {"index": index, **item, "prompt": prompt, "board_size": board_size,
-                      "raw_output": output, **score, "plot_file": plot_file,
-                      "decoding_method": config["decoding"]["method"],
-                      "decoding_stats": stats, "trace_file": trace_file}
-            handle.write(json.dumps(record) + "\n")
-            handle.flush()
-            exact += score["exact"]
-            correct_cells += score["correct_cells"]
-            complete += score["parse_success"]
-            clues_preserved += score["clues_preserved"]
-            valid_sudoku += score["valid_sudoku"]
-            processed = index + 1
-            summary.update(
-                processed=processed,
-                exact_accuracy=exact / processed,
-                cell_accuracy=correct_cells / (board_size ** 2 * processed),
-                completion_rate=complete / processed,
-                clue_preservation_rate=clues_preserved / processed,
-                sudoku_validity_rate=valid_sudoku / processed,
-            )
-            if stats is not None:
-                for key in ("search_model_calls", "completion_model_calls", "latency_seconds"):
-                    summary[key] = (summary[key] or 0) + stats[key]
-                if stats["peak_gpu_memory_bytes"] is not None:
-                    summary["peak_gpu_memory_bytes"] = max(
-                        summary["peak_gpu_memory_bytes"] or 0, stats["peak_gpu_memory_bytes"])
-            save_json(run_dir / "metrics.json", summary)
-            save_prediction_plot(record, run_dir / plot_file)
-            summary["plots_saved"] += 1
-            save_json(run_dir / "metrics.json", summary)
-            print(
-                f"{index:03d} | complete={score['parse_success']} | "
-                f"clues={score['clues_preserved']} | valid={score['valid_sudoku']} | "
-                f"exact={score['exact']} | output={score['prediction']}", flush=True,
-            )
+                        prediction = model.predict_with_stats(
+                            prompt, **config["generation"],
+                            decoding=decoding, on_event=save_event,
+                        )
+                    output, stats = prediction["text"], prediction["stats"]
+                else:
+                    if config["decoding"]["method"] != "baseline":
+                        raise TypeError("This decoding method requires model.predict_with_stats().")
+                    output = model.predict(prompt, **config["generation"])
+                score = score_prediction(output, item["solution"], board_size)
+                score["clues_preserved"] = preserves_clues(item["puzzle"], score["prediction"], board_size)
+                score["valid_sudoku"] = is_valid_sudoku(score["prediction"], board_size)
+                plot_file = f"plots/puzzle_{index:03d}.png"
+                record = {"index": index, **item, "prompt": prompt, "board_size": board_size,
+                          "raw_output": output, **score, "plot_file": plot_file,
+                          "base_prompt": base_prompt, "base_prompt_hash": digest(base_prompt),
+                          "effective_prompt_hash": digest(prompt), "decomposition": decomposition,
+                          "decoding_method": config["decoding"]["method"],
+                          "decoding_stats": stats, "trace_file": trace_file}
+                handle.write(json.dumps(record) + "\n")
+                handle.flush()
+                summary["active_prediction_model_calls"] = 0
+                exact += score["exact"]
+                correct_cells += score["correct_cells"]
+                complete += score["parse_success"]
+                clues_preserved += score["clues_preserved"]
+                valid_sudoku += score["valid_sudoku"]
+                processed = index + 1
+                summary.update(
+                    processed=processed,
+                    exact_accuracy=exact / processed,
+                    cell_accuracy=correct_cells / (board_size ** 2 * processed),
+                    completion_rate=complete / processed,
+                    clue_preservation_rate=clues_preserved / processed,
+                    sudoku_validity_rate=valid_sudoku / processed,
+                )
+                if stats is not None:
+                    for key in ("search_model_calls", "completion_model_calls", "tree_analysis_model_calls",
+                                "simulation_model_calls", "candidate_evaluation_model_calls", "latency_seconds"):
+                        summary.setdefault(key, None)
+                        summary[key] = (summary[key] or 0) + stats.get(key, 0)
+                    if stats["peak_gpu_memory_bytes"] is not None:
+                        summary["peak_gpu_memory_bytes"] = max(
+                            summary["peak_gpu_memory_bytes"] or 0, stats["peak_gpu_memory_bytes"])
+                save_json(run_dir / "metrics.json", summary)
+                save_prediction_plot(record, run_dir / plot_file)
+                summary["plots_saved"] += 1
+                save_json(run_dir / "metrics.json", summary)
+                print(
+                    f"{index:03d} | complete={score['parse_success']} | "
+                    f"clues={score['clues_preserved']} | valid={score['valid_sudoku']} | "
+                    f"exact={score['exact']} | output={score['prediction']}", flush=True,
+                )
+
+    except BaseException as error:
+        summary.update(status="interrupted" if isinstance(error, KeyboardInterrupt) else "failed",
+                       error=f"{type(error).__name__}: {error}")
+        save_json(run_dir / "metrics.json", summary)
+        raise
 
     summary["status"] = "completed"
     save_json(run_dir / "metrics.json", summary)

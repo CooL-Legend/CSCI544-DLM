@@ -149,7 +149,7 @@ def test_partial_run_keeps_completed_results(tmp_path):
     assert json.loads(records[0])["raw_output"] == SOLUTION
     metrics = json.loads((run_dir / "metrics.json").read_text())
     assert metrics["processed"] == 1
-    assert metrics["status"] == "running"
+    assert metrics["status"] == "failed"
     assert metrics["exact_accuracy"] == 1.0
     assert metrics["plots_saved"] == 1
     assert (run_dir / "plots/puzzle_000.png").is_file()

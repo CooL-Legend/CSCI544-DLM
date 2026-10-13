@@ -2,7 +2,7 @@
 
 Evaluate **LLaDA-8B-Instruct**, **iLLaDA-8B-Instruct**, and **LLaDA-8B-BGPO-sudoku** on Sudoku for CSCI 544 Applied NLP. Develop locally, run inference on **Google Colab Pro**, and keep model weights and experiment artifacts in **Google Drive**.
 
-The **LLaDA and iLLaDA GSM8K notebooks** evaluate four shared decoding methods and display accuracy, inference cost, and randomly selected saved answers. LLaDA also includes MCTS initialization followed by token-probability confidence decoding.
+The **LLaDA and iLLaDA GSM8K notebooks** evaluate four shared decoding methods and display accuracy, inference cost, and randomly selected saved answers. LLaDA also includes the documented MEDAL reconstruction with full rollouts, candidate evaluation, and adjusted-score sampling.
 
 | Model | Notebook on `adi` | Dependency profile |
 | --- | --- | --- |
@@ -42,7 +42,7 @@ Top-K Margin, token-probability confidence decoding, and majority-vote Best-of-5
 Both LLaDA and iLLaDA use their pinned checkpoints and the same frozen GSM8K examples; the guide defines
 their accuracy, NFE, runtime and method-specific metrics.
 
-The [milestone sweep guide](docs/milestone1_sweeps.md) provides two scripts using the **same pinned original LLaDA** model: GSM8K and BGPO's **4×4 dataset**. Each compares baseline, confidence-only, and fixed-branching MCTS with search caps of **128, 256 and 512 forwards**, using the current **one-step entropy evaluator**. It saves frozen manifests, per-example traces/scores/compute, paired summaries, Wilson intervals, and PNG/PDF reports.
+The [milestone sweep guide](docs/milestone1_sweeps.md) provides two scripts using the **same pinned original LLaDA** model: GSM8K and BGPO's **4×4 dataset**. Each compares baseline, confidence-only, and fixed-branching MCTS with search caps of **128, 256 and 512 forwards**, using **full sampled rollouts and mean stepwise information gain** as explicit budget-limited MEDAL ablations. It saves frozen manifests, per-example traces/scores/compute, paired summaries, Wilson intervals, and PNG/PDF reports.
 
 ```bash
 python scripts/run_gsm8k_sweep.py --profile smoke
@@ -86,7 +86,7 @@ The comparison validates puzzle IDs, prompts, decoding settings/seeds, and check
 1. Open the notebook for the model you want. Select **Runtime → Change runtime type → GPU → L4 or A100**, subject to availability. The notebooks check BF16 support and GPU memory before loading unquantized weights.
 2. Give the clone cell read access to the private repository: use a fine-grained GitHub token with **Contents: read** access, stored in Colab **Secrets** as `GITHUB_TOKEN`, or use the hidden prompt. Do not paste tokens into notebook source or Git URLs.
 3. Run steps **1–5** to get `adi`, install the selected model's dependencies, mount Drive, load the base configuration, and download/stage the model. A clean checkout can switch to `adi`; local modifications or divergent commits stop the update without discarding work.
-4. In **Config Updater**, use `NUM_SAMPLES = 1` for the first verification. LLaDA now starts with the MCTS walkthrough: **256 output positions, steps, and block length**, temperature **0**, `Lc=2`, `C=3`, and `K1=K2=2`. The iLLaDA notebook retains its baseline defaults (three puzzles and 128-token blocks). The first dataset preparation can process the million-row CSV before selecting your slice.
+4. In **Config Updater**, use `NUM_SAMPLES = 1` for the first verification. LLaDA now starts with the MCTS walkthrough: **256 output positions, steps, and block length**, temperature **1**, `Lc=20`, `C=3`, and `K1=3`, `K2=5`, with no default cap. The iLLaDA notebook retains its baseline defaults (three puzzles and 128-token blocks). The first dataset preparation can process the million-row CSV before selecting your slice.
 5. In the LLaDA notebook, run **Inspect one expansion**, then **Inspect initialization**. Change `CYCLE_TO_VIEW` to inspect saved selection, expansion, evaluation and backpropagation tables without another model load. These inspection commands do not complete the output.
 6. Run **step 6** for full generation, then inspect predictions, traces, GPU artifact checks and plots in **step 7**. `status: completed` means inference and artifact saving finished, not that the puzzles were solved. After verification, increase `NUM_SAMPLES` and rerun Config Updater and steps 6–7.
 7. Check cache reuse by rerunning **step 5** and then evaluation. Unchanged weight files are reused; each evaluation creates a new experiment timestamp. Inspect Sudoku validity and clue preservation before increasing to 10 or 100 puzzles.
@@ -107,7 +107,9 @@ Each iLLaDA method streams its subprocess output, writes a unique run receipt, a
 
 The LLaDA notebook appends **MCTS initialization + confidence decoding** as a fifth method. Run its configuration, execution, and preview cells after the shared setup and benchmark configuration. It inherits the active prompt, model/cache paths, generation controls, profile, seed, and current `NUM_SAMPLES = 2` override; set that override to `None` for profile counts. Its run streams errors and selects previews through a unique receipt, displaying accuracy, random saved answers, initialization depth, fallback status, and search/completion costs.
 
-MCTS defaults to a 20-token initialization target, three candidates, K1=3, K2=5, and a **512-forward search cap per question**. The cap includes the root and every evaluated branch; confidence completion adds its own forwards at temperature 1.0. Budget/frontier fallbacks complete the deepest selected state and report its actual depth. At 256 generation steps, completion uses `256 - selected_depth` calls: 512 search calls plus a 20-token initialization total 748 calls. This reuses the existing one-step entropy search; the legacy greedy MCTS workflow retains its semantics.
+MCTS now uses the [MEDAL paper reconstruction](docs/mcts_walkthrough.md) across GSM8K, Sudoku, inspection, and sweeps. Defaults are Lc=20, C=3, K1=3, K2=5, temperature 1.0, 256 output tokens/steps/global block length, seed 1, and **no forward cap**. Full native-probability rollouts back up mean stepwise information gain; fresh candidate rollouts select the partial state, and literal adjusted-score softmax fills its remaining masks. Inline three-subtask prompting uses disjoint training/synthetic demonstrations. Gamma 10 and exploration constant 0.01 remain repository defaults, not verified author settings. Author-code parity is unverified.
+
+All branch simulations and candidate evaluations count as search; final completion is additional. Three default candidate evaluations cost 708 forwards and completion costs 236. A direct-path example costs **25,023 forwards**, with more possible under broader exploration. Strict candidate mode fails instead of silently falling back. Explicit finite-budget sweeps remain labeled ablations, retaining only completed simulation rewards. New artifact labels include `medal-v1`; historical runs and the four standalone decoding sections are preserved.
 
 On a configured CUDA machine with the LLaDA dependency profile installed:
 
@@ -202,11 +204,11 @@ All search components live in [`src/dlm_project/decoding/mcts_decoding.py`](src/
 
 - `baseline`: the existing sampler, unchanged by default.
 - `confidence`: greedy confidence-adjusted decoding from an entirely masked output.
-- `mcts_entropy`: one-token entropy evaluations initialize the output; greedy confidence decoding then completes the selected partial state.
+- `mcts_entropy`: full sampled rollout MCTS and independent candidate evaluation initialize the output; literal adjusted-score sampling completes it.
 
-This is a MEDAL-inspired **one-step entropy variant**. It does not implement full DLM rollout evaluation or search over completed Sudoku answers. Each action fills one token position, and its child evaluation performs one additional model forward. Rewards can be negative. Reference solutions never enter search or completion.
+This is a versioned paper-based MEDAL reconstruction, with explicit choices for rollout position selection, mean stepwise reward, candidate evaluation, and completion sampling. Each action fixes one output token, but evaluation completes an independent cloned trajectory. Rewards can be negative; references and Sudoku validators never guide search. See the [function flowchart, definitions, and cost accounting](docs/mcts_walkthrough.md).
 
-The default search budget is **32 forwards**, including the root and all evaluated children. Its first cycle uses **3 forwards**. Final completion is counted separately and reuses the selected node's cached analysis. `predict_with_stats(...)` returns a dictionary containing `text`, `stats`, and `trace`; statistics include selected depth, candidate count, fallback/termination details, separate search and completion forwards and latency, and peak allocated GPU memory (bytes, including weights; `null` on CPU). Timings exclude model loading and include trace work. `metrics.json` aggregates calls and latency and reports the largest per-puzzle memory peak.
+`predict_with_stats(...)` returns text, stats, and streamed trace events. It reuses one model for every branch, candidate, and final completion. Metrics separate tree analysis, simulation, candidate evaluation, and completion forwards and latency, plus peak allocated GPU memory. Failure preserves completed records and partial traces. Inline prompting is prepared by task runners; the standalone greedy confidence baseline retains its behavior.
 
 On a configured CUDA machine, run each inspection in a fresh process:
 

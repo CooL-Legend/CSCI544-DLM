@@ -135,7 +135,7 @@ class LLaDA:
         """Return {text, stats, trace}; optionally stream each trace event to a sink.
 
         MCTS initializes a partial state and passes that exact state and its
-        cached distribution statistics into greedy completion. No model is
+        independent candidate evaluations into adjusted-score completion. No model is
         reloaded here. Timings exclude model loading and synchronize CUDA.
         """
         generation = dict(steps=steps, gen_length=gen_length, block_length=block_length,
@@ -180,31 +180,26 @@ class LLaDA:
             completion_started = perf_counter()
             output = generate(counted_model, input_ids, **generation, mask_id=self.mask_id)
             stats["completion_model_calls"] = counted_model.calls
+        elif method == "mcts_entropy":
+            from dlm_project.decoding.mcts_confidence import decode
+            result = decode(self.model, input_ids, self.mask_id, steps=steps, gen_length=gen_length,
+                            block_length=block_length, temperature=temperature, seed=options["seed"],
+                            mcts=config, tokenizer=self.tokenizer, on_event=emit)
+            output = result.token_ids
+            stats.update(result.details)
+            completion_started = None
         else:
-            analysis = None
-            if method == "mcts_entropy":
-                sync()
-                search_started = perf_counter()
-                search = MCTSSearch(self.model, input_ids, self.mask_id, gen_length, config,
-                                    tokenizer=self.tokenizer, on_event=emit)
-                result = search.run()
-                sync()
-                stats.update(result.stats)
-                stats["search_latency_seconds"] = perf_counter() - search_started
-                state, analysis = result.selected.state, result.selected.analysis
-            else:
-                state = torch.full((1, prompt_len + gen_length), self.mask_id, dtype=torch.long)
-                state[:, :prompt_len] = input_ids.cpu()
+            state = torch.full((1, prompt_len + gen_length), self.mask_id, dtype=torch.long)
+            state[:, :prompt_len] = input_ids.cpu()
             sync()
             completion_started = perf_counter()
-            completion = complete_confidence(
-                self.model, state, prompt_len, self.mask_id, config,
-                initial_analysis=analysis, tokenizer=self.tokenizer, on_event=emit,
-            )
+            completion = complete_confidence(self.model, state, prompt_len, self.mask_id, config,
+                                             tokenizer=self.tokenizer, on_event=emit)
             output = completion.token_ids
             stats["completion_model_calls"] = completion.model_calls
         sync()
-        stats["completion_latency_seconds"] = perf_counter() - completion_started
+        if completion_started is not None:
+            stats["completion_latency_seconds"] = perf_counter() - completion_started
         text = self.tokenizer.batch_decode(output[:, prompt_len:], skip_special_tokens=True)[0]
         stats["latency_seconds"] = perf_counter() - started
         stats["total_model_calls"] = stats["search_model_calls"] + stats["completion_model_calls"]

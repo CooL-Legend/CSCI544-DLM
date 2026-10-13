@@ -11,6 +11,7 @@ from dlm_project.decoding.mcts_decoding import MCTSConfig, MCTSSearch, model_dev
 from dlm_project.experiments.config import load_config, validate_config
 from dlm_project.paths import PROJECT_ROOT as ROOT
 from dlm_project.tasks.sudoku.dataset import format_prompt
+from dlm_project.decoding.medal_prompting import sudoku_prompt
 
 
 def inspect_puzzle(wrapper, puzzle, config, phase, trace_path):
@@ -41,10 +42,12 @@ def inspect_puzzle(wrapper, puzzle, config, phase, trace_path):
         emit({"stage": "metadata", "phase": phase, "puzzle": puzzle,
               "generation": config["generation"], "decoding": options,
               "model": getattr(wrapper, "identity", None)})
-        prompt = wrapper.encode_prompt(format_prompt(puzzle))
+        effective_prompt, decomposition = sudoku_prompt(format_prompt(puzzle), 9, puzzle)
+        emit({"stage": "prompt", "effective_prompt": effective_prompt, "decomposition": decomposition})
+        prompt = wrapper.encode_prompt(effective_prompt)
         search = MCTSSearch(wrapper.model, prompt, wrapper.mask_id,
                             config["generation"]["gen_length"], MCTSConfig(**options["mcts"]),
-                            tokenizer=wrapper.tokenizer, on_event=emit)
+                            tokenizer=wrapper.tokenizer, on_event=emit, seed=options["seed"])
         if phase == "one_step":
             search.step()
             result = search.result()

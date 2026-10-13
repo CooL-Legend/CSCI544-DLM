@@ -24,7 +24,7 @@ def experiment_name(generation, decoding=None):
     if options["method"] == "mcts_entropy":
         suffix += (f"-lc{m['init_tokens']}-c{m['num_candidates']}"
                    f"-k1_{m['top_k_tokens']}-k2_{m['top_k_actions']}"
-                   f"-budget{m['max_model_calls']}-ucb{m['exploration_c']:g}")
+                   f"-budget{m['max_model_calls'] if m['max_model_calls'] is not None else 'none'}-ucb{m['exploration_c']:g}-medal-v1")
         if m["stop_mode"] == "budget":
             suffix += "-stop-budget"
     return name + suffix

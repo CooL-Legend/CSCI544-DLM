@@ -1,132 +1,82 @@
-"""MCTS-to-sampled-confidence handoff and actual forward accounting."""
-
-from dataclasses import asdict
-
+"""Public MEDAL adapter preserves commitments and charges every branch."""
 import pytest
 import torch
-
 from dlm_project.decoding import mcts_confidence
-from dlm_project.decoding.mcts_decoding import MCTSConfig
-from tests.decoding.helpers import FakeModel, FakeTokenizer, MASK, PROMPT
+from dlm_project.decoding.mcts_decoding import MCTSConfig, derive_seed,SearchIncompleteError
+from tests.decoding.helpers import FakeModel,FakeTokenizer,MASK,PROMPT
 
 
-def options(**overrides):
-    return {"init_tokens": 2, "num_candidates": 1, "top_k_tokens": 2,
-            "top_k_actions": 2, "max_model_calls": 32, **overrides}
+def options(**kw):
+    return {'init_tokens':2,'num_candidates':1,'top_k_tokens':2,'top_k_actions':2,**kw}
 
 
-@pytest.mark.parametrize("search,depth,reason,fallback", [
-    (options(), 2, "candidate_quota", False),
-    (options(max_model_calls=1), 0, "model_call_budget", True),
-    (options(max_model_calls=2), 1, "model_call_budget", True),
-    (options(top_k_actions=1, num_candidates=3), 2, "frontier_exhausted", True),
-])
-def test_selected_state_is_completed_and_all_search_branches_are_charged(search, depth, reason, fallback):
-    model = FakeModel()
-    result = mcts_confidence.decode(model, PROMPT, MASK, gen_length=6, steps=6,
-                                   block_length=3, mcts=search, tokenizer=FakeTokenizer())
-    details = result.details
-    assert details["selected_depth"] == depth and details["requested_depth"] == 2
-    assert details["stop_reason"] == reason and details["fallback_used"] is fallback
-    assert details["search_model_calls"] <= search["max_model_calls"]
-    assert details["completion_model_calls"] == 6 - depth
-    assert result.total_nfes == len(model.seen) == (
-        details["search_model_calls"] + details["completion_model_calls"])
-    assert result.scoring_nfes == 0 and details["remaining_masks"] == 0
-    assert details["search_latency_seconds"] >= 0 and details["completion_latency_seconds"] >= 0
-    assert details["search_state_device"] == "cpu"
-    assert all(torch.equal(state[:, :2], PROMPT) for state in model.seen)
-    initialization = details["selected_initialization"]
-    assert len(initialization["committed"]) == depth
-    for state in model.seen[details["search_model_calls"]:]:
-        for item in initialization["committed"]:
-            assert state[0, 2 + item["output_position"]] == item["token_id"]
-    completed_positions = [action["output_position"] for event in result.trace
-                           if event["phase"] == "completion" for action in event["actions"]]
-    initial_positions = [item["output_position"] for item in initialization["committed"]]
-    assert sorted(initial_positions + completed_positions) == list(range(6))
-    evaluations = [event for event in result.trace
-                   if event["phase"] == "search" and event["stage"] == "evaluation"]
-    assert details["search_model_calls"] == 1 + len(evaluations)
-    completion_events = [event for event in result.trace if event["phase"] == "completion"]
-    assert completion_events[0]["generation_nfes"] == details["search_model_calls"] + 1
-    assert completion_events[-1]["generation_nfes"] == result.total_nfes
-    if fallback:
-        assert details["fallback_reason"] is not None
+@pytest.mark.parametrize('cap,depth',[(1,0),(2,0),(6,1)])
+def test_explicit_budget_completion_preserves_committed_tokens_and_costs(cap,depth):
+    model=FakeModel();sink=[]
+    r=mcts_confidence.decode(model,PROMPT,MASK,gen_length=6,steps=6,block_length=6,
+        mcts=options(stop_mode='budget',max_model_calls=cap),tokenizer=FakeTokenizer(),on_event=sink.append)
+    assert r.details['selected_depth']==depth
+    assert r.details['search_model_calls']==cap
+    assert r.details['completion_model_calls']==6-depth
+    assert r.total_nfes==len(model.seen)==cap+6-depth
+    assert r.trace==sink
+    assert torch.equal(r.token_ids[:,:2],PROMPT)
+    for commit in r.details['selected_initialization']['committed']:
+        assert r.token_ids[0,2+commit['output_position']]==commit['token_id']
+    assert (r.token_ids[:,2:]!=MASK).all()
+    assert r.details['completion_seed']==derive_seed(1,'final_completion')
 
 
-def test_search_initialization_in_future_block_is_preserved_during_completion():
-    rows = [[0., .5, .25, .25]] * 4 + [[0., .99, .005, .005], [0., .98, .01, .01]]
-    model = FakeModel(lambda _: rows)
-    result = mcts_confidence.decode(model, PROMPT, MASK, gen_length=6, steps=6,
-                                   block_length=3, mcts=options(top_k_actions=1))
-    initialized = result.details["selected_initialization"]["committed"]
-    assert [item["output_position"] for item in initialized] == [4, 5]
-    for state in model.seen[result.details["search_model_calls"]:]:
-        assert state[0, 6:].tolist() == [1, 1]
-    assert result.details["completion_model_calls"] == 4
-    assert result.token_ids[0, 6:].tolist() == [1, 1]
+def test_uncapped_candidate_search_full_cost_and_global_completion():
+    model=FakeModel()
+    r=mcts_confidence.decode(model,PROMPT,MASK,gen_length=4,steps=4,block_length=4,
+                             mcts=options(num_candidates=3),tokenizer=FakeTokenizer())
+    assert r.details['candidate_count']==r.details['evaluated_candidates']==3
+    assert r.details['search_model_calls']==21
+    assert r.details['completion_model_calls']==2
+    assert r.total_nfes==len(model.seen)==23
+    assert r.details['implementation_version']=='medal_reconstruction_v1'
+    assert not r.details['fallback_used']
+    assert r.trace[-1]['generation_nfes']==23
+    assert r.details['candidate_evaluations'][0]['raw_output'] is not None
 
 
-def test_full_initialization_needs_no_completion_forward():
-    model = FakeModel()
-    result = mcts_confidence.decode(model, PROMPT, MASK, gen_length=4, steps=4,
-                                   block_length=2, mcts=options(init_tokens=4, top_k_actions=1))
-    assert result.details["selected_depth"] == 4
-    assert result.details["completion_model_calls"] == 0
-    assert result.total_nfes == len(model.seen) == 5  # Root + four child evaluations.
-    assert not any(event["phase"] == "completion" for event in result.trace)
-    assert not (result.token_ids[:, 2:] == MASK).any()
+def test_seed_reproducibility_and_phase_separation():
+    kw=dict(gen_length=24,steps=24,block_length=24,
+            mcts=options(stop_mode='budget',max_model_calls=1))
+    a=mcts_confidence.decode(FakeModel(),PROMPT,MASK,seed=1,**kw)
+    b=mcts_confidence.decode(FakeModel(),PROMPT,MASK,seed=1,**kw)
+    c=mcts_confidence.decode(FakeModel(),PROMPT,MASK,seed=2,**kw)
+    assert torch.equal(a.token_ids,b.token_ids) and a.trace==b.trace
+    assert not torch.equal(a.token_ids,c.token_ids)
+    assert len({derive_seed(1,p) for p in ['simulation','candidate_evaluation','final_completion']})==3
 
 
-def test_completion_uses_token_probability_instead_of_legacy_adjusted_confidence():
-    # Position 0 has higher token probability; position 1 has a larger margin.
-    rows = [[0., .60, .39, .01], [0., .55, .225, .225]]
-    result = mcts_confidence.decode(FakeModel(lambda _: rows), PROMPT, MASK,
-                                   gen_length=2, steps=2, block_length=2, temperature=0,
-                                   mcts=options(max_model_calls=1))
-    event = next(event for event in result.trace if event["phase"] == "completion")
-    assert event["actions"][0]["output_position"] == 0
-    assert event["actions"][0]["selection_score"] == pytest.approx(.60)
+@pytest.mark.parametrize('changes',[{'mcts':options(init_tokens=4)},{'block_length':2},
+                                   {'temperature':0},{'mcts':options(max_model_calls=0)}])
+def test_invalid_settings_fail_before_forward(changes):
+    model=FakeModel()
+    kw=dict(gen_length=4,steps=4,block_length=4,mcts=options())
+    kw.update(changes)
+    with pytest.raises(ValueError): mcts_confidence.decode(model,PROMPT,MASK,**kw)
+    assert not model.seen
 
 
-def test_temperature_one_completion_is_seeded_and_reproducible():
-    def model():
-        return FakeModel(lambda _: [0., 1 / 3, 1 / 3, 1 / 3])
-
-    kwargs = dict(gen_length=32, steps=32, block_length=16, temperature=1.0,
-                  mcts=options(max_model_calls=1))
-    first = mcts_confidence.decode(model(), PROMPT, MASK, seed=1, **kwargs)
-    again = mcts_confidence.decode(model(), PROMPT, MASK, seed=1, **kwargs)
-    other = mcts_confidence.decode(model(), PROMPT, MASK, seed=2, **kwargs)
-    assert torch.equal(first.token_ids, again.token_ids)
-    assert first.trace == again.trace
-    assert not torch.equal(first.token_ids, other.token_ids)
+def test_default_settings_shared_across_all_mcts_paths():
+    assert mcts_confidence.resolve_mcts_config(gen_length=256)==MCTSConfig()
+    assert MCTSConfig().init_tokens==20 and MCTSConfig().max_model_calls is None
 
 
-def test_method_defaults_are_separate_from_legacy_mcts_defaults():
-    resolved = mcts_confidence.resolve_mcts_config(gen_length=256)
-    assert asdict(resolved) == {
-        "init_tokens": 20, "num_candidates": 3, "top_k_tokens": 3, "top_k_actions": 5,
-        "max_model_calls": 512, "margin_gamma": 10.0, "exploration_c": .01,
-        "epsilon": 1e-8, "stop_mode": "candidates",
-    }
-    assert MCTSConfig().init_tokens == MCTSConfig().top_k_tokens == 2
-    assert MCTSConfig().max_model_calls == 32
-    supplied = {"max_model_calls": 1}
-    assert mcts_confidence.resolve_mcts_config(supplied, gen_length=256).init_tokens == 20
-    assert supplied == {"max_model_calls": 1}
-
-
-@pytest.mark.parametrize("settings", [
-    "invalid", {"unknown": 2}, {"init_tokens": 5}, {"top_k_tokens": True},
-    {"max_model_calls": 0}, {"stop_mode": "invalid"}, {"epsilon": 0},
-])
-def test_invalid_search_settings_fail_before_model_forward(settings):
-    model = FakeModel()
-    if isinstance(settings, dict):
-        settings = {**options(), **settings}
-    with pytest.raises(ValueError):
-        mcts_confidence.decode(model, PROMPT, MASK, gen_length=4, steps=4,
-                               block_length=2, mcts=settings)
-    assert model.seen == []
+@pytest.mark.parametrize('family',['llada','illada','llada_bgpo'])
+def test_registered_model_mask_ids_are_excluded_from_all_commitments(family):
+    from dlm_project.models.profiles import get_profile
+    mask=get_profile(family)['mask_id']
+    probabilities=torch.zeros(max(mask+1,6))
+    probabilities[1:4]=torch.tensor([.7,.2,.1])
+    model=FakeModel(lambda _:probabilities)
+    prompt=torch.tensor([[3,mask]])
+    r=mcts_confidence.decode(model,prompt,mask,gen_length=4,steps=4,block_length=4,
+                             mcts=options(top_k_tokens=1,top_k_actions=1))
+    assert torch.equal(r.token_ids[:,:2],prompt)
+    assert (r.token_ids[:,2:]!=mask).all()
+    assert r.total_nfes==len(model.seen)==10

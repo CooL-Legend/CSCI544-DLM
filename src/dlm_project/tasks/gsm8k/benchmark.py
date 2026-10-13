@@ -14,6 +14,8 @@ import torch
 
 from dlm_project.decoding import best_of_5, confidence, mcts_confidence, random_mdm, top_k_margin
 from dlm_project.decoding.common import validate_generation
+from dlm_project.decoding.medal_prompting import get_gsm8k_demonstrations, gsm8k_prompt
+from dlm_project.decoding.mcts_decoding import IMPLEMENTATION_VERSION
 from dlm_project.experiments.artifacts import save_json
 from dlm_project.experiments.config import load_config, validate_config
 from dlm_project.experiments.manifests import digest
@@ -82,6 +84,9 @@ def resolve_settings(method, source, *, profile=None, num_samples=None, seed=Non
         generation["temperature"] = temperature
     validate_generation(**generation, seed=decoding_seed)
     if method == "mcts_confidence":
+        if generation["steps"] != generation["gen_length"] or generation["block_length"] != generation["gen_length"] or generation["temperature"] <= 0:
+            raise ValueError("MEDAL requires steps = block_length = gen_length and positive temperature.")
+        config["implementation_version"] = IMPLEMENTATION_VERSION
         config["decoding"]["mcts"] = asdict(mcts_confidence.resolve_mcts_config(
             decoding_source.get("mcts"), gen_length=generation["gen_length"]))
     compatible = {**config, "generation": {**generation, "remasking": "low_confidence"},
@@ -127,7 +132,7 @@ def _metrics(config, state, records):
     total_seconds = sum(times)
     calls = sum(row["total_model_calls"] for row in records)
     memory = [row["peak_gpu_memory_bytes"] for row in records if row["peak_gpu_memory_bytes"] is not None]
-    metrics = {"status": state["status"], "method": config["decoding"]["method"],
+    metrics = {"implementation_version": config.get("implementation_version"), "status": state["status"], "method": config["decoding"]["method"],
             "model_family": config["model"]["family"],
             "profile": config["evaluation"]["profile"],
             "requested_examples": config["data"]["num_samples"], "processed": count,
@@ -153,6 +158,11 @@ def _metrics(config, state, records):
             metrics[f"{phase}_latency_seconds"] = sum(row[f"{phase}_latency_seconds"] for row in records)
         metrics["fallback_count"] = sum(row["fallback_used"] for row in records)
         metrics["mean_selected_depth"] = mean(row["selected_depth"] for row in records) if count else None
+    if config["decoding"]["method"] == "mcts_confidence":
+        for phase in ("tree_analysis", "simulation", "candidate_evaluation"):
+            metrics[f"total_{phase}_model_calls"] = sum(row.get(f"{phase}_model_calls", 0) for row in records)
+            metrics[f"total_{phase}_latency_seconds"] = sum(row.get(f"{phase}_latency_seconds", 0) for row in records)
+        metrics["active_prediction_model_calls"] = state.get("active_prediction_model_calls", 0)
     return metrics
 
 
@@ -171,8 +181,8 @@ def run_evaluation(method, source, *, manifest_path=None, output_dir=None, model
             f"temp{generation['temperature']:g}-seed{config['decoding']['seed']}")
     if method == "mcts_confidence":
         m = config["decoding"]["mcts"]
-        name += (f"-lc{m['init_tokens']}-c{m['num_candidates']}-k1_{m['top_k_tokens']}"
-                 f"-k2_{m['top_k_actions']}-budget{m['max_model_calls']}-gamma{m['margin_gamma']:g}"
+        name += (f"-medal-v1-lc{m['init_tokens']}-c{m['num_candidates']}-k1_{m['top_k_tokens']}"
+                 f"-k2_{m['top_k_actions']}-budget{m['max_model_calls'] if m['max_model_calls'] is not None else 'none'}-gamma{m['margin_gamma']:g}"
                  f"-ucb{m['exploration_c']:g}-eps{m['epsilon']:g}-stop-{m['stop_mode']}")
     model_profile = get_profile(config["model"]["family"])
     parent = Path(output_dir).expanduser() if output_dir else root / model_profile["label"] / "GSM8K"
@@ -207,9 +217,17 @@ def run_evaluation(method, source, *, manifest_path=None, output_dir=None, model
         config["provenance"]["model"] = wrapper.identity
         save_json(directory / "config.json", config)
         save_progress()
+        demonstrations = None
+        if method == "mcts_confidence":
+            demonstrations = get_gsm8k_demonstrations(Path(manifest_path).with_name("gsm8k_decomposition_train.json"), revision=manifest["dataset"]["revision"],
+                                                     cache_dir=config["data"].get("cache_dir"))
+            save_json(directory / "decomposition_manifest.json", demonstrations)
         with (directory / "predictions.jsonl").open("a", encoding="utf-8") as predictions:
             for example in examples:
                 prompt = build_prompt(example["question"], config["prompt"]["instructions"])
+                base_prompt, decomposition = prompt, None
+                if method == "mcts_confidence":
+                    prompt, decomposition = gsm8k_prompt(base_prompt, example["question"], demonstrations)
                 seed = example_seed(config["decoding"]["seed"], example["row_id"])
                 _sync(wrapper.device)
                 if torch.device(wrapper.device).type == "cuda":
@@ -221,7 +239,21 @@ def run_evaluation(method, source, *, manifest_path=None, output_dir=None, model
                     kwargs.update(tokenizer=wrapper.tokenizer, answer_extractor=extract_answer)
                 elif method == "mcts_confidence":
                     kwargs.update(mcts=config["decoding"]["mcts"], tokenizer=wrapper.tokenizer)
-                result = DECODERS[method](wrapper.model, prompt_ids, wrapper.mask_id, **kwargs)
+                trace_file = f"traces/test_{example['row_id']:04d}.jsonl"
+                with (directory / trace_file).open("w", encoding="utf-8") as trace:
+                    def emit(event):
+                        trace.write(json.dumps(event, allow_nan=False) + "\n")
+                        trace.flush()
+                        state["active_example_id"] = example["example_id"]
+                        state["active_prediction_model_calls"] = event.get("generation_nfes", event.get("search_model_calls", 0))
+                    if method == "mcts_confidence":
+                        kwargs["on_event"] = emit
+                    result = DECODERS[method](wrapper.model, prompt_ids, wrapper.mask_id, **kwargs)
+                    if method != "mcts_confidence":
+                        for event in result.trace:
+                            emit(event)
+                state["active_example_id"] = None
+                state["active_prediction_model_calls"] = 0
                 if method == "best_of_5":
                     text = result.details["candidates"][result.details["selected_candidate_index"]]["raw_output"]
                 else:
@@ -233,13 +265,11 @@ def run_evaluation(method, source, *, manifest_path=None, output_dir=None, model
                                if torch.device(wrapper.device).type == "cuda" else None)
                 # Reference solutions enter only post-generation scoring.
                 score = score_answer(text, example["reference_solution"])
-                trace_file = f"traces/test_{example['row_id']:04d}.jsonl"
-                with (directory / trace_file).open("w", encoding="utf-8") as trace:
-                    for event in result.trace:
-                        trace.write(json.dumps(event, allow_nan=False) + "\n")
                 row = {"example_id": example["example_id"], "row_id": example["row_id"],
                        "model_family": config["model"]["family"], "mask_token_id": wrapper.mask_id,
                        "method": method, "seed": seed, "prompt": prompt, "prompt_hash": digest(prompt),
+                       "base_prompt": base_prompt, "base_prompt_hash": digest(base_prompt),
+                       "effective_prompt_hash": digest(prompt), "decomposition": decomposition,
                        "content_hash": example["content_hash"], "reference_solution": example["reference_solution"],
                        "raw_output": text, **score, "model_revision": wrapper.identity["revision"],
                        "dataset_revision": manifest["dataset"]["revision"],

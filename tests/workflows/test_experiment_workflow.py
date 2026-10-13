@@ -62,7 +62,7 @@ def test_plot_failure_preserves_record_and_cannot_mark_run_completed(tmp_path, m
         run_experiment(config, [{"puzzle": "0" * 81, "solution": "1" * 81}], Model())
     run_dir = next(tmp_path.rglob("metrics.json")).parent
     metrics = json.loads((run_dir / "metrics.json").read_text())
-    assert metrics["status"] == "running"
+    assert metrics["status"] == "failed"
     assert metrics["processed"] == 1
     assert metrics["plots_saved"] == 0
     record = json.loads((run_dir / "predictions.jsonl").read_text())
@@ -93,7 +93,7 @@ def test_notebook_config_updater_uses_actual_parameters_and_family(tmp_path, fam
     if family == "llada":
         assert saved["generation"]["block_length"] == 256
         assert saved["decoding"]["method"] == "mcts_entropy"
-        assert saved["decoding"]["mcts"]["init_tokens"] == 2
+        assert saved["decoding"]["mcts"]["init_tokens"] == 20
     else:
         assert saved["generation"]["block_length"] == 128
     assert Path(saved["output_dir"]) == tmp_path / label / "Sudoku" / experiment_name(saved["generation"], saved.get("decoding"))

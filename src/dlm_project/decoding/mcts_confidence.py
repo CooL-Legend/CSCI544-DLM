@@ -1,27 +1,23 @@
-"""Entropy-based MCTS initialization followed by token-probability sampling.
+"""MEDAL reconstruction: complete MCTS rollouts, then adjusted-score sampling.
 
-Search keeps the existing one-step entropy evaluator. Completion recomputes
-probabilities for the selected state and uses the same sampler as confidence.py.
+The historical method name is retained; implementation_version distinguishes
+new runs from the earlier one-step/token-probability method.
 """
 
 from dataclasses import asdict
 from time import perf_counter
-
 import torch
 
 from dlm_project.decoding.common import validate_generation, validate_prompt
-from dlm_project.decoding.confidence import decode as confidence_decode
 from dlm_project.decoding.decoder_result import DecodeResult
-from dlm_project.decoding.mcts_decoding import MCTSConfig, MCTSSearch, model_device, state_record
+from dlm_project.decoding.mcts_decoding import (
+    MCTSConfig, MCTSSearch, complete_medal, derive_seed, model_device, state_record,
+)
 
-
-DEFAULT_MCTS_CONFIG = MCTSConfig(init_tokens=20, num_candidates=3,
-                                top_k_tokens=3, top_k_actions=5,
-                                max_model_calls=512)
+DEFAULT_MCTS_CONFIG = MCTSConfig()
 
 
 def resolve_mcts_config(settings=None, *, gen_length):
-    """Apply this method's defaults without changing legacy MCTS defaults."""
     if isinstance(settings, MCTSConfig):
         config = settings
     else:
@@ -42,44 +38,44 @@ def _sync(device):
 
 @torch.inference_mode()
 def decode(model, prompt_ids, mask_id, *, gen_length=256, steps=256,
-           block_length=128, temperature=1.0, seed=1, mcts=None, tokenizer=None):
-    """Search once, then complete the selected state using the same loaded model.
-
-    The cap includes root and all child evaluations, and excludes completion.
-    Budget/frontier fallbacks are completed and retain their actual depth.
-    """
+           block_length=256, temperature=1.0, seed=1, mcts=None, tokenizer=None,
+           on_event=None):
+    """Accept prepared prompt IDs; task runners own two-shot prompt augmentation."""
     validate_generation(gen_length=gen_length, steps=steps, block_length=block_length,
                         temperature=temperature, seed=seed)
     validate_prompt(prompt_ids, mask_id)
+    if steps != gen_length or block_length != gen_length or temperature <= 0:
+        raise ValueError("MEDAL requires steps = block_length = gen_length and positive temperature.")
     config = resolve_mcts_config(mcts, gen_length=gen_length)
     device = model_device(model)
-    search = MCTSSearch(model, prompt_ids, mask_id, gen_length, config, tokenizer=tokenizer)
+    search = MCTSSearch(model, prompt_ids, mask_id, gen_length, config,
+                        tokenizer=tokenizer, on_event=on_event, seed=seed)
     _sync(device)
     started = perf_counter()
     result = search.run()
     _sync(device)
     search_seconds = perf_counter() - started
+    completion_seed = derive_seed(seed, "final_completion")
+    events = []
+
+    def emit(event):
+        event = {**event, "phase": "completion",
+                 "generation_nfes": result.stats["search_model_calls"] + event.get("model_calls", 0)}
+        events.append(event)
+        if on_event:
+            on_event(event)
 
     started = perf_counter()
-    completion = confidence_decode(
-        model, prompt_ids, mask_id, gen_length=gen_length, steps=steps,
-        block_length=block_length, temperature=temperature, seed=seed,
-        initial_state=result.selected.state,
-    )
+    completion = complete_medal(model, result.selected.state, search.prompt_len, mask_id,
+                                config, seed=completion_seed, temperature=temperature,
+                                tokenizer=tokenizer, on_event=emit)
     _sync(device)
     completion_seconds = perf_counter() - started
-    search_calls = result.stats["search_model_calls"]
-    details = {**completion.details, **result.stats, "mcts": asdict(config),
-               "completion_model_calls": completion.total_nfes,
-               "search_latency_seconds": search_seconds,
-               "completion_latency_seconds": completion_seconds,
-               "model_device": str(device), "search_state_device": str(result.selected.state.device),
-               "selected_initialization": state_record(result.selected.state, prompt_ids.shape[1],
-                                                       mask_id, tokenizer)}
-    trace = [{**event, "phase": "search"} for event in result.trace]
-    trace.extend({**event, "phase": "completion",
-                  "completion_model_calls": event["generation_nfes"],
-                  "generation_nfes": search_calls + event["generation_nfes"]}
-                 for event in completion.trace)
-    return DecodeResult(completion.token_ids, search_calls + completion.generation_nfes,
-                        scoring_nfes=completion.scoring_nfes, details=details, trace=trace)
+    details = {**result.stats, "mcts_config": asdict(config), "seed": seed,
+               "completion_seed": completion_seed, "completion_model_calls": completion.model_calls,
+               "search_latency_seconds": search_seconds, "completion_latency_seconds": completion_seconds,
+               "remaining_masks": 0, "model_device": str(device), "search_state_device": "cpu",
+               "selected_initialization": state_record(result.selected.state, search.prompt_len,
+                                                        mask_id, tokenizer)}
+    return DecodeResult(completion.token_ids, search.model_calls + completion.model_calls,
+                        details=details, trace=result.trace + events)

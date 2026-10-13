@@ -95,11 +95,12 @@ def test_configuration_preserves_active_benchmark(cells, tmp_path, profile, coun
     exec(source, scope)
     config = yaml.safe_load(scope["MCTS_CONFIG"].read_text())
     assert scope["cfg"] == original
-    for section in ("model", "data", "prompt", "generation", "evaluation"):
+    for section in ("model", "data", "prompt", "evaluation"):
         assert config[section] == original[section]
     assert config["decoding"]["seed"] == 1
     assert scope["mcts_resolved"]["data"]["num_samples"] == expected
-    assert config["decoding"]["mcts"]["max_model_calls"] == 512
+    assert config["decoding"]["mcts"]["max_model_calls"] is None
+    assert config["generation"]["block_length"] == config["generation"]["gen_length"]
     assert scope["MCTS_MANIFEST"] == tmp_path / "drive/manifests/gsm8k_test.json"
     assert scope["MCTS_RUN_DIR"] is None
 

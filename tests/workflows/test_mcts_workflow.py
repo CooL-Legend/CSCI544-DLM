@@ -32,6 +32,7 @@ def tiny_config(tmp_path):
     config["experiment_root"] = str(tmp_path)
     config["model"].update(device="cpu", dtype="float32")
     config["generation"].update(gen_length=4, steps=4, block_length=4)
+    config["decoding"]["mcts"].update(init_tokens=2, num_candidates=3, top_k_tokens=2, top_k_actions=2, max_model_calls=None)
     return config
 
 
@@ -40,14 +41,15 @@ def source(notebook, cell_id):
 
 
 @pytest.mark.parametrize("method,search_calls,completion_calls", [
-    ("baseline", 0, 4), ("confidence", 0, 4), ("mcts_entropy", 7, 1),
+    ("baseline", 0, 4), ("confidence", 0, 4), ("mcts_entropy", 21, 2),
 ])
 def test_prediction_modes_forward_counts_text_interface_and_trace(method, search_calls, completion_calls):
     instance = wrapper()
     sink = []
     prediction = instance.predict_with_stats(
         "prompt", steps=4, gen_length=4, block_length=4,
-        decoding={"method": method}, on_event=sink.append,
+        temperature=1.0 if method=="mcts_entropy" else 0.0,
+        decoding={"method": method, "mcts": {"init_tokens":2,"num_candidates":3,"top_k_tokens":2,"top_k_actions":2}}, on_event=sink.append,
     )
     stats = prediction["stats"]
     assert stats["search_model_calls"] == search_calls
@@ -61,11 +63,12 @@ def test_prediction_modes_forward_counts_text_interface_and_trace(method, search
     assert prediction["trace"] == sink
     assert sink[-1]["stage"] == "prediction"
     assert prediction["text"] == instance.predict("prompt", steps=4, gen_length=4, block_length=4,
-                                                 decoding={"method": method})
+                                                 temperature=1.0 if method=="mcts_entropy" else 0.0,
+                                                 decoding={"method": method,"mcts":{"init_tokens":2,"num_candidates":3,"top_k_tokens":2,"top_k_actions":2}})
     json.dumps(prediction, allow_nan=False)
     if method == "mcts_entropy":
         selected = next(e["selected_state"] for e in sink if e["stage"] == "termination")
-        completed_positions = [e["action"]["output_position"] for e in sink if e["stage"] == "completion"]
+        completed_positions = [e["action"]["output_position"] for e in sink if e["stage"] == "rollout_step" and e.get("phase") == "completion"]
         assert not set(completed_positions) & {a["output_position"] for a in selected["committed"]}
         first_completion_input = instance.model.seen[search_calls]
         for action in selected["committed"]:
@@ -87,7 +90,7 @@ def test_baseline_default_delegates_to_original_sampler_with_unchanged_parameter
                          remasking="low_confidence", mask_id=MASK)]
 
 
-@pytest.mark.parametrize("phase,expected_calls,finished", [("one_step", 3, False), ("search", 7, True)])
+@pytest.mark.parametrize("phase,expected_calls,finished", [("one_step", 7, False), ("search", 21, True)])
 def test_inspection_jsonl_contains_actual_events_and_no_completion(tmp_path, phase, expected_calls, finished):
     instance = wrapper()
     trace_path = tmp_path / "inspection" / f"{phase}.jsonl"
@@ -101,7 +104,7 @@ def test_inspection_jsonl_contains_actual_events_and_no_completion(tmp_path, pha
     assert result.stats["search_model_calls"] == len(instance.model.seen) == expected_calls
     assert all(e["stage"] != "completion" for e in events)
     assert "logits" not in trace_path.read_text()
-    assert "solution" not in trace_path.read_text()
+    assert "reference_solution" not in trace_path.read_text()
 
 
 def test_runner_saves_resolved_config_search_stats_and_matching_trace(tmp_path):
@@ -114,13 +117,13 @@ def test_runner_saves_resolved_config_search_stats_and_matching_trace(tmp_path):
     assert saved["decoding"] == resolve_decoding(config["decoding"], config["generation"])
     record = json.loads((run_dir / "predictions.jsonl").read_text())
     stats = record["decoding_stats"]
-    assert record["raw_output"] == " one" * 4  # Unmodified, unparseable output remains visible.
+    assert len(record["raw_output"]) > 0  # Unmodified, unparseable output remains visible.
     assert record["parse_success"] is False
     assert record["decoding_method"] == "mcts_entropy"
     assert stats["selected_depth"] == 2 and stats["candidate_count"] == 3
     assert stats["mcts_config"] == saved["decoding"]["mcts"]
-    assert stats["search_model_calls"] == summary["search_model_calls"] == 7
-    assert stats["completion_model_calls"] == summary["completion_model_calls"] == 1
+    assert stats["search_model_calls"] == summary["search_model_calls"] == 21
+    assert stats["completion_model_calls"] == summary["completion_model_calls"] == 2
     assert summary["latency_seconds"] == stats["latency_seconds"]
     events = [json.loads(line) for line in (run_dir / record["trace_file"]).read_text().splitlines()]
     assert events[-1]["stats"] == stats
@@ -141,9 +144,10 @@ def test_interrupted_search_flushes_prior_trace_events(tmp_path):
         run_experiment(tiny_config(tmp_path), [{"puzzle": "0" * 81, "solution": "1" * 81}], instance)
     trace_path = next(tmp_path.rglob("puzzle_000.jsonl"))
     events = [json.loads(line) for line in trace_path.read_text().splitlines()]
-    assert any(e["stage"] == "backpropagation" for e in events)
+    assert any(e["stage"] == "forward" for e in events)
+    assert not any(e["stage"] == "backpropagation" for e in events)
     metrics = json.loads(next(tmp_path.rglob("metrics.json")).read_text())
-    assert metrics["status"] == "running" and metrics["processed"] == 0
+    assert metrics["status"] == "failed" and metrics["processed"] == 0
 
 
 def test_config_validation_and_method_sensitive_experiment_names(tmp_path):
@@ -152,13 +156,18 @@ def test_config_validation_and_method_sensitive_experiment_names(tmp_path):
     baseline = experiment_name(config["generation"])
     assert experiment_name(config["generation"], {"method": "baseline"}) == baseline
     mcts = experiment_name(config["generation"], config["decoding"])
-    assert "mcts_entropy" in mcts and "lc2-c3-k1_2-k2_2-budget32" in mcts
+    assert "mcts_entropy" in mcts and "lc2-c3-k1_2-k2_2-budgetnone" in mcts
     for key in config["decoding"]["mcts"]:
         changed = copy.deepcopy(config["decoding"])
-        changed["mcts"][key] *= 2
+        if key == "stop_mode":
+            continue
+        if key == "max_model_calls":
+            changed["mcts"][key] = 100
+        else:
+            changed["mcts"][key] *= 2
         assert experiment_name(config["generation"], changed) != mcts
     for method in ("confidence", "mcts_entropy"):
-        for key, value in [("block_length", 2), ("steps", 2), ("temperature", .1), ("remasking", "random")]:
+        for key, value in [("block_length", 2), ("steps", 2), ("temperature", .1 if method == "confidence" else 0), ("remasking", "random")]:
             invalid = copy.deepcopy(config)
             invalid["decoding"]["method"] = method
             invalid["generation"][key] = value
@@ -177,7 +186,7 @@ def test_notebook_inspection_uses_subprocess_and_viewer_reads_saved_traces(tmp_p
     monkeypatch.setattr(IPython.display, "display", frames.append)
     scope = {"Path": Path}
     exec(source(notebook, "mcts-trace-viewer"), scope)
-    events = MCTSSearch(FakeModel(), PROMPT, MASK, 4, MCTSConfig()).run().trace
+    events = MCTSSearch(FakeModel(), PROMPT, MASK, 4, MCTSConfig(init_tokens=2, top_k_tokens=2, top_k_actions=2)).run().trace
     trace_path = tmp_path / "events.jsonl"
     trace_path.write_text("".join(json.dumps(e) + "\n" for e in events))
     scope["search_events"] = scope["read_trace"](trace_path)

@@ -3,7 +3,7 @@
 Four decoder modules evaluate the pinned `GSAI-ML/LLaDA-8B-Instruct` and
 `GSAI-ML/iLLaDA-8B-Instruct` checkpoints on GSM8K. They share fixed-length masked sampling, block scheduling,
 chat formatting, and strict final-answer scoring. A fifth LLaDA method adds MCTS
-initialization before the same token-probability confidence completion. These
+initialization with full sampled rollouts, independent candidate evaluation, and adjusted-score softmax completion. These
 methods perform inference without training.
 
 ## Algorithms
@@ -14,15 +14,15 @@ methods perform inference without training.
 | [Top-K Margin](top_k_margin.py) | Fill positions with the largest difference between their top two token probabilities. | 256 |
 | [Confidence](confidence.py) | Fill positions whose sampled tokens have the largest model probabilities. | 256 |
 | [Best-of-5](best_of_5.py) | Generate five confidence-decoded candidates and select the most frequent normalized final answer. | 1,280 |
-| [MCTS + Confidence](mcts_confidence.py) | Select an initialization with entropy-based MCTS, then confidence-decode its remaining masks. | Search calls + 256 − selected depth |
+| [MCTS + Confidence](mcts_confidence.py) | MEDAL reconstruction: full-rollout search, fresh candidate ranking, adjusted-score sampling. | Search calls + 256 − selected depth |
 
 All four default to **temperature 1.0**, **256 output positions**, **256 denoising
 steps**, **128-token blocks**, and **seed 1**. Tokens are sampled using the
 existing LLaDA Gumbel helper. Scores use the model probabilities before sampling
 noise. Mask tokens are excluded from proposals and probability rankings.
 Prompt tokens and completed output positions stay fixed, and only the current
-output block can receive commitments during sampling/completion. MCTS can
-initialize positions anywhere in the output before block-based completion.
+output block receives commitments in the four standalone decoders. MEDAL uses
+one global output block and can choose positions anywhere in the output.
 
 Top-K Margin's K is the scheduled number of positions filled at each step,
 derived from the generation length and step count. For example, 256 positions
@@ -45,31 +45,17 @@ retained and the question scores as incorrect. Voting uses no reference answer
 and adds no model forwards. Temperature zero is supported but can make all five
 confidence candidates identical despite their distinct seeds.
 
-### MCTS initialization + confidence completion
+### MEDAL paper reconstruction
 
-`mcts_confidence.py` reuses the existing `MCTSSearch` one-step entropy evaluator.
-Each child commits one output token and costs one forward to evaluate its
-remaining-mask entropy. Search defaults are `init_tokens=20` (Lc),
-`num_candidates=3` (C), `top_k_tokens=3` (K1), `top_k_actions=5` (K2),
-`max_model_calls=512`, `margin_gamma=10`, `exploration_c=0.01`, `epsilon=1e-8`,
-and `stop_mode=candidates`. These initialization parameters use the existing
-search algorithm; full-completion rollouts are not performed. See the
-[search walkthrough](../../../docs/mcts_walkthrough.md) for its reward and ranking.
+All MCTS paths now use the [documented MEDAL reconstruction](../../../docs/mcts_walkthrough.md), with implementation version `medal_reconstruction_v1`. The historical `mcts_confidence` and `mcts_entropy` identifiers remain available. Author-code parity is unverified.
 
-The **512-forward cap is per question and search-only**: it includes root analysis
-and every evaluated child across all branches. Search stops earlier when it
-collects the requested candidates or exhausts the frontier. If the target depth
-or candidate quota cannot be reached, the deepest selected state is completed,
-with `selected_depth`, `fallback_used`, `fallback_reason`, and `stop_reason` saved.
-The target of 20 initialized tokens is therefore not guaranteed by a 512-call cap.
+Search performs complete native-probability rollouts on cloned child states and backs up the mean stepwise information gain once per completed simulation. It collects three distinct depth-20 states, evaluates each with a fresh independently seeded rollout, and selects the highest rollout mean. Final completion starts afresh from the selected partial state and samples literal `softmax(s / temperature)` over all legal masked position-token actions, where `s = p * exp(-H) * sigmoid(gamma * margin)`. It does not use token-probability confidence completion or reuse a candidate's completed sample.
 
-Completion preserves the prompt and every selected initialization token. It
-samples at temperature 1.0 and ranks positions by sampled-token probability,
-matching `confidence.py`. The selected state's probabilities are recomputed;
-the legacy search analysis is not reused as a token-probability cache. Transfer
-schedules use each block's remaining masks, and zero-transfer steps are skipped.
-The existing `mcts_entropy` dispatcher and its greedy entropy/margin-adjusted
-completion retain their behavior.
+Defaults: 256 output tokens, steps and global block length; temperature 1.0; seed 1; Lc=20, C=3, K1=3, K2=5, gamma=10, exploration constant 0.01, epsilon=1e-8, and no search cap. Gamma/c are repository defaults rather than verified author parameters. Reward aggregation, native rollout position selection, fresh candidate evaluation, and completion softmax scope are explicit reconstruction assumptions.
+
+Task runners use inline three-subtask prompting with disjoint two-shot examples. GSM8K training rows 0/1 share the frozen test revision; evaluated references never enter prompts or rewards. Low-level decoder APIs accept already prepared prompt IDs. Setting `NUM_SAMPLES=None` restores profile counts; the LLaDA notebook retains its two-question override and all four standalone sections.
+
+Strict candidate mode fails explicitly if quota/evaluation cannot finish. Finite `stop_mode: budget` runs remain labeled ablations and complete the deepest fully evaluated state, or root. Every search and candidate-evaluation forward counts against an explicit cap; unfinished simulations do not update visits. Final completion is additional. Historical runs remain readable; new directory labels include `medal-v1`.
 
 ## Python API
 
@@ -109,15 +95,14 @@ mask IDs mark positions to fill. The state is cloned and existing commitments
 are preserved. A fully completed state needs no model calls.
 
 MCTS + Confidence additionally accepts `mcts` (a settings mapping or
-`MCTSConfig`) and an optional `tokenizer` for readable search traces. Unspecified
-search settings use this method's defaults rather than changing legacy defaults:
+`MCTSConfig`) and an optional `tokenizer` for readable search traces. All MCTS paths share the new defaults. An optional `on_event` streams partial traces immediately:
 
 ```python
 from dlm_project.decoding import mcts_confidence
 
 initialized = mcts_confidence.decode(
     wrapper.model, ids, wrapper.mask_id, tokenizer=wrapper.tokenizer,
-    mcts={"init_tokens": 20, "max_model_calls": 512},
+    mcts={"init_tokens": 20, "max_model_calls": None},
 )
 print(initialized.details["selected_depth"])
 print(initialized.details["search_model_calls"],
@@ -264,15 +249,7 @@ and search/completion latencies. Trace events carry `phase: search` or
 - Peak allocated CUDA memory in bytes, including resident weights; `null` on CPU.
 - Model loading time and load count, model/dataset revisions, run status, and errors.
 
-MCTS metrics additionally include total and mean search/completion forwards,
-`search_latency_seconds`, `completion_latency_seconds`, `fallback_count`, and
-`mean_selected_depth`. With the default 256 steps, completion uses
-`256 - selected_depth` actual forwards. For example, 512 search forwards and a
-20-token initialization cost **512 + 236 = 748 forwards** overall. All explored
-branches count, even when their tokens are absent from the selected state.
-Completion does not load another model. Phase latencies synchronize CUDA and
-exclude model loading; overall generation latency also includes encoding,
-response decoding, and metadata construction.
+MEDAL counts tree analysis, every branch simulation, candidate evaluation, and fresh final completion. Three default candidate evaluations cost 708 forwards; completion costs 236. A direct-path example totals 25,023 forwards, and broader exploration can cost more. The walkthrough gives the formula and explicit assumptions. No CPU or smoke-run result is a reproduction of the paper's reported accuracy.
 
 Latency includes prompt encoding, decoding, response decoding, and voting, with
 CUDA synchronization. It excludes model loading, dataset preparation, scoring

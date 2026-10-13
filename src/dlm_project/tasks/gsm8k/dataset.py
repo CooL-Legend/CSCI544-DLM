@@ -11,15 +11,16 @@ def load_example(config):
     data = config["data"]
     index = data["question_index"]
     split = f"{data['split']}[{index}:{index + 1}]"
+    revision_options = {"revision": data["revision"]} if data.get("revision") else {}
     dataset = load_dataset(data["dataset_id"], data["dataset_config"], split=split,
-                           cache_dir=data.get("cache_dir"))
+                           cache_dir=data.get("cache_dir"), **revision_options)
     if len(dataset) != 1:
         raise ValueError(f"Expected one GSM8K example at {split}; got {len(dataset)}.")
     row = dataset[0]
     return {"question": row["question"], "reference_solution": row["answer"],
             "source": {"kind": "gsm8k", "dataset_id": data["dataset_id"],
                        "dataset_config": data["dataset_config"], "split": data["split"],
-                       "question_index": index, "fingerprint": getattr(dataset, "_fingerprint", None)}}
+                       "question_index": index, "revision": data.get("revision"), "fingerprint": getattr(dataset, "_fingerprint", None)}}
 
 
 def build_prompt(question, instructions):

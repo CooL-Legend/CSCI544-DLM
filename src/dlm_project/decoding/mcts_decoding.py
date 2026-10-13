@@ -1,18 +1,16 @@
-"""Inspectable, one-step-entropy MCTS for a frozen masked language model.
+"""Documented reconstruction of MEDAL Algorithms 1 and 2.
 
-Read in order: analyze_state -> select_node -> expand_node -> evaluate_action
--> backpropagate -> MCTSSearch.step. All search and completion logic lives here.
-
-This adapts MEDAL's confidence filtering (Eq. 5) and information gain (Eq. 9).
-Evaluation commits ONE token and observes the child's remaining-mask entropy;
-it does not sample a full completion. Final completion is greedy. Search states
-are CPU int64 tensors [1, prompt_length + output_length]. Output positions in
-actions and traces are zero-based and exclude the prompt. No reference answer
-or Sudoku validator is accepted by the decoder.
+Full sampled rollouts, mean stepwise information gain, independent candidate
+rollouts, and literal adjusted-score softmax completion. The interpretation
+choices are exported in RECONSTRUCTION_ASSUMPTIONS; author-code parity is not
+claimed. Trees retain compact CPU states and never accept reference answers.
 """
 
 from dataclasses import asdict, dataclass, field
 import math
+import hashlib
+from contextlib import contextmanager
+from time import perf_counter
 from typing import Callable
 
 import torch
@@ -20,16 +18,12 @@ import torch
 
 @dataclass(frozen=True)
 class MCTSConfig:
-    """Validated Lc, C, K1, K2 and search-only forward cap (including the root).
-
-    candidates mode stops at the quota, cap or exhausted frontier. budget mode
-    ignores C and searches until the cap or exhaustion; target nodes stay closed.
-    """
-    init_tokens: int = 2
+    """Lc, C, K1, K2 and optional cap covering all search/candidate forwards."""
+    init_tokens: int = 20
     num_candidates: int = 3
-    top_k_tokens: int = 2
-    top_k_actions: int = 2
-    max_model_calls: int = 32
+    top_k_tokens: int = 3
+    top_k_actions: int = 5
+    max_model_calls: int | None = None
     margin_gamma: float = 10.0
     exploration_c: float = 0.01
     epsilon: float = 1e-8
@@ -39,9 +33,13 @@ class MCTSConfig:
         if self.stop_mode not in ("candidates", "budget"):
             raise ValueError("mcts.stop_mode must be candidates or budget.")
         for name in ("init_tokens", "num_candidates", "top_k_tokens",
-                     "top_k_actions", "max_model_calls"):
+                     "top_k_actions"):
             if type(getattr(self, name)) is not int or getattr(self, name) < 1:
                 raise ValueError(f"mcts.{name} must be a positive integer.")
+        if self.max_model_calls is not None and (type(self.max_model_calls) is not int or self.max_model_calls < 1):
+            raise ValueError("mcts.max_model_calls must be null or a positive integer.")
+        if self.stop_mode == "budget" and self.max_model_calls is None:
+            raise ValueError("budget mode requires a finite max_model_calls.")
         for name in ("margin_gamma", "exploration_c", "epsilon"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
@@ -50,8 +48,8 @@ class MCTSConfig:
                 raise ValueError(f"Invalid mcts.{name}: {value}.")
 
     def validate_length(self, gen_length):
-        if type(gen_length) is not int or not 1 <= self.init_tokens <= gen_length:
-            raise ValueError("MCTS requires 1 <= init_tokens <= gen_length.")
+        if type(gen_length) is not int or not 1 <= self.init_tokens < gen_length:
+            raise ValueError("MCTS requires 1 <= init_tokens < gen_length.")
 
 
 def resolve_decoding(decoding=None, generation=None):
@@ -73,11 +71,15 @@ def resolve_decoding(decoding=None, generation=None):
         raise ValueError(f"Invalid decoding.mcts settings: {error}") from error
     if generation is not None and method != "baseline":
         length = generation["gen_length"]
-        if (generation["steps"] != length or generation["block_length"] != length
-                or generation["temperature"] != 0 or generation["remasking"] != "low_confidence"):
-            raise ValueError("Confidence/MCTS decoding requires steps = block_length = gen_length, "
-                             "temperature = 0, and remasking = low_confidence.")
+        if generation["steps"] != length or generation["block_length"] != length:
+            raise ValueError("Confidence/MCTS decoding requires steps = block_length = gen_length.")
+        if generation["remasking"] != "low_confidence":
+            raise ValueError("Confidence/MCTS decoding requires remasking = low_confidence.")
+        if method == "confidence" and generation["temperature"] != 0:
+            raise ValueError("Greedy confidence requires temperature = 0.")
         if method == "mcts_entropy":
+            if generation["temperature"] <= 0 or not math.isfinite(generation["temperature"]):
+                raise ValueError("MEDAL completion requires positive temperature (default 1.0).")
             config.validate_length(length)
     return {"method": method, "seed": seed, "mcts": asdict(config)}
 
@@ -119,6 +121,7 @@ class Node:
     analysis: StateAnalysis | None = None
     expanded: bool = False
     closed: bool = False
+    rollout: "RolloutResult | None" = None
 
     @property
     def mean_reward(self):
@@ -182,29 +185,18 @@ def _token_topk(probabilities, k, mask_id):
     return result
 
 
-@torch.inference_mode()
-def analyze_state(model, state, prompt_len, mask_id, config, *, force_forward=False):
-    """One forward pass on [1, P+L]; return entropies [L] and top-K2 actions.
-
-    Entropy and the top-two margin use the full model distribution. The mask
-    token is excluded only from possible commitments. Prompt masks, if any,
-    cannot become actions. A completed state normally needs no call;
-    force_forward=True preserves the one-forward-per-child evaluation contract
-    when Lc equals the entire output length.
-    """
-    if state.ndim != 2 or state.shape[0] != 1 or not 0 <= prompt_len <= state.shape[1]:
-        raise ValueError("Expected one sequence [1, P+L] and a valid prompt length.")
+def _distribution(model, state, prompt_len, mask_id, config, *, legacy_entropy=False):
+    """One forward; full-vocabulary probabilities stay local to this step."""
+    if (state.ndim != 2 or state.shape[0] != 1 or state.dtype != torch.long
+            or not 0 <= prompt_len <= state.shape[1]):
+        raise ValueError("Expected one int64 sequence [1, P+L] and a valid prompt length.")
     state = state.detach().cpu()
-    output = state[0, prompt_len:]
-    positions = torch.nonzero(output == mask_id, as_tuple=False).flatten()
-    entropies = torch.zeros(output.numel(), dtype=torch.float32)
-    if positions.numel() == 0 and not force_forward:
-        return StateAnalysis(entropies, (), _state_key(state))
-
+    positions = torch.nonzero(state[0, prompt_len:] == mask_id, as_tuple=False).flatten()
+    entropies = torch.zeros(state.shape[1] - prompt_len)
+    if not positions.numel():
+        return StateAnalysis(entropies, (), _state_key(state)), positions, None, None
     device = model_device(model)
     prediction = model(state.to(device))
-    if positions.numel() == 0:
-        return StateAnalysis(entropies, (), _state_key(state))
     logits = prediction.logits[0, (positions + prompt_len).to(device)].float()
     del prediction
     if not 0 <= mask_id < logits.shape[-1] or logits.shape[-1] < 2:
@@ -212,8 +204,8 @@ def analyze_state(model, state, prompt_len, mask_id, config, *, force_forward=Fa
     probabilities = torch.softmax(logits, dim=-1)
     if not torch.isfinite(probabilities).all():
         raise ValueError("Non-finite model probabilities; cannot evaluate entropy.")
-    # entr(0) = 0: exact Shannon entropy in nats, including zero probabilities.
-    h = torch.special.entr(probabilities).sum(dim=-1)
+    h = (torch.special.entr(probabilities).sum(-1) if legacy_entropy else
+         -(probabilities * torch.log(probabilities + config.epsilon)).sum(-1))
     top_two = probabilities.topk(2, dim=-1).values
     margins = top_two[:, 0] - top_two[:, 1]
     factors = torch.exp(-h) * torch.sigmoid(config.margin_gamma * margins)
@@ -226,7 +218,20 @@ def analyze_state(model, state, prompt_len, mask_id, config, *, force_forward=Fa
             actions.append(Action(position, token_id, probability * factors_cpu[row],
                                   probability, h_cpu[row].item(), margins_cpu[row]))
     actions.sort(key=_action_order)
-    return StateAnalysis(entropies, tuple(actions[:config.top_k_actions]), _state_key(state))
+    return (StateAnalysis(entropies, tuple(actions[:config.top_k_actions]), _state_key(state)),
+            positions, probabilities, factors)
+
+
+@torch.inference_mode()
+def analyze_state(model, state, prompt_len, mask_id, config, *, force_forward=False,
+                  legacy_entropy=False):
+    """Return compact CPU analysis; completed states need no forward.
+
+    force_forward remains accepted for source compatibility, but no longer
+    causes unnecessary inference on a completed state.
+    """
+    return _distribution(model, state, prompt_len, mask_id, config,
+                         legacy_entropy=legacy_entropy)[0]
 
 
 # 1. SELECTION: choose a frontier node using accumulated search statistics.
@@ -277,18 +282,168 @@ def information_gain(before, after, epsilon):
     return (before - after) / before if before > epsilon else 0.0
 
 
-# 3. EVALUATION: observe one post-action distribution, without more commitments.
-def evaluate_action(model, parent, child, prompt_len, mask_id, config):
-    """Evaluate a newly expanded child once; cache its statistics for reuse."""
+IMPLEMENTATION_VERSION = "medal_reconstruction_v1"
+PAPER_URL = "https://aclanthology.org/2026.findings-eacl.180.pdf"
+RECONSTRUCTION_ASSUMPTIONS = {
+    "simulation": "global highest adjusted-confidence position; native legal token probabilities at temperature 1",
+    "reward": "arithmetic mean of stepwise Eq9 gains; include forced expansion transition",
+    "candidate_evaluation": "one fresh independent rollout per candidate; rank its mean gain",
+    "completion": "fresh partial-state completion; literal softmax(s/temperature) over all legal position-token actions",
+    "decomposition": "inline three subtasks; disjoint two-shot demonstrations",
+    "quota": "stop immediately at first C distinct depth-Lc states",
+    "constants": "gamma=10 and exploration_c=0.01 are repository defaults, not verified author settings",
+}
+
+
+def derive_seed(seed, phase, identifier=0):
+    if type(seed) is not int or not 0 <= seed < 2**63:
+        raise ValueError("seed must be an integer in [0, 2**63).")
+    raw = hashlib.sha256(f"{IMPLEMENTATION_VERSION}:{seed}:{phase}:{identifier}".encode()).digest()
+    return int.from_bytes(raw[:8], "big") % 2**63
+
+
+class BudgetExhausted(RuntimeError):
+    """Internal interruption before a forward exceeding the cap."""
+
+
+class SearchIncompleteError(RuntimeError):
+    def __init__(self, stats):
+        self.stats = stats
+        super().__init__(f"MEDAL initialization incomplete: {stats['stop_reason']}; "
+                         f"collected {stats['candidate_count']}/{stats['candidate_target']} candidates, "
+                         f"evaluated {stats['evaluated_candidates']}. Use explicit budget mode for an ablation.")
+
+
+class _SearchModel:
+    """One invocation counter, including interrupted rollouts; no model reload."""
+    def __init__(self, model, cap, emit):
+        self.model, self.cap, self.emit = model, cap, emit
+        self.calls = 0
+        self.current_phase = "tree_analysis"
+        self.counts = {name: 0 for name in ("tree_analysis", "simulation", "candidate_evaluation")}
+        self.seconds = dict.fromkeys(self.counts, 0.0)
+
+    def __getattr__(self, name):
+        return getattr(self.model, name)
+
+    def __call__(self, *args, **kwargs):
+        if self.cap is not None and self.calls >= self.cap:
+            raise BudgetExhausted("Search forward cap reached.")
+        self.calls += 1
+        self.counts[self.current_phase] += 1
+        try:
+            return self.model(*args, **kwargs)
+        finally:
+            self.emit("forward", phase=self.current_phase, **self.costs())
+
+    def costs(self):
+        return {f"{phase}_model_calls": count for phase, count in self.counts.items()}
+
+    @contextmanager
+    def phase(self, name):
+        previous = self.current_phase
+        self.current_phase = name
+        device = model_device(self.model)
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        started = perf_counter()
+        try:
+            yield
+        finally:
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            self.seconds[name] += perf_counter() - started
+            self.current_phase = previous
+
+
+@dataclass
+class RolloutResult:
+    token_ids: torch.Tensor
+    gains: list[float]
+    mean_reward: float
+    seed: int
+    model_calls: int
+    initial_analysis: StateAnalysis
+    trace: list[dict]
+
+
+def _sample_action(analysis, positions, probabilities, factors, mask_id, generator,
+                   policy, temperature):
+    if policy == "native":
+        # Top action's position is globally best; sample over the full legal vocabulary.
+        position = analysis.actions[0].output_position
+        row = positions.tolist().index(position)
+        weights = probabilities[row].clone()
+        weights[mask_id] = 0
+        if weights.sum() <= 0:
+            raise ValueError("No probability mass on legal tokens.")
+        token = torch.multinomial(weights, 1, generator=generator).item()
+    else:
+        scores = probabilities * factors[:, None]
+        scores[:, mask_id] = -torch.inf
+        weights = torch.softmax(scores.flatten() / temperature, dim=0)
+        flat = torch.multinomial(weights, 1, generator=generator).item()
+        row, token = divmod(flat, probabilities.shape[1])
+        position = positions[row].item()
+    probability = probabilities[row, token].item()
+    top_two = probabilities[row].topk(2).values
+    margin = (top_two[0] - top_two[1]).item()
+    return Action(position, token, probability * factors[row].item(), probability,
+                  analysis.entropies[position].item(), margin)
+
+
+@torch.inference_mode()
+def rollout(model, state, prompt_len, mask_id, config, *, seed, policy="native",
+            temperature=1.0, parent_analysis=None, on_event=None, tokenizer=None):
+    """Clone and fully complete; return predictive transition gains and actual NFEs."""
+    if policy not in ("native", "adjusted_softmax") or temperature <= 0 or not math.isfinite(temperature):
+        raise ValueError("Invalid rollout policy or nonpositive temperature.")
+    derive_seed(seed, "validate_rollout")
+    x = state.detach().cpu().clone()
+    generator = torch.Generator(device=model_device(model)).manual_seed(seed)
+    calls, gains, trace = 0, [], []
+    analysis, positions, probabilities, factors = _distribution(model, x, prompt_len, mask_id, config)
+    calls += int(positions.numel() > 0)
+    initial_analysis = analysis
+    if parent_analysis is not None:
+        gains.append(information_gain(parent_analysis.total_entropy, analysis.total_entropy, config.epsilon))
+    while positions.numel():
+        action = _sample_action(analysis, positions, probabilities, factors, mask_id,
+                                generator, policy, temperature)
+        x[0, prompt_len + action.output_position] = action.token_id
+        before = analysis.total_entropy
+        analysis, positions, probabilities, factors = _distribution(model, x, prompt_len, mask_id, config)
+        calls += int(positions.numel() > 0)
+        gain = information_gain(before, analysis.total_entropy, config.epsilon)
+        if not math.isfinite(gain):
+            raise ValueError("Non-finite rollout information gain.")
+        gains.append(gain)
+        event = {"stage": "rollout_step", "step": len(trace) + 1, "seed": seed,
+                 "policy": policy, "model_calls": calls, "remaining_masks": positions.numel(),
+                 "entropy_before": before, "entropy_after": analysis.total_entropy,
+                 "gain": gain, "action": action_record(action, tokenizer)}
+        trace.append(event)
+        if on_event:
+            on_event(event)
+    return RolloutResult(x, gains, sum(gains) / len(gains) if gains else 0.0,
+                         seed, calls, initial_analysis, trace)
+
+
+# 3. SIMULATION: evaluate a complete sampled trajectory, without mutating the child.
+def evaluate_action(model, parent, child, prompt_len, mask_id, config, *, seed=1,
+                    on_event=None, tokenizer=None):
     if parent.analysis is None or child.analysis is not None:
         raise ValueError("Evaluation requires a cached parent and an unevaluated child.")
-    child.analysis = analyze_state(model, child.state, prompt_len, mask_id, config, force_forward=True)
+    result = rollout(model, child.state, prompt_len, mask_id, config, seed=seed,
+                     parent_analysis=parent.analysis, on_event=on_event, tokenizer=tokenizer)
+    child.analysis, child.rollout = result.initial_analysis, result
     before, after = parent.analysis.total_entropy, child.analysis.total_entropy
     removed = parent.analysis.entropies[child.action.output_position].item()
     return {"entropy_before": before, "entropy_after": after,
-            "committed_position_entropy": removed,
-            "reward": information_gain(before, after, config.epsilon),
-            "context_gain": before - removed - after,
+            "immediate_gain": result.gains[0], "reward": result.mean_reward,
+            "gains": result.gains, "rollout_seed": seed, "rollout_model_calls": result.model_calls,
+            "rollout_output_ids": result.token_ids[0, prompt_len:].tolist(),
+            "committed_position_entropy": removed, "context_gain": before - removed - after,
             "entropies_before": parent.analysis.entropies.tolist(),
             "entropies_after": child.analysis.entropies.tolist()}
 
@@ -332,46 +487,38 @@ def state_record(state, prompt_len, mask_id, tokenizer=None):
 
 
 class MCTSSearch:
-    """Stateful search. step() exposes one cycle; run() resumes the same tree.
-
-    The constructor copies prompt_ids [1, P] to CPU and appends L masks.
-    The first step evaluates the root. Every new child costs one forward pass.
-    on_event, when provided, receives each JSON-serializable event immediately.
-    """
-
+    """One resumable tree; step() includes full simulations and terminal candidate evaluation."""
     def __init__(self, model, prompt_ids, mask_id, gen_length, config=None,
-                 tokenizer=None, on_event: Callable[[dict], None] | None = None):
+                 tokenizer=None, on_event: Callable[[dict], None] | None = None, *, seed=1):
         self.config = config if isinstance(config, MCTSConfig) else MCTSConfig(**(config or {}))
         self.config.validate_length(gen_length)
         if prompt_ids.ndim != 2 or prompt_ids.shape[0] != 1 or prompt_ids.dtype != torch.long:
             raise ValueError("prompt_ids must be an int64 tensor with shape [1, P].")
+        derive_seed(seed, "validation")
+        self.seed = seed
         self.model, self.mask_id, self.tokenizer = model, mask_id, tokenizer
         self.prompt_len = prompt_ids.shape[1]
         state = torch.full((1, self.prompt_len + gen_length), mask_id, dtype=torch.long)
         state[:, :self.prompt_len] = prompt_ids.detach().cpu()
         self.root = Node(0, state)
-        self.nodes = [self.root]
-        self.candidates = {}
-        self.trace = []
-        self.on_event = on_event
-        self.model_calls = 0
-        self.cycle = 0
-        self.stop_reason = None
+        self.nodes, self.candidates, self.candidate_rollouts = [self.root], {}, {}
+        self.trace, self.on_event = [], on_event
+        self.cycle, self.stop_reason = 0, None
+        self._counted = _SearchModel(model, self.config.max_model_calls, self._emit)
+
+    @property
+    def model_calls(self):
+        return self._counted.calls
 
     @property
     def done(self):
         return self.stop_reason is not None
 
     def _emit(self, stage, **details):
-        event = {"cycle": self.cycle, "stage": stage, "search_model_calls": self.model_calls,
-                 **details}
+        event = {"cycle": self.cycle, "stage": stage, "search_model_calls": self.model_calls, **details}
         self.trace.append(event)
-        if self.on_event is not None:
+        if self.on_event:
             self.on_event(event)
-
-    def _score(self, node):
-        return information_gain(self.root.analysis.total_entropy, node.analysis.total_entropy,
-                                self.config.epsilon)
 
     def _close_exhausted(self, node):
         while node is not None:
@@ -379,120 +526,174 @@ class MCTSSearch:
                 node.expanded and all(child.closed for child in node.children))
             node = node.parent
 
-    def _finish_if_needed(self):
-        if self.config.stop_mode == "candidates" and len(self.candidates) >= self.config.num_candidates:
-            reason = "candidate_quota"
-        elif self.model_calls >= self.config.max_model_calls:
-            reason = "model_call_budget"
-        elif self.root.closed:
-            reason = "frontier_exhausted"
-        else:
-            return
+    def _at_cap(self):
+        return self.config.max_model_calls is not None and self.model_calls >= self.config.max_model_calls
+
+    def _finish(self, reason):
+        if reason != "model_call_budget" and self.candidates:
+            for index, node in enumerate(self.candidates.values()):
+                seed = derive_seed(self.seed, "candidate_evaluation", index)
+                try:
+                    with self._counted.phase("candidate_evaluation"):
+                        candidate = rollout(self._counted, node.state, self.prompt_len, self.mask_id,
+                                            self.config, seed=seed, tokenizer=self.tokenizer,
+                                            on_event=lambda e, n=node: self._emit(e["stage"], phase="candidate_evaluation",
+                                                node_id=n.node_id, **{k:v for k,v in e.items() if k != "stage"}))
+                except BudgetExhausted:
+                    reason = "model_call_budget"
+                    self._emit("rollout_interrupted", phase="candidate_evaluation", node_id=node.node_id, seed=seed)
+                    break
+                self.candidate_rollouts[node.node_id] = candidate
+                self._emit("candidate_evaluation", node_id=node.node_id, seed=seed,
+                           reward=candidate.mean_reward, gains=candidate.gains, model_calls=candidate.model_calls,
+                           output_ids=candidate.token_ids[0, self.prompt_len:].tolist(),
+                           raw_output=self.tokenizer.decode(candidate.token_ids[0, self.prompt_len:].tolist(),
+                                      skip_special_tokens=True) if self.tokenizer else None)
         self.stop_reason = reason
         result = self.result()
-        self._emit("termination", **result.stats,
-                   selected_state=state_record(result.selected.state, self.prompt_len,
-                                               self.mask_id, self.tokenizer))
+        self._emit("termination", **{k:v for k,v in result.stats.items() if not k.endswith("_latency_seconds")},
+                   selected_state=state_record(result.selected.state, self.prompt_len, self.mask_id, self.tokenizer))
+        if self.config.stop_mode == "candidates" and result.stats["fallback_used"]:
+            raise SearchIncompleteError(result.stats)
 
     @torch.inference_mode()
     def step(self):
-        """Return ordered events for one selection/expansion/evaluation/backup cycle.
-
-        Finish the retained sibling set unless the call budget is exhausted.
-        In candidates mode, quotas are checked after the cycle, so a cycle can
-        collect more than C candidates. budget mode ignores this quota.
-        Calling step() after termination returns [].
-        """
         if self.done:
             return []
         start = len(self.trace)
         self.cycle += 1
         if self.root.analysis is None:
-            self.model_calls += 1
-            self.root.analysis = analyze_state(self.model, self.root.state, self.prompt_len,
-                                               self.mask_id, self.config)
+            with self._counted.phase("tree_analysis"):
+                self.root.analysis = analyze_state(self._counted, self.root.state, self.prompt_len,
+                                                   self.mask_id, self.config)
             self._emit("initialization", node_id=0, entropy=self.root.analysis.total_entropy,
-                       model_device=str(model_device(self.model)),
-                       search_state_device=str(self.root.state.device),
+                       implementation_version=IMPLEMENTATION_VERSION, assumptions=RECONSTRUCTION_ASSUMPTIONS,
+                       model_device=str(model_device(self.model)), search_state_device="cpu",
                        entropies=self.root.analysis.entropies.tolist(),
                        state=state_record(self.root.state, self.prompt_len, self.mask_id, self.tokenizer),
                        actions=[action_record(a, self.tokenizer) for a in self.root.analysis.actions])
-            self._finish_if_needed()
-            if self.done:
-                return self.trace[start:]
-
+        if self._at_cap():
+            self._finish("model_call_budget")
+            return self.trace[start:]
         parent, decisions = select_node(self.root, self.config.exploration_c)
         if parent is None:
-            self.root.closed = True
-            self._finish_if_needed()
+            self._finish("frontier_exhausted")
             return self.trace[start:]
         self._emit("selection", node_id=parent.node_id,
-                   path=[self.root.node_id] + [hop["chosen_id"] for hop in decisions],
-                   decisions=decisions, visits=parent.visits, mean_reward=parent.mean_reward)
+                   path=[0] + [hop["chosen_id"] for hop in decisions], decisions=decisions)
         parent.expanded = True
         for action in parent.analysis.actions:
-            if self.model_calls >= self.config.max_model_calls:
-                break
-            child = expand_node(parent, action, len(self.nodes), self.prompt_len,
-                                self.mask_id, self.config.init_tokens)
+            child = expand_node(parent, action, len(self.nodes), self.prompt_len, self.mask_id, self.config.init_tokens)
             self.nodes.append(child)
             self._emit("expansion", parent_id=parent.node_id, child_id=child.node_id,
                        depth=child.depth, action=action_record(action, self.tokenizer))
-            self.model_calls += 1
-            evaluation = evaluate_action(self.model, parent, child, self.prompt_len,
-                                         self.mask_id, self.config)
+            seed = derive_seed(self.seed, "simulation", child.node_id)
+            try:
+                with self._counted.phase("simulation"):
+                    evaluation = evaluate_action(self._counted, parent, child, self.prompt_len, self.mask_id,
+                        self.config, seed=seed, tokenizer=self.tokenizer,
+                        on_event=lambda e: self._emit(e["stage"], phase="simulation", child_id=child.node_id,
+                            **{k:v for k,v in e.items() if k != "stage"}))
+            except BudgetExhausted:
+                child.closed = True
+                self._emit("rollout_interrupted", phase="simulation", child_id=child.node_id, seed=seed)
+                self._finish("model_call_budget")
+                return self.trace[start:]
             self._emit("evaluation", parent_id=parent.node_id, child_id=child.node_id,
                        depth=child.depth, action=action_record(action, self.tokenizer),
-                       child_state=state_record(child.state, self.prompt_len, self.mask_id, self.tokenizer),
-                       **evaluation)
-            updates = backpropagate(child, evaluation["reward"])
-            self._emit("backpropagation", child_id=child.node_id,
-                       reward=evaluation["reward"], updates=updates)
+                       child_state=state_record(child.state, self.prompt_len, self.mask_id, self.tokenizer), **evaluation)
+            self._emit("backpropagation", child_id=child.node_id, reward=evaluation["reward"],
+                       updates=backpropagate(child, evaluation["reward"]))
             if child.depth == self.config.init_tokens:
                 key = _state_key(child.state)
                 duplicate = key in self.candidates
                 self.candidates.setdefault(key, child)
                 self._emit("candidate", node_id=child.node_id, duplicate=duplicate,
-                           candidate_count=len(self.candidates), score=self._score(child))
+                           candidate_count=len(self.candidates), score=evaluation["reward"])
+            if self.config.stop_mode == "candidates" and len(self.candidates) >= self.config.num_candidates:
+                self._finish("candidate_quota")
+                return self.trace[start:]
+            if self._at_cap():
+                self._finish("model_call_budget")
+                return self.trace[start:]
         self._close_exhausted(parent)
-        self._finish_if_needed()
+        if self.root.closed:
+            self._finish("frontier_exhausted")
         return self.trace[start:]
 
     def result(self):
-        """Snapshot the current best initialization; does not consume model calls."""
+        """Read-only snapshot; provisional frontier selection during inspection."""
         if self.root.analysis is None:
             raise RuntimeError("Call step() or run() before requesting a result.")
         candidates = list(self.candidates.values())
-        pool = candidates or [node for node in self.nodes if node.analysis is not None]
-        deepest = max(node.depth for node in pool)
-        pool = [node for node in pool if node.depth == deepest]
-        selected = min(pool, key=lambda node: (-self._score(node), node.node_id))
-        fallback = self.done and (not candidates if self.config.stop_mode == "budget"
-                                  else len(candidates) < self.config.num_candidates)
-        evaluated = [node for node in self.nodes if node.parent is not None and node.analysis is not None]
-        expanded_parents = len({node.parent.node_id for node in evaluated})
-        stats = {"finished": self.done, "stop_reason": self.stop_reason,
-                 "stop_mode": self.config.stop_mode,
-                 "search_model_calls": self.model_calls, "cycles": self.cycle,
-                 "requested_depth": self.config.init_tokens, "selected_depth": selected.depth,
-                 "max_depth": max(node.depth for node in self.nodes),
-                 "candidate_target": self.config.num_candidates if self.config.stop_mode == "candidates" else None,
-                 "candidate_count": len(candidates),
-                 "evaluated_children": len(evaluated), "expanded_parents": expanded_parents,
-                 "realized_branching_factor": len(evaluated) / expanded_parents if expanded_parents else 0.0,
-                 "candidate_ids": [node.node_id for node in candidates],
-                 "selected_node_id": selected.node_id, "selected_score": self._score(selected),
-                 "fallback_used": fallback,
-                 "fallback_reason": ("insufficient_target_candidates" if candidates else "deepest_available_state")
-                 if fallback else None,
-                 "budget_exhausted": self.model_calls >= self.config.max_model_calls}
+        if self.candidate_rollouts:
+            pool = [n for n in candidates if n.node_id in self.candidate_rollouts]
+            selected = max(pool, key=lambda n: self.candidate_rollouts[n.node_id].mean_reward)
+            score = self.candidate_rollouts[selected.node_id].mean_reward
+        else:
+            pool = [n for n in self.nodes if n.rollout is not None] or [self.root]
+            selected = min(pool, key=lambda n: (-n.depth, -n.rollout.mean_reward if n.rollout else 0, n.node_id))
+            score = selected.rollout.mean_reward if selected.rollout else 0.0
+        complete = (len(candidates) >= self.config.num_candidates and
+                    len(self.candidate_rollouts) == len(candidates))
+        fallback = self.done and not complete
+        evaluated = [node for node in self.nodes if node.rollout is not None]
+        parents = len({node.parent.node_id for node in evaluated})
+        stats = {"implementation_version": IMPLEMENTATION_VERSION, "paper_url": PAPER_URL,
+                 "reconstruction_assumptions": dict(RECONSTRUCTION_ASSUMPTIONS),
+                 "evaluation_variant": "budget-limited MEDAL reconstruction" if self.config.stop_mode == "budget"
+                 else "MEDAL reconstruction (mean stepwise IG)",
+                 "finished": self.done, "stop_reason": self.stop_reason, "stop_mode": self.config.stop_mode,
+                 "search_model_calls": self.model_calls, **self._counted.costs(),
+                 **{f"{phase}_latency_seconds": seconds for phase, seconds in self._counted.seconds.items()},
+                 "cycles": self.cycle, "requested_depth": self.config.init_tokens, "selected_depth": selected.depth,
+                 "max_depth": max(n.depth for n in self.nodes), "candidate_target": self.config.num_candidates,
+                 "candidate_count": len(candidates), "evaluated_candidates": len(self.candidate_rollouts),
+                 "evaluated_children": len(evaluated), "expanded_parents": parents,
+                 "realized_branching_factor": len(evaluated) / parents if parents else 0.0,
+                 "candidate_ids": [n.node_id for n in candidates], "selected_node_id": selected.node_id,
+                 "selected_score": score, "fallback_used": fallback,
+                 "fallback_reason": self.stop_reason if fallback else None, "budget_exhausted": self._at_cap(),
+                 "candidate_evaluations": [{"node_id": n.node_id, "seed": r.seed, "reward": r.mean_reward,
+                     "gains": r.gains, "model_calls": r.model_calls,
+                     "output_ids": r.token_ids[0, self.prompt_len:].tolist(),
+                     "raw_output": self.tokenizer.decode(r.token_ids[0, self.prompt_len:].tolist(), skip_special_tokens=True)
+                     if self.tokenizer else None} for n in candidates if (r := self.candidate_rollouts.get(n.node_id))]}
         return SearchResult(selected, candidates, stats, list(self.trace))
 
     def run(self):
-        """Continue this tree until quota, budget, or frontier exhaustion."""
         while not self.done:
             self.step()
-        return self.result()
+        result = self.result()
+        if self.config.stop_mode == "candidates" and result.stats["fallback_used"]:
+            raise SearchIncompleteError(result.stats)
+        return result
+
+
+@torch.inference_mode()
+def complete_medal(model, state, prompt_len, mask_id, config=None, *, seed=1,
+                   temperature=1.0, tokenizer=None, on_event=None):
+    """Fresh literal adjusted-score softmax, without top-K filtering or cache reuse."""
+    events = []
+    class CountCompletion:
+        calls = 0
+        def __getattr__(self, name):
+            return getattr(model, name)
+        def __call__(self, *args, **kwargs):
+            self.calls += 1
+            try:
+                return model(*args, **kwargs)
+            finally:
+                emit({"stage": "forward", "model_calls": self.calls, "seed": seed})
+    def emit(event):
+        events.append(event)
+        if on_event:
+            on_event(event)
+    counted = CountCompletion()
+    result = rollout(counted, state, prompt_len, mask_id, config or MCTSConfig(), seed=seed,
+                     policy="adjusted_softmax", temperature=temperature, tokenizer=tokenizer, on_event=emit)
+    result.trace = events
+    return result
 
 
 @torch.inference_mode()
@@ -516,7 +717,7 @@ def complete_confidence(model, state, prompt_len, mask_id, config=None,
     while (x[0, prompt_len:] == mask_id).any():
         reused = analysis is not None
         if analysis is None:
-            analysis = analyze_state(model, x, prompt_len, mask_id, config)
+            analysis = analyze_state(model, x, prompt_len, mask_id, config, legacy_entropy=True)
             calls += 1
         if not analysis.actions:
             raise RuntimeError("No legal commitment for a masked output position.")
