@@ -42,6 +42,8 @@ Top-K Margin, token-probability confidence decoding, and majority-vote Best-of-5
 Both LLaDA and iLLaDA use their pinned checkpoints and the same frozen GSM8K examples; the guide defines
 their accuracy, NFE, runtime and method-specific metrics.
 
+The LLaDA GSM8K notebook now has an **Accuracy, compute, and MCTS simulation comparison** section. It loads one model in a subprocess for all four baselines and MCTS caps of 4, 8, 16, 32, and 64 completed simulations. It uses shared MEDAL prompting and generation settings, saves uncertainty signals without additional forwards, and displays a paired metric table plus accuracy-versus-simulations/NFEs/time plots. The [metric definitions and commands](src/dlm_project/decoding/README.md#accuracy-compute-and-search-metrics) explain decoding-step counts, full rollout cost, and fallback behavior. Start with two examples; simulation caps are distinct from NFE caps.
+
 The [milestone sweep guide](docs/milestone1_sweeps.md) provides two scripts using the **same pinned original LLaDA** model: GSM8K and BGPO's **4×4 dataset**. Each compares baseline, confidence-only, and fixed-branching MCTS with search caps of **128, 256 and 512 forwards**, using **full sampled rollouts and mean stepwise information gain** as explicit budget-limited MEDAL ablations. It saves frozen manifests, per-example traces/scores/compute, paired summaries, Wilson intervals, and PNG/PDF reports.
 
 ```bash

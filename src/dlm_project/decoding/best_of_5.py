@@ -35,6 +35,7 @@ def decode(model, prompt_ids, mask_id, *, tokenizer, answer_extractor,
         outputs.append(result.token_ids)
         candidates.append({"index": index, "seed": candidate_seed, "raw_output": text,
                            "predicted_answer": answer, "parse_success": answer is not None,
+                           "decoding_steps": result.details.get("decoding_steps"),
                            "generation_nfes": result.generation_nfes})
         calls += result.generation_nfes
         trace.extend({**event, "candidate_index": index} for event in result.trace)
@@ -52,6 +53,10 @@ def decode(model, prompt_ids, mask_id, *, tokenizer, answer_extractor,
                "all_candidates_invalid": not bool(votes),
                "unique_candidate_count": len({candidate["raw_output"] for candidate in candidates}),
                "remaining_masks": 0, "seed": seed}
+    candidate_steps = [candidate["decoding_steps"] for candidate in candidates]
+    details.update(decoding_steps=sum(candidate_steps) if all(value is not None for value in candidate_steps) else None,
+                   selected_output_steps=candidates[winner]["decoding_steps"],
+                   batch_size=1, state_evaluations=calls)
     trace.append({"stage": "selection", "votes": dict(votes),
                   "selected_candidate_index": winner, "generation_nfes": calls})
     return DecodeResult(outputs[winner], calls, details=details, trace=trace)

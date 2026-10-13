@@ -77,5 +77,8 @@ def decode(model, prompt_ids, mask_id, *, gen_length=256, steps=256,
                "remaining_masks": 0, "model_device": str(device), "search_state_device": "cpu",
                "selected_initialization": state_record(result.selected.state, search.prompt_len,
                                                         mask_id, tokenizer)}
+    completion_steps = sum(event["stage"] == "rollout_step" for event in completion.trace)
+    details.update(decoding_steps=completion_steps, selected_output_steps=result.selected.depth + completion_steps,
+                   batch_size=1, state_evaluations=search.model_calls + completion.model_calls)
     return DecodeResult(completion.token_ids, search.model_calls + completion.model_calls,
                         details=details, trace=result.trace + events)

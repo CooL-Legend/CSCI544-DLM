@@ -57,6 +57,53 @@ Task runners use inline three-subtask prompting with disjoint two-shot examples.
 
 Strict candidate mode fails explicitly if quota/evaluation cannot finish. Finite `stop_mode: budget` runs remain labeled ablations and complete the deepest fully evaluated state, or root. Every search and candidate-evaluation forward counts against an explicit cap; unfinished simulations do not update visits. Final completion is additional. Historical runs remain readable; new directory labels include `medal-v1`.
 
+## Accuracy, compute, and search metrics
+
+The LLaDA GSM8K notebook's optional comparison section runs all four baselines
+and MCTS simulation caps of 4, 8, 16, 32, and 64 in **one subprocess with one model
+load**. Every condition receives the same MEDAL two-shot prompt, single global
+output block, temperature, frozen questions and per-question seed. These are
+separate comparison runs; standalone entrypoints retain their settings.
+
+```bash
+python scripts/run_gsm8k_metrics.py --config configs/gsm8k/decoding.yaml \
+  --profile smoke --num-samples 2 --budgets 4 8 16 32 64
+
+# Rebuild the comparison without model loading or dataset downloads.
+python scripts/run_gsm8k_metrics.py --report-only /path/to/comparison
+```
+
+| Measurement | Definition |
+|---|---|
+| Accuracy and Wilson 95% interval | Strict GSM8K exact match; malformed/empty outputs are wrong. Execution failures have no fabricated answer. |
+| Total NFEs / state evaluations | All forwards, including tree analysis, full simulations, terminal candidate scoring and completion. Batch size is recorded as 1, so these counts are equal. |
+| Wall-clock time | CUDA-synchronized inference, including tokenization, output decoding, signal reductions and compact trace writing; model loading, warm-up and report generation are recorded separately. |
+| MCTS simulations | Fully completed child rollouts and backups. Starts, interruptions, cycles and terminal candidate-evaluation rollouts are distinct. Per-invocation counts are saved as a list, and totals are per example. |
+| Decoding steps | Actual final-output commitment iterations. Best-of-5 sums all five trajectories and separately records the selected trajectory. MCTS reports final completion steps; selected tree depth and internal rollout steps are separate. |
+| Average search depth | Mean depth of children whose simulations completed. Selected and maximum depths are also saved. |
+| Expanded nodes | Number of distinct evaluated child states, excluding root; expanded-parent and total tree-state counts are separate. |
+| Entropy and margin | Mean native full-vocabulary entropy in nats and top-two probability gap over all unresolved output positions, from existing forwards. Compact traces store scalar values, never vocabulary logits. |
+
+`max_simulations` is an optional positive cap; `stop_mode: budget` accepts a finite
+simulation cap, NFE cap, or both. The first cap reached stops search. Candidate
+evaluation and final completion can add NFEs after a simulation cap. Candidate
+evaluation still obeys a configured NFE cap. Default quota behavior is unchanged.
+Small simulation budgets may never reach Lc=20; report selected depth and fallback
+rate instead of assuming all runs reached the target depth.
+
+The three PNG/PDF plots use **the intersection of examples completed under every
+selected condition**, with that denominator displayed. They show accuracy versus
+actual mean completed simulations, mean total NFEs, and mean wall-clock time.
+Requested simulation budgets remain in condition labels. Historical counts may
+be reconstructed from saved trace events; unavailable counts remain missing.
+Reports warn when effective prompts or generation settings differ.
+
+Each comparison saves `setup.json`, exact run paths in `runs.json`, and individual
+incrementally saved predictions/traces. Its `report/` directory contains
+`results.csv`, `summary.csv`, `summary.json`, `plot_data.json`, `report.md`, and plots.
+Set `METRICS_NUM_SAMPLES` and `METRICS_SIMULATION_BUDGETS` in the notebook before
+launching. Start with two examples and `[4]` for the smallest full-rollout check.
+
 ## Python API
 
 Each module exposes `decode(model, prompt_ids, mask_id, *, gen_length, steps,

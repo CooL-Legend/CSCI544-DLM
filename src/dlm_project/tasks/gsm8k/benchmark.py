@@ -20,6 +20,8 @@ from dlm_project.experiments.artifacts import save_json
 from dlm_project.experiments.config import load_config, validate_config
 from dlm_project.experiments.manifests import digest
 from dlm_project.experiments.paths import create_run_directory
+from dlm_project.experiments.sweep_report import write_csv
+from dlm_project.experiments.primary_metrics import summarize_primary
 from dlm_project.models.profiles import get_profile
 from dlm_project.paths import PROJECT_ROOT
 from dlm_project.tasks.gsm8k.benchmark_dataset import PROFILE_SIZES, TEST_SIZE, get_manifest, select_examples
@@ -58,6 +60,8 @@ def resolve_settings(method, source, *, profile=None, num_samples=None, seed=Non
         raise ValueError("prompt.instructions must be nonempty text.")
     if prompt.get("custom_question") is not None:
         raise ValueError("Custom questions are not supported by the GSM8K accuracy benchmark.")
+    if "medal_decomposition" in prompt and type(prompt["medal_decomposition"]) is not bool:
+        raise ValueError("prompt.medal_decomposition must be boolean.")
     model = config.setdefault("model", {})
     model.setdefault("family", expected_family or "llada")
     if model["family"] not in MODEL_FAMILIES:
@@ -163,12 +167,16 @@ def _metrics(config, state, records):
             metrics[f"total_{phase}_model_calls"] = sum(row.get(f"{phase}_model_calls", 0) for row in records)
             metrics[f"total_{phase}_latency_seconds"] = sum(row.get(f"{phase}_latency_seconds", 0) for row in records)
         metrics["active_prediction_model_calls"] = state.get("active_prediction_model_calls", 0)
+    metrics.update(summarize_primary(records))
     return metrics
 
 
-def run_evaluation(method, source, *, manifest_path=None, output_dir=None, model_factory=None):
+def run_evaluation(method, source, *, manifest_path=None, output_dir=None, model_factory=None,
+                   model_instance=None, on_run_created=None):
     """Load one model, preserve every completed prediction, and report actual cost."""
     config = resolve_settings(method, source)
+    if model_factory is not None and model_instance is not None:
+        raise ValueError("Supply model_factory or model_instance, not both.")
     root = Path(config.get("experiment_root", "results")).expanduser()
     root = (root if root.is_absolute() else PROJECT_ROOT / root).resolve()
     manifest_path = Path(manifest_path).expanduser() if manifest_path else root / "manifests/gsm8k_test.json"
@@ -184,6 +192,10 @@ def run_evaluation(method, source, *, manifest_path=None, output_dir=None, model
         name += (f"-medal-v1-lc{m['init_tokens']}-c{m['num_candidates']}-k1_{m['top_k_tokens']}"
                  f"-k2_{m['top_k_actions']}-budget{m['max_model_calls'] if m['max_model_calls'] is not None else 'none'}-gamma{m['margin_gamma']:g}"
                  f"-ucb{m['exploration_c']:g}-eps{m['epsilon']:g}-stop-{m['stop_mode']}")
+        if m["max_simulations"] is not None:
+            name += f"-sims{m['max_simulations']}"
+    if config["prompt"].get("medal_decomposition") and method != "mcts_confidence":
+        name += "-medal-prompt"
     model_profile = get_profile(config["model"]["family"])
     parent = Path(output_dir).expanduser() if output_dir else root / model_profile["label"] / "GSM8K"
     parent = parent / method / config["evaluation"]["profile"] / name
@@ -196,6 +208,8 @@ def run_evaluation(method, source, *, manifest_path=None, output_dir=None, model
     config["provenance"] = {"git_commit": _git_commit(), "dataset": manifest["dataset"]}
     save_json(directory / "config.json", config)
     save_json(directory / "manifest.json", manifest)
+    if on_run_created is not None:
+        on_run_created(directory)
     (directory / "traces").mkdir()
     (directory / "predictions.jsonl").touch()
     state = {"status": "running", "model_load_count": 0}
@@ -204,21 +218,26 @@ def run_evaluation(method, source, *, manifest_path=None, output_dir=None, model
     def save_progress():
         metrics = _metrics(config, state, records)
         save_json(directory / "metrics.json", metrics)
+        write_csv(directory / "results.csv", records, ("example_id", "method"))
+        write_csv(directory / "summary.csv", [metrics])
         return metrics
 
     save_progress()
     print(f"Evaluation artifacts: {directory}", flush=True)
     try:
         load_started = perf_counter()
-        wrapper = (model_factory or _load_model)(config)
+        wrapper = model_instance if model_instance is not None else (model_factory or _load_model)(config)
         _sync(wrapper.device)
-        state.update(model_load_count=1, model_loading_seconds=perf_counter() - load_started)
+        state.update(model_load_count=int(model_instance is None),
+                     model_loading_seconds=perf_counter() - load_started if model_instance is None else 0.0,
+                     model_reused=model_instance is not None)
         _verify_model(wrapper, config["model"]["family"])
         config["provenance"]["model"] = wrapper.identity
         save_json(directory / "config.json", config)
         save_progress()
         demonstrations = None
-        if method == "mcts_confidence":
+        use_decomposition = config["prompt"].get("medal_decomposition", method == "mcts_confidence")
+        if use_decomposition:
             demonstrations = get_gsm8k_demonstrations(Path(manifest_path).with_name("gsm8k_decomposition_train.json"), revision=manifest["dataset"]["revision"],
                                                      cache_dir=config["data"].get("cache_dir"))
             save_json(directory / "decomposition_manifest.json", demonstrations)
@@ -226,7 +245,7 @@ def run_evaluation(method, source, *, manifest_path=None, output_dir=None, model
             for example in examples:
                 prompt = build_prompt(example["question"], config["prompt"]["instructions"])
                 base_prompt, decomposition = prompt, None
-                if method == "mcts_confidence":
+                if use_decomposition:
                     prompt, decomposition = gsm8k_prompt(base_prompt, example["question"], demonstrations)
                 seed = example_seed(config["decoding"]["seed"], example["row_id"])
                 _sync(wrapper.device)
@@ -266,6 +285,7 @@ def run_evaluation(method, source, *, manifest_path=None, output_dir=None, model
                 # Reference solutions enter only post-generation scoring.
                 score = score_answer(text, example["reference_solution"])
                 row = {"example_id": example["example_id"], "row_id": example["row_id"],
+                       "question": example["question"],
                        "model_family": config["model"]["family"], "mask_token_id": wrapper.mask_id,
                        "method": method, "seed": seed, "prompt": prompt, "prompt_hash": digest(prompt),
                        "base_prompt": base_prompt, "base_prompt_hash": digest(base_prompt),
@@ -278,6 +298,16 @@ def run_evaluation(method, source, *, manifest_path=None, output_dir=None, model
                        "model_device": str(wrapper.device), "prompt_token_count": prompt_ids.shape[1],
                        "generation_length": generation["gen_length"], "trace_file": trace_file,
                        **result.details}
+                row.update(total_nfes=result.total_nfes,
+                           search_invocations=result.details.get("search_invocations", 0),
+                           mcts_simulations=result.details.get("mcts_simulations", 0),
+                           simulations_per_invocation=result.details.get("simulations_per_invocation", []),
+                           simulations_started=result.details.get("simulations_started", 0),
+                           simulations_interrupted=result.details.get("simulations_interrupted", 0),
+                           average_search_depth=result.details.get("average_search_depth"),
+                           expanded_nodes=result.details.get("expanded_nodes"),
+                           gpu_name=torch.cuda.get_device_name(wrapper.device) if torch.device(wrapper.device).type == "cuda" else None,
+                           signal_extra_nfes=0)
                 predictions.write(json.dumps(row, allow_nan=False) + "\n")
                 predictions.flush()
                 records.append(row)

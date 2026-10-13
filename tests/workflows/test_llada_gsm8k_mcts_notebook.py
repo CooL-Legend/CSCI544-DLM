@@ -64,23 +64,24 @@ def test_appended_cells_are_valid_cleared_and_preserve_existing_workflow(cells):
     validation_copy = copy.deepcopy(raw)
     # Saved Colab streams contain nonstandard metadata. Validate structure and
     # new outputs without modifying the user's original execution history.
-    for cell in validation_copy["cells"][:-5]:
+    new_ids = ("mcts-confidence-intro", "mcts-confidence-config", "run-mcts-confidence",
+               "preview-mcts-confidence", "mcts-confidence-artifacts")
+    mcts_index = next(index for index, cell in enumerate(validation_copy["cells"]) if cell.get("id") == new_ids[0])
+    for cell in validation_copy["cells"][:mcts_index]:
         if cell["cell_type"] == "code":
             cell["outputs"] = []
     notebook = nbformat.reads(json.dumps(validation_copy), as_version=4)
     nbformat.validate(notebook)
     ids = [cell.id for cell in notebook.cells]
     assert len(ids) == len(set(ids))
-    new_ids = ("mcts-confidence-intro", "mcts-confidence-config", "run-mcts-confidence",
-               "preview-mcts-confidence", "mcts-confidence-artifacts")
-    assert ids[-5:] == list(new_ids)
+    assert ids[mcts_index:mcts_index + len(new_ids)] == list(new_ids)
     for cell_id in new_ids:
         cell = cells[cell_id]
         if cell.cell_type == "code":
             assert cell.outputs == [] and cell.execution_count is None
             compile(cell.text, cell_id, "exec")
-    assert any(cell["cell_type"] == "code" and cell.get("outputs") for cell in raw["cells"][:-5])
-    old_code = "\n".join(cell.source for cell in notebook.cells[:-5] if cell.cell_type == "code")
+    assert any(cell["cell_type"] == "code" and cell.get("outputs") for cell in raw["cells"][:mcts_index])
+    old_code = "\n".join(cell.source for cell in notebook.cells[:mcts_index] if cell.cell_type == "code")
     for method in ("confidence", "random_mdm", "top_k_margin", "best_of_5"):
         assert f'METHOD = "{method}"' in old_code
     assert "NUM_SAMPLES = 2" in old_code and 'BRANCH = "adi"' in old_code

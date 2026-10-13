@@ -24,6 +24,7 @@ class MCTSConfig:
     top_k_tokens: int = 3
     top_k_actions: int = 5
     max_model_calls: int | None = None
+    max_simulations: int | None = None
     margin_gamma: float = 10.0
     exploration_c: float = 0.01
     epsilon: float = 1e-8
@@ -38,8 +39,10 @@ class MCTSConfig:
                 raise ValueError(f"mcts.{name} must be a positive integer.")
         if self.max_model_calls is not None and (type(self.max_model_calls) is not int or self.max_model_calls < 1):
             raise ValueError("mcts.max_model_calls must be null or a positive integer.")
-        if self.stop_mode == "budget" and self.max_model_calls is None:
-            raise ValueError("budget mode requires a finite max_model_calls.")
+        if self.max_simulations is not None and (type(self.max_simulations) is not int or self.max_simulations < 1):
+            raise ValueError("mcts.max_simulations must be null or a positive integer.")
+        if self.stop_mode == "budget" and self.max_model_calls is None and self.max_simulations is None:
+            raise ValueError("budget mode requires a finite max_model_calls or max_simulations.")
         for name in ("margin_gamma", "exploration_c", "epsilon"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
@@ -101,6 +104,7 @@ class StateAnalysis:
     entropies: torch.Tensor  # [output_length]; committed positions are zero.
     actions: tuple[Action, ...]
     state_key: tuple[int, ...]
+    mean_margin: float | None = None
 
     @property
     def total_entropy(self):
@@ -218,7 +222,7 @@ def _distribution(model, state, prompt_len, mask_id, config, *, legacy_entropy=F
             actions.append(Action(position, token_id, probability * factors_cpu[row],
                                   probability, h_cpu[row].item(), margins_cpu[row]))
     actions.sort(key=_action_order)
-    return (StateAnalysis(entropies, tuple(actions[:config.top_k_actions]), _state_key(state)),
+    return (StateAnalysis(entropies, tuple(actions[:config.top_k_actions]), _state_key(state), margins.mean().item()),
             positions, probabilities, factors)
 
 
@@ -408,6 +412,10 @@ def rollout(model, state, prompt_len, mask_id, config, *, seed, policy="native",
     if parent_analysis is not None:
         gains.append(information_gain(parent_analysis.total_entropy, analysis.total_entropy, config.epsilon))
     while positions.numel():
+        signals = {"masked_count": positions.numel(),
+                   "mean_token_entropy": analysis.total_entropy / positions.numel(),
+                   "mean_confidence_margin": analysis.mean_margin,
+                   "signal_nfe": getattr(model, "calls", calls), "signal_extra_nfes": 0}
         action = _sample_action(analysis, positions, probabilities, factors, mask_id,
                                 generator, policy, temperature)
         x[0, prompt_len + action.output_position] = action.token_id
@@ -419,6 +427,7 @@ def rollout(model, state, prompt_len, mask_id, config, *, seed, policy="native",
             raise ValueError("Non-finite rollout information gain.")
         gains.append(gain)
         event = {"stage": "rollout_step", "step": len(trace) + 1, "seed": seed,
+                 **signals,
                  "policy": policy, "model_calls": calls, "remaining_masks": positions.numel(),
                  "entropy_before": before, "entropy_after": analysis.total_entropy,
                  "gain": gain, "action": action_record(action, tokenizer)}
@@ -504,6 +513,7 @@ class MCTSSearch:
         self.nodes, self.candidates, self.candidate_rollouts = [self.root], {}, {}
         self.trace, self.on_event = [], on_event
         self.cycle, self.stop_reason = 0, None
+        self.simulations_started = self.simulations_completed = 0
         self._counted = _SearchModel(model, self.config.max_model_calls, self._emit)
 
     @property
@@ -528,6 +538,9 @@ class MCTSSearch:
 
     def _at_cap(self):
         return self.config.max_model_calls is not None and self.model_calls >= self.config.max_model_calls
+
+    def _at_simulation_cap(self):
+        return self.config.max_simulations is not None and self.simulations_completed >= self.config.max_simulations
 
     def _finish(self, reason):
         if reason != "model_call_budget" and self.candidates:
@@ -567,6 +580,10 @@ class MCTSSearch:
                 self.root.analysis = analyze_state(self._counted, self.root.state, self.prompt_len,
                                                    self.mask_id, self.config)
             self._emit("initialization", node_id=0, entropy=self.root.analysis.total_entropy,
+                       masked_count=self.root.state.shape[1] - self.prompt_len,
+                       mean_token_entropy=self.root.analysis.total_entropy / (self.root.state.shape[1] - self.prompt_len),
+                       mean_confidence_margin=self.root.analysis.mean_margin,
+                       signal_nfe=self.model_calls, signal_extra_nfes=0,
                        implementation_version=IMPLEMENTATION_VERSION, assumptions=RECONSTRUCTION_ASSUMPTIONS,
                        model_device=str(model_device(self.model)), search_state_device="cpu",
                        entropies=self.root.analysis.entropies.tolist(),
@@ -574,6 +591,9 @@ class MCTSSearch:
                        actions=[action_record(a, self.tokenizer) for a in self.root.analysis.actions])
         if self._at_cap():
             self._finish("model_call_budget")
+            return self.trace[start:]
+        if self._at_simulation_cap():
+            self._finish("simulation_budget")
             return self.trace[start:]
         parent, decisions = select_node(self.root, self.config.exploration_c)
         if parent is None:
@@ -588,6 +608,9 @@ class MCTSSearch:
             self._emit("expansion", parent_id=parent.node_id, child_id=child.node_id,
                        depth=child.depth, action=action_record(action, self.tokenizer))
             seed = derive_seed(self.seed, "simulation", child.node_id)
+            self.simulations_started += 1
+            self._emit("simulation_started", child_id=child.node_id,
+                       simulations_started=self.simulations_started)
             try:
                 with self._counted.phase("simulation"):
                     evaluation = evaluate_action(self._counted, parent, child, self.prompt_len, self.mask_id,
@@ -599,6 +622,7 @@ class MCTSSearch:
                 self._emit("rollout_interrupted", phase="simulation", child_id=child.node_id, seed=seed)
                 self._finish("model_call_budget")
                 return self.trace[start:]
+            self.simulations_completed += 1
             self._emit("evaluation", parent_id=parent.node_id, child_id=child.node_id,
                        depth=child.depth, action=action_record(action, self.tokenizer),
                        child_state=state_record(child.state, self.prompt_len, self.mask_id, self.tokenizer), **evaluation)
@@ -615,6 +639,9 @@ class MCTSSearch:
                 return self.trace[start:]
             if self._at_cap():
                 self._finish("model_call_budget")
+                return self.trace[start:]
+            if self._at_simulation_cap():
+                self._finish("simulation_budget")
                 return self.trace[start:]
         self._close_exhausted(parent)
         if self.root.closed:
@@ -647,6 +674,15 @@ class MCTSSearch:
                  "search_model_calls": self.model_calls, **self._counted.costs(),
                  **{f"{phase}_latency_seconds": seconds for phase, seconds in self._counted.seconds.items()},
                  "cycles": self.cycle, "requested_depth": self.config.init_tokens, "selected_depth": selected.depth,
+                 "search_invocations": 1, "mcts_simulations": self.simulations_completed,
+                 "simulations_per_invocation": [self.simulations_completed],
+                 "simulations_started": self.simulations_started,
+                 "simulations_interrupted": self.simulations_started - self.simulations_completed,
+                 "requested_simulation_budget": self.config.max_simulations,
+                 "simulation_decoding_steps": sum(len(n.rollout.trace) for n in evaluated),
+                 "average_search_depth": sum(n.depth for n in evaluated) / len(evaluated) if evaluated else 0.0,
+                 "expanded_nodes": len({_state_key(n.state) for n in evaluated}),
+                 "unique_tree_states": len({_state_key(n.state) for n in self.nodes}),
                  "max_depth": max(n.depth for n in self.nodes), "candidate_target": self.config.num_candidates,
                  "candidate_count": len(candidates), "evaluated_candidates": len(self.candidate_rollouts),
                  "evaluated_children": len(evaluated), "expanded_parents": parents,

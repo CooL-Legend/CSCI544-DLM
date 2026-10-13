@@ -6,6 +6,7 @@ import torch
 
 from dlm_project.decoding.baseline import add_gumbel_noise, get_num_transfer_tokens
 from dlm_project.decoding.decoder_result import DecodeResult
+from dlm_project.decoding.signals import masked_state_signals
 
 
 def validate_generation(*, gen_length, steps, block_length, temperature, seed=1):
@@ -81,6 +82,8 @@ def decode_masked(model, prompt_ids, mask_id, *, selection_rule, gen_length=256,
             positions = torch.nonzero(state[0, start:end] == mask_id, as_tuple=False).flatten() + start
             prediction = model(state)
             calls += 1
+            unresolved = torch.nonzero(state[0, prompt_len:] == mask_id, as_tuple=False).flatten() + prompt_len
+            signals = masked_state_signals(prediction.logits[0], unresolved)
             logits = prediction.logits[0, positions].float().clone()
             del prediction
             if logits.shape[-1] < 2 or mask_id >= logits.shape[-1]:
@@ -110,11 +113,14 @@ def decode_masked(model, prompt_ids, mask_id, *, selection_rule, gen_length=256,
                 selected_margins.extend(action["selection_score"] for action in actions)
             trace.append({"stage": "commit", "block": block, "step": step,
                           "generation_nfes": calls, "actions": actions,
+                          "signal_nfe": calls, "signal_extra_nfes": 0, **signals,
                           "remaining_masks": int((state[0, prompt_len:] == mask_id).sum().item())})
     remaining = int((state[0, prompt_len:] == mask_id).sum().item())
     if remaining:
         raise RuntimeError("The transfer schedule left masked output positions.")
-    details = {"seed": seed, "selection_rule": selection_rule, "remaining_masks": remaining}
+    details = {"seed": seed, "selection_rule": selection_rule, "remaining_masks": remaining,
+               "decoding_steps": len(trace), "selected_output_steps": len(trace),
+               "batch_size": 1, "state_evaluations": calls}
     if selected_margins:
         details["mean_selected_margin"] = sum(selected_margins) / len(selected_margins)
     return DecodeResult(state, calls, details=details, trace=trace)
