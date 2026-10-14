@@ -12,8 +12,8 @@ def summarize_primary(records):
     """Aggregate completed predictions; missing execution results are excluded.
 
     decoding_steps counts all final-output trajectories (all five for Best-of-5),
-    excluding search rollouts. mcts_simulations counts fully evaluated tree edges,
-    independently of MCTS cycles and terminal candidate evaluation rollouts.
+    excluding search actions. mcts_simulations counts fully evaluated tree edges,
+    independently of MCTS cycles and candidate ranking.
     """
     count = len(records)
     correct = sum(bool(row["exact_match"]) for row in records)
@@ -88,7 +88,7 @@ def _load_run(directory):
             if events is not None:
                 row.setdefault("decoding_steps", sum(event["stage"] == "commit" or
                     (event["stage"] == "rollout_step" and event.get("phase") == "completion") for event in events))
-                if is_search and row.get("implementation_version") == "medal_reconstruction_v1":
+                if is_search and row.get("implementation_version") in {"medal_reconstruction_v1", "medal_reconstruction_v2"}:
                     row.setdefault("mcts_simulations", sum(event["stage"] == "evaluation" for event in events))
             if not is_search:
                 row.setdefault("mcts_simulations", 0)
@@ -174,12 +174,13 @@ def generate_primary_report(run_dirs, output_dir, *, expected_conditions=None):
         ci = "—" if low is None else f"{100 * low:.1f}–{100 * high:.1f}"
         values = [number(item[key]) for key in ("mean_total_nfes", "mean_latency_seconds", "mean_decoding_steps", "mean_mcts_simulations")]
         lines.append(f"| {item['condition']} | {number(item['accuracy_percent'])} ({ci}) | " + " | ".join(values) + " |")
-    lines += ["", *warnings, "", "NFEs count every forward, including tree analysis, full simulations, terminal candidate evaluation, and final completion. "
+    lines += ["", *warnings, "", "NFEs count every forward, including tree analysis, child evaluation, and final completion. "
+              "Version 2 evaluates each immediate child once and ranks candidates without extra forwards; version 1 includes full search and candidate rollouts. "
               "Batch size is one, so state evaluations equal forward calls. Model loading is recorded separately. "
               "Latency includes tokenization, decoding, uncertainty reductions and trace writing, and excludes model loading and report generation.", "",
-              "One MCTS simulation is one fully completed child rollout and backup. Interrupted simulations, candidate-evaluation rollouts and MCTS cycles are separate counts. "
-              "A simulation cap limits child rollouts; terminal candidate evaluation can add NFEs after that cap. "
-              "Decoding steps count output-generation commitments, summed over all five Best-of-5 candidates; internal search rollout steps are saved separately. "
+              "One MCTS simulation is one evaluated child and backup. MCTS cycles and interrupted evaluations are separate counts. "
+              "In version 2, search NFEs equal one root forward plus completed child evaluations; candidate ranking adds no NFEs. "
+              "Decoding steps count output-generation commitments, summed over all five Best-of-5 candidates; version 2 has zero internal rollout steps. "
               "Average search depth averages evaluated child depths. Expanded nodes counts distinct evaluated child states, excluding the root.", "",
               "Entropy is measured in nats and margin is the top-two probability gap over all unresolved output positions. "
               "Both reuse native full-vocabulary predictions and add zero model forwards; their arithmetic and trace overhead remains in latency.", ""]

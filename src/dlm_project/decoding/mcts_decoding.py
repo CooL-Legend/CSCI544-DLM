@@ -1,7 +1,7 @@
 """Documented reconstruction of MEDAL Algorithms 1 and 2.
 
-Full sampled rollouts, mean stepwise information gain, independent candidate
-rollouts, and literal adjusted-score softmax completion. The interpretation
+Immediate parent-to-child information gain, cached candidate ranking,
+and literal adjusted-score softmax completion. The interpretation
 choices are exported in RECONSTRUCTION_ASSUMPTIONS; author-code parity is not
 claimed. Trees retain compact CPU states and never accept reference answers.
 """
@@ -18,7 +18,7 @@ import torch
 
 @dataclass(frozen=True)
 class MCTSConfig:
-    """Lc, C, K1, K2 and optional cap covering all search/candidate forwards."""
+    """Lc, C, K1, K2 and optional cap covering root and child forwards."""
     init_tokens: int = 20
     num_candidates: int = 3
     top_k_tokens: int = 3
@@ -125,7 +125,7 @@ class Node:
     analysis: StateAnalysis | None = None
     expanded: bool = False
     closed: bool = False
-    rollout: "RolloutResult | None" = None
+    immediate_reward: float | None = None
 
     @property
     def mean_reward(self):
@@ -286,12 +286,12 @@ def information_gain(before, after, epsilon):
     return (before - after) / before if before > epsilon else 0.0
 
 
-IMPLEMENTATION_VERSION = "medal_reconstruction_v1"
+IMPLEMENTATION_VERSION = "medal_reconstruction_v2"
 PAPER_URL = "https://aclanthology.org/2026.findings-eacl.180.pdf"
 RECONSTRUCTION_ASSUMPTIONS = {
-    "simulation": "global highest adjusted-confidence position; native legal token probabilities at temperature 1",
-    "reward": "arithmetic mean of stepwise Eq9 gains; include forced expansion transition",
-    "candidate_evaluation": "one fresh independent rollout per candidate; rank its mean gain",
+    "simulation": "one forward on the immediate child; cache its entropy and actions",
+    "reward": "Eq9 gain from cached parent entropy to immediate child entropy",
+    "candidate_evaluation": "rank cached mean tree rewards; no additional model forwards",
     "completion": "fresh partial-state completion; literal softmax(s/temperature) over all legal position-token actions",
     "decomposition": "inline three subtasks; disjoint two-shot demonstrations",
     "quota": "stop immediately at first C distinct depth-Lc states",
@@ -319,7 +319,7 @@ class SearchIncompleteError(RuntimeError):
 
 
 class _SearchModel:
-    """One invocation counter, including interrupted rollouts; no model reload."""
+    """One invocation counter, including failed child evaluations; no model reload."""
     def __init__(self, model, cap, emit):
         self.model, self.cap, self.emit = model, cap, emit
         self.calls = 0
@@ -399,7 +399,7 @@ def _sample_action(analysis, positions, probabilities, factors, mask_id, generat
 @torch.inference_mode()
 def rollout(model, state, prompt_len, mask_id, config, *, seed, policy="native",
             temperature=1.0, parent_analysis=None, on_event=None, tokenizer=None):
-    """Clone and fully complete; return predictive transition gains and actual NFEs."""
+    """Completion helper; MCTS search evaluates immediate children without calling it."""
     if policy not in ("native", "adjusted_softmax") or temperature <= 0 or not math.isfinite(temperature):
         raise ValueError("Invalid rollout policy or nonpositive temperature.")
     derive_seed(seed, "validate_rollout")
@@ -438,20 +438,25 @@ def rollout(model, state, prompt_len, mask_id, config, *, seed, policy="native",
                          seed, calls, initial_analysis, trace)
 
 
-# 3. SIMULATION: evaluate a complete sampled trajectory, without mutating the child.
-def evaluate_action(model, parent, child, prompt_len, mask_id, config, *, seed=1,
-                    on_event=None, tokenizer=None):
+# 3. SIMULATION: evaluate only the immediate child, without further commitments.
+@torch.inference_mode()
+def evaluate_action(model, parent, child, prompt_len, mask_id, config):
+    """Use the cached parent and one child forward to compute the edge reward."""
     if parent.analysis is None or child.analysis is not None:
         raise ValueError("Evaluation requires a cached parent and an unevaluated child.")
-    result = rollout(model, child.state, prompt_len, mask_id, config, seed=seed,
-                     parent_analysis=parent.analysis, on_event=on_event, tokenizer=tokenizer)
-    child.analysis, child.rollout = result.initial_analysis, result
-    before, after = parent.analysis.total_entropy, child.analysis.total_entropy
+    analysis = analyze_state(model, child.state, prompt_len, mask_id, config)
+    before, after = parent.analysis.total_entropy, analysis.total_entropy
+    reward = information_gain(before, after, config.epsilon)
+    if not math.isfinite(reward):
+        raise ValueError("Non-finite child information gain.")
+    child.analysis, child.immediate_reward = analysis, reward
+    remaining = int((child.state[0, prompt_len:] == mask_id).sum().item())
     removed = parent.analysis.entropies[child.action.output_position].item()
     return {"entropy_before": before, "entropy_after": after,
-            "immediate_gain": result.gains[0], "reward": result.mean_reward,
-            "gains": result.gains, "rollout_seed": seed, "rollout_model_calls": result.model_calls,
-            "rollout_output_ids": result.token_ids[0, prompt_len:].tolist(),
+            "immediate_gain": reward, "reward": reward, "evaluation_model_calls": int(remaining > 0),
+            "masked_count": remaining, "mean_token_entropy": after / remaining if remaining else 0.0,
+            "mean_confidence_margin": analysis.mean_margin,
+            "signal_nfe": getattr(model, "calls", None), "signal_extra_nfes": 0,
             "committed_position_entropy": removed, "context_gain": before - removed - after,
             "entropies_before": parent.analysis.entropies.tolist(),
             "entropies_after": child.analysis.entropies.tolist()}
@@ -496,7 +501,7 @@ def state_record(state, prompt_len, mask_id, tokenizer=None):
 
 
 class MCTSSearch:
-    """One resumable tree; step() includes full simulations and terminal candidate evaluation."""
+    """One resumable tree; step() evaluates immediate children and backs up gains."""
     def __init__(self, model, prompt_ids, mask_id, gen_length, config=None,
                  tokenizer=None, on_event: Callable[[dict], None] | None = None, *, seed=1):
         self.config = config if isinstance(config, MCTSConfig) else MCTSConfig(**(config or {}))
@@ -510,7 +515,7 @@ class MCTSSearch:
         state = torch.full((1, self.prompt_len + gen_length), mask_id, dtype=torch.long)
         state[:, :self.prompt_len] = prompt_ids.detach().cpu()
         self.root = Node(0, state)
-        self.nodes, self.candidates, self.candidate_rollouts = [self.root], {}, {}
+        self.nodes, self.candidates = [self.root], {}
         self.trace, self.on_event = [], on_event
         self.cycle, self.stop_reason = 0, None
         self.simulations_started = self.simulations_completed = 0
@@ -543,25 +548,10 @@ class MCTSSearch:
         return self.config.max_simulations is not None and self.simulations_completed >= self.config.max_simulations
 
     def _finish(self, reason):
-        if reason != "model_call_budget" and self.candidates:
-            for index, node in enumerate(self.candidates.values()):
-                seed = derive_seed(self.seed, "candidate_evaluation", index)
-                try:
-                    with self._counted.phase("candidate_evaluation"):
-                        candidate = rollout(self._counted, node.state, self.prompt_len, self.mask_id,
-                                            self.config, seed=seed, tokenizer=self.tokenizer,
-                                            on_event=lambda e, n=node: self._emit(e["stage"], phase="candidate_evaluation",
-                                                node_id=n.node_id, **{k:v for k,v in e.items() if k != "stage"}))
-                except BudgetExhausted:
-                    reason = "model_call_budget"
-                    self._emit("rollout_interrupted", phase="candidate_evaluation", node_id=node.node_id, seed=seed)
-                    break
-                self.candidate_rollouts[node.node_id] = candidate
-                self._emit("candidate_evaluation", node_id=node.node_id, seed=seed,
-                           reward=candidate.mean_reward, gains=candidate.gains, model_calls=candidate.model_calls,
-                           output_ids=candidate.token_ids[0, self.prompt_len:].tolist(),
-                           raw_output=self.tokenizer.decode(candidate.token_ids[0, self.prompt_len:].tolist(),
-                                      skip_special_tokens=True) if self.tokenizer else None)
+        for node in self.candidates.values():
+            self._emit("candidate_evaluation", phase="candidate_evaluation", node_id=node.node_id,
+                       reward=node.mean_reward, immediate_gain=node.immediate_reward, model_calls=0,
+                       state=state_record(node.state, self.prompt_len, self.mask_id, self.tokenizer))
         self.stop_reason = reason
         result = self.result()
         self._emit("termination", **{k:v for k,v in result.stats.items() if not k.endswith("_latency_seconds")},
@@ -607,19 +597,16 @@ class MCTSSearch:
             self.nodes.append(child)
             self._emit("expansion", parent_id=parent.node_id, child_id=child.node_id,
                        depth=child.depth, action=action_record(action, self.tokenizer))
-            seed = derive_seed(self.seed, "simulation", child.node_id)
             self.simulations_started += 1
             self._emit("simulation_started", child_id=child.node_id,
                        simulations_started=self.simulations_started)
             try:
                 with self._counted.phase("simulation"):
                     evaluation = evaluate_action(self._counted, parent, child, self.prompt_len, self.mask_id,
-                        self.config, seed=seed, tokenizer=self.tokenizer,
-                        on_event=lambda e: self._emit(e["stage"], phase="simulation", child_id=child.node_id,
-                            **{k:v for k,v in e.items() if k != "stage"}))
+                                                 self.config)
             except BudgetExhausted:
                 child.closed = True
-                self._emit("rollout_interrupted", phase="simulation", child_id=child.node_id, seed=seed)
+                self._emit("simulation_interrupted", phase="simulation", child_id=child.node_id)
                 self._finish("model_call_budget")
                 return self.trace[start:]
             self.simulations_completed += 1
@@ -653,23 +640,19 @@ class MCTSSearch:
         if self.root.analysis is None:
             raise RuntimeError("Call step() or run() before requesting a result.")
         candidates = list(self.candidates.values())
-        if self.candidate_rollouts:
-            pool = [n for n in candidates if n.node_id in self.candidate_rollouts]
-            selected = max(pool, key=lambda n: self.candidate_rollouts[n.node_id].mean_reward)
-            score = self.candidate_rollouts[selected.node_id].mean_reward
+        evaluated = [node for node in self.nodes if node.immediate_reward is not None]
+        if candidates:
+            selected = max(candidates, key=lambda n: n.mean_reward)
         else:
-            pool = [n for n in self.nodes if n.rollout is not None] or [self.root]
-            selected = min(pool, key=lambda n: (-n.depth, -n.rollout.mean_reward if n.rollout else 0, n.node_id))
-            score = selected.rollout.mean_reward if selected.rollout else 0.0
-        complete = (len(candidates) >= self.config.num_candidates and
-                    len(self.candidate_rollouts) == len(candidates))
+            selected = min(evaluated or [self.root], key=lambda n: (-n.depth, -n.mean_reward, n.node_id))
+        score = selected.mean_reward
+        complete = len(candidates) >= self.config.num_candidates
         fallback = self.done and not complete
-        evaluated = [node for node in self.nodes if node.rollout is not None]
         parents = len({node.parent.node_id for node in evaluated})
         stats = {"implementation_version": IMPLEMENTATION_VERSION, "paper_url": PAPER_URL,
                  "reconstruction_assumptions": dict(RECONSTRUCTION_ASSUMPTIONS),
-                 "evaluation_variant": "budget-limited MEDAL reconstruction" if self.config.stop_mode == "budget"
-                 else "MEDAL reconstruction (mean stepwise IG)",
+                 "evaluation_variant": "budget-limited MEDAL reconstruction (immediate-child IG)" if self.config.stop_mode == "budget"
+                 else "MEDAL reconstruction (immediate-child IG)",
                  "finished": self.done, "stop_reason": self.stop_reason, "stop_mode": self.config.stop_mode,
                  "search_model_calls": self.model_calls, **self._counted.costs(),
                  **{f"{phase}_latency_seconds": seconds for phase, seconds in self._counted.seconds.items()},
@@ -679,22 +662,20 @@ class MCTSSearch:
                  "simulations_started": self.simulations_started,
                  "simulations_interrupted": self.simulations_started - self.simulations_completed,
                  "requested_simulation_budget": self.config.max_simulations,
-                 "simulation_decoding_steps": sum(len(n.rollout.trace) for n in evaluated),
+                 "simulation_decoding_steps": 0,
                  "average_search_depth": sum(n.depth for n in evaluated) / len(evaluated) if evaluated else 0.0,
                  "expanded_nodes": len({_state_key(n.state) for n in evaluated}),
                  "unique_tree_states": len({_state_key(n.state) for n in self.nodes}),
                  "max_depth": max(n.depth for n in self.nodes), "candidate_target": self.config.num_candidates,
-                 "candidate_count": len(candidates), "evaluated_candidates": len(self.candidate_rollouts),
+                 "candidate_count": len(candidates), "evaluated_candidates": len(candidates),
                  "evaluated_children": len(evaluated), "expanded_parents": parents,
                  "realized_branching_factor": len(evaluated) / parents if parents else 0.0,
                  "candidate_ids": [n.node_id for n in candidates], "selected_node_id": selected.node_id,
                  "selected_score": score, "fallback_used": fallback,
                  "fallback_reason": self.stop_reason if fallback else None, "budget_exhausted": self._at_cap(),
-                 "candidate_evaluations": [{"node_id": n.node_id, "seed": r.seed, "reward": r.mean_reward,
-                     "gains": r.gains, "model_calls": r.model_calls,
-                     "output_ids": r.token_ids[0, self.prompt_len:].tolist(),
-                     "raw_output": self.tokenizer.decode(r.token_ids[0, self.prompt_len:].tolist(), skip_special_tokens=True)
-                     if self.tokenizer else None} for n in candidates if (r := self.candidate_rollouts.get(n.node_id))]}
+                 "candidate_evaluations": [{"node_id": n.node_id, "reward": n.mean_reward,
+                     "immediate_gain": n.immediate_reward, "model_calls": 0,
+                     **state_record(n.state, self.prompt_len, self.mask_id, self.tokenizer)} for n in candidates]}
         return SearchResult(selected, candidates, stats, list(self.trace))
 
     def run(self):

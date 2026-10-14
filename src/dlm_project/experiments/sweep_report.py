@@ -183,7 +183,11 @@ def _markdown(config, summary, rows, directory):
              f"Completed {summary['completed_predictions']}/{summary['expected_predictions']} predictions. "
              f"Every main comparison uses **n={summary['common_n']} common examples** "
              f"out of {summary['requested_examples']} selected examples.", ""]
-    if config.get("report_schema_version", 1) >= 2:
+    if config.get("implementation_version") == "medal_reconstruction_v2":
+        lines += ["Immediate-child accounting: search = one root forward + one forward per evaluated child. "
+                  "Candidate ranking reuses cached rewards and adds no forwards. Final completion is additional "
+                  "and starts with a fresh forward. Only completed child evaluations update tree visits.", ""]
+    elif config.get("report_schema_version", 1) >= 2:
         lines += ["Full-rollout accounting: search = tree analysis + all branch simulations + candidate evaluation. "
                   "Final completion is additional and starts with a fresh forward. Interrupted simulation calls count "
                   "against the budget; their unfinished rewards are never backed up. Budget sweeps are ablations.", ""]
@@ -201,11 +205,13 @@ def _markdown(config, summary, rows, directory):
               f"All settings and package versions: [resolved config](config.json).", "",
               "```json", json.dumps({"generation": config["generation"], "decoding": config["decoding"],
                                      "budgets": config["sweep"]["budgets"], "setup_cost": summary["setup"]}, indent=2), "```", "",
-              ("- Total NFEs = tree analysis + branch simulations + candidate evaluation + fresh final completion."
+              ("- Total NFEs = one root forward + evaluated children + fresh final completion."
+               if config.get("implementation_version") == "medal_reconstruction_v2" else
+               "- Total NFEs = tree analysis + branch simulations + candidate evaluation + fresh final completion."
                if config.get("report_schema_version", 1) >= 2 else
                "- Total NFEs = search NFEs + completion NFEs. Search includes root and each evaluated child; first completion reuses cached analysis."),
               "- Budget mode ignores the candidate quota, closes target-depth nodes, and stops at the NFE cap or exhausted frontier. "
-              "Fallback completes the deepest fully evaluated state (or root) when no complete candidate-selection result exists.",
+              "Collected evaluated candidates are ranked; when none exists, fallback completes the deepest evaluated state (or root).",
               "- Realized branching = evaluated children / distinct parents with evaluated children, only for MCTS.",
               "- Decoding latency includes prompt encoding, search, completion and trace capture during those stages; CUDA is synchronized. "
               "Loading, warm-up, scoring and plotting are excluded. Setup forwards/time are listed separately above.",

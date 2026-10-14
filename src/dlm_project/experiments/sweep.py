@@ -54,7 +54,7 @@ def resolve_settings(task, config, *, profile=None, num_samples=None, budgets=No
     if type(data["num_samples"]) is not int or not 1 <= data["num_samples"] <= POOL_SIZES[task][partition]:
         raise ValueError(f"Select 1–{POOL_SIZES[task][partition]} {partition} examples.")
     config["task"] = task
-    config["evaluation_variant"] = "Budget-limited MEDAL reconstruction; inline decomposition; mean stepwise IG"
+    config["evaluation_variant"] = "Budget-limited MEDAL reconstruction; inline decomposition; immediate-child IG"
     config["report_schema_version"] = 2
     config["implementation_version"] = IMPLEMENTATION_VERSION
     config["trace_policy"] = "all search-cycle and completion events; no vocabulary logits"
@@ -218,7 +218,7 @@ def run_sweep(task, config, *, manifest_path=None, output_dir=None, model_factor
     config["data"]["revision"] = manifest["dataset"]["revision"]
     dataset_name = "GSM8K" if task == "gsm8k" else "Sudoku4x4"
     output_dir = output_dir or config.get("output_dir")
-    parent = Path(output_dir).expanduser() if output_dir else root / "LLaDA" / dataset_name / "sweeps" / "medal-v1"
+    parent = Path(output_dir).expanduser() if output_dir else root / "LLaDA" / dataset_name / "sweeps" / "medal-v2"
     directory, started = create_run_directory({"output_dir": str(parent),
                                                "experiment_timezone": config.get("experiment_timezone", "America/Los_Angeles")})
     config["run"] = {"directory": str(directory), "started_at": started.isoformat(),

@@ -1,4 +1,4 @@
-"""MEDAL reconstruction: complete MCTS rollouts, then adjusted-score sampling.
+"""MEDAL reconstruction: immediate-child MCTS gains, then adjusted-score sampling.
 
 The historical method name is retained; implementation_version distinguishes
 new runs from the earlier one-step/token-probability method.

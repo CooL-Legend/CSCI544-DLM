@@ -11,7 +11,7 @@ from tests.decoding.helpers import FakeModel, MASK, PROMPT
 
 
 @pytest.mark.parametrize("budget", [1, 2, 3, 4])
-def test_simulation_cap_stops_between_siblings_and_records_completed_rollouts(budget):
+def test_simulation_cap_stops_between_siblings_and_records_evaluated_children(budget):
     model = FakeModel()
     search = MCTSSearch(model, PROMPT, MASK, 4, MCTSConfig(init_tokens=2,
         num_candidates=10, top_k_actions=3, top_k_tokens=2,
@@ -23,17 +23,17 @@ def test_simulation_cap_stops_between_siblings_and_records_completed_rollouts(bu
     assert result.stats["simulations_interrupted"] == 0
     assert search.root.visits == budget
     assert sum(event["stage"] == "backpropagation" for event in result.trace) == budget
-    assert result.stats["search_model_calls"] == len(model.seen) > budget
-    assert result.stats["simulation_decoding_steps"] == sum(len(node.rollout.trace) for node in search.nodes if node.rollout)
-    assert result.stats["average_search_depth"] == pytest.approx(sum(node.depth for node in search.nodes if node.rollout) / budget)
+    assert result.stats["search_model_calls"] == len(model.seen) == 1 + budget
+    assert result.stats["simulation_decoding_steps"] == 0
+    assert result.stats["average_search_depth"] == pytest.approx(sum(node.depth for node in search.nodes if node.immediate_reward is not None) / budget)
 
 
-def test_interrupted_simulation_is_charged_without_becoming_completed_simulation():
+def test_last_forward_at_cap_completes_one_immediate_child_simulation():
     result = MCTSSearch(FakeModel(), PROMPT, MASK, 4, MCTSConfig(init_tokens=2,
         max_model_calls=2, max_simulations=4, stop_mode="budget")).run()
     assert result.stats["search_model_calls"] == 2
-    assert result.stats["simulations_started"] == result.stats["simulations_interrupted"] == 1
-    assert result.stats["mcts_simulations"] == 0
+    assert result.stats["simulations_started"] == result.stats["mcts_simulations"] == 1
+    assert result.stats["simulations_interrupted"] == 0
 
 
 def test_signals_include_future_blocks_without_additional_forwards():

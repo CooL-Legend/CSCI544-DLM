@@ -156,13 +156,14 @@ def test_one_model_five_conditions_fresh_states_forward_accounting_and_increment
     for start in (0, 5):
         group = rows[start:start+5]
         assert len({(row["example_id"], row["base_prompt_hash"], row["seed"]) for row in group}) == 1
-        assert [row["search_nfes"] for row in group] == [0, 0, 2, 5, 8]
-        assert [row["completion_nfes"] for row in group] == [4, 4, 4, 3, 3]
-        assert [row["fallback_used"] for row in group] == [None, None, True, True, True]
-        assert group[-1]["stop_reason"] == "model_call_budget"
-        assert group[-1]["evaluated_children"] == 2
-        assert group[-1]["expanded_parents"] == 1
+        assert [row["search_nfes"] for row in group] == [0, 0, 2, 5, 7]
+        assert [row["completion_nfes"] for row in group] == [4, 4, 3, 2, 2]
+        assert [row["fallback_used"] for row in group] == [None, None, True, True, False]
+        assert group[-1]["stop_reason"] == "frontier_exhausted"
+        assert group[-1]["evaluated_children"] == 6
+        assert group[-1]["expanded_parents"] == 3
         assert group[-1]["realized_branching_factor"] == 2
+        assert all(row['candidate_evaluation_nfes']==0 for row in group)
     for index, ((prompt, decoding), offset) in enumerate(zip(predictions, offsets)):
         assert "REFERENCE_ONLY" not in prompt and SOLUTION not in prompt
         assert set(decoding) == {"method", "seed", "mcts"}

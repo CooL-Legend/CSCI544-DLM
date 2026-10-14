@@ -16,7 +16,7 @@ On Colab, the notebooks install `requirements/llada-colab.txt`, `requirements/il
 | --- | --- | --- |
 | Model interface | `src/dlm_project/models/llada.py` | Load the HF model/tokenizer, encode a prompt, dispatch decoding, report predictions and statistics. |
 | Model identity/cache | `src/dlm_project/models/profiles.py`, `cache.py` | Model IDs, revisions, mask IDs, download validation and staging. |
-| MCTS | `src/dlm_project/decoding/mcts_decoding.py` | All search components, all four cycle stages, full rollout evaluation, adjusted-score sampling and trace events in one file. |
+| MCTS | `src/dlm_project/decoding/mcts_decoding.py` | All search components, all four cycle stages, immediate-child entropy evaluation, adjusted-score sampling and trace events in one file. |
 | Baseline | `src/dlm_project/decoding/baseline.py` | Upstream fixed-length sampler. |
 | Experiment utilities | `src/dlm_project/experiments/` | Shared configuration validation, run names/directories and atomic JSON saving. |
 | Decoder sweeps | `src/dlm_project/experiments/{manifests,sweep,sweep_report,sweep_plots}.py` | Frozen examples, paired baseline/confidence/MCTS runs, incremental records, offline tables and figures. |

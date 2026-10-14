@@ -25,8 +25,8 @@ def run_metrics_sweep(source, *, budgets=(4, 8, 16, 32, 64), manifest_path=None,
     """Run paired conditions sequentially and retain partial artifacts on failure.
 
     All conditions use MEDAL two-shot prompting and a single global output block.
-    The reconstruction's simulation budget counts completed child rollouts;
-    candidate evaluation and final completion are included in total NFEs.
+    The reconstruction's simulation budget counts immediate-child evaluations;
+    root analysis and final completion are also included in total NFEs.
     """
     if not budgets or any(type(budget) is not int or budget < 1 for budget in budgets) or len(set(budgets)) != len(budgets):
         raise ValueError("Simulation budgets must be distinct positive integers.")

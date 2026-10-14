@@ -7,7 +7,7 @@ and conditions sequentially. Sudoku uses **BGPO's released 4×4 dataset**, not i
 fine-tuned weights. The existing BGPO model comparison and single-example
 notebooks retain their behavior.
 
-These experiments now use full sampled-rollout MEDAL reconstruction, mean stepwise information gain, inline decomposition, and literal adjusted-score completion. Finite caps are budget-limited ablations; author-code parity is unverified. Historical report-only artifacts remain supported. See the [walkthrough](mcts_walkthrough.md) for the assumptions and substantially increased full-rollout cost.
+These experiments now use MEDAL reconstruction with immediate parent-to-child information gain, inline decomposition, and literal adjusted-score completion. Finite caps are budget-limited ablations; author-code parity is unverified. Historical report-only artifacts remain supported. See the [walkthrough](mcts_walkthrough.md) for the assumptions and one-forward-per-child cost accounting.
 
 ## Conditions and frozen data
 
@@ -178,9 +178,9 @@ inference/accounting/artifacts, not model accuracy or equivalence.
 
 ## Cost and interpretation
 
-One NFE is one call to the DLM at batch size one. Search includes root analysis, every branch-simulation forward, and independent candidate-evaluation forwards. Fresh final completion costs `256 - selected_depth`. Interrupted simulation forwards consume the cap, but unfinished rewards never update visits. Fallback selects a deepest fully evaluated state, or root. Final candidates rank by their fresh rollout mean, not root-relative entropy reduction.
+One NFE is one call to the DLM at batch size one. Search includes one root-analysis forward and one forward per evaluated immediate child. Candidate ranking reuses cached mean tree rewards and adds no forwards. Fresh final completion costs `256 - selected_depth`. Failed child evaluations never update visits. If no target-depth candidate exists, fallback selects a deepest evaluated state, or root.
 
-Caps 128/256/512 can complete very few full branch simulations. These are explicit budget-limited ablations, not uncapped candidate-mode reproduction runs. Read saved actual phase counts rather than using the historical one-forward-per-child cost estimates.
+Caps 128/256/512 allow at most 127/255/511 immediate-child evaluations after root analysis. These are explicit budget-limited runs; they do not guarantee the candidate quota. Read saved phase counts and selected depths for each example.
 
 Use smoke latency to estimate milestone runtime on your allocated GPU. Model
 loading and warm-up time are reported separately; plotting/scoring are outside
@@ -220,10 +220,10 @@ are rejected. Raw records are never overwritten during reporting.
 - `experiments/sweep.py`: sequential execution, task adapters, warm-up, metrics and incremental saving.
 - `experiments/sweep_report.py`: offline aggregation, Wilson intervals, CSV/Markdown and incomplete-run handling.
 - `experiments/sweep_plots.py`: saved-metric figures and trace inspection.
-- `decoding/mcts_decoding.py`: all search logic, including both stopping modes; reward unchanged.
+- `decoding/mcts_decoding.py`: all search logic, including both stopping modes and immediate-child entropy rewards.
 
 Run `python -m pytest -q` in the pinned LLaDA dependency environment. New tests
-exercise both stop modes, sibling caps, deduplication, full-rollout phase accounting,
+exercise both stop modes, sibling caps, deduplication, immediate-child phase accounting,
 frozen manifests, scoring failures, paired samples, offline report regeneration,
 one model load, incremental saves and figure data. Controlled CPU tests and
 controlled CUDA tests are separate from **actual HF GPU smoke validation**, which

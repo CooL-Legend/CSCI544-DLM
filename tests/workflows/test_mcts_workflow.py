@@ -41,7 +41,7 @@ def source(notebook, cell_id):
 
 
 @pytest.mark.parametrize("method,search_calls,completion_calls", [
-    ("baseline", 0, 4), ("confidence", 0, 4), ("mcts_entropy", 21, 2),
+    ("baseline", 0, 4), ("confidence", 0, 4), ("mcts_entropy", 7, 2),
 ])
 def test_prediction_modes_forward_counts_text_interface_and_trace(method, search_calls, completion_calls):
     instance = wrapper()
@@ -90,7 +90,7 @@ def test_baseline_default_delegates_to_original_sampler_with_unchanged_parameter
                          remasking="low_confidence", mask_id=MASK)]
 
 
-@pytest.mark.parametrize("phase,expected_calls,finished", [("one_step", 7, False), ("search", 21, True)])
+@pytest.mark.parametrize("phase,expected_calls,finished", [("one_step", 3, False), ("search", 7, True)])
 def test_inspection_jsonl_contains_actual_events_and_no_completion(tmp_path, phase, expected_calls, finished):
     instance = wrapper()
     trace_path = tmp_path / "inspection" / f"{phase}.jsonl"
@@ -122,7 +122,7 @@ def test_runner_saves_resolved_config_search_stats_and_matching_trace(tmp_path):
     assert record["decoding_method"] == "mcts_entropy"
     assert stats["selected_depth"] == 2 and stats["candidate_count"] == 3
     assert stats["mcts_config"] == saved["decoding"]["mcts"]
-    assert stats["search_model_calls"] == summary["search_model_calls"] == 21
+    assert stats["search_model_calls"] == summary["search_model_calls"] == 7
     assert stats["completion_model_calls"] == summary["completion_model_calls"] == 2
     assert summary["latency_seconds"] == stats["latency_seconds"]
     events = [json.loads(line) for line in (run_dir / record["trace_file"]).read_text().splitlines()]
@@ -145,7 +145,8 @@ def test_interrupted_search_flushes_prior_trace_events(tmp_path):
     trace_path = next(tmp_path.rglob("puzzle_000.jsonl"))
     events = [json.loads(line) for line in trace_path.read_text().splitlines()]
     assert any(e["stage"] == "forward" for e in events)
-    assert not any(e["stage"] == "backpropagation" for e in events)
+    assert sum(e["stage"] == "backpropagation" for e in events) == 1
+    assert events[-1]["stage"] == "forward"
     metrics = json.loads(next(tmp_path.rglob("metrics.json")).read_text())
     assert metrics["status"] == "failed" and metrics["processed"] == 0
 

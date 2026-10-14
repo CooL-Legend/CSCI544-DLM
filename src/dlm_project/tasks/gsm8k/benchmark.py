@@ -189,7 +189,7 @@ def run_evaluation(method, source, *, manifest_path=None, output_dir=None, model
             f"temp{generation['temperature']:g}-seed{config['decoding']['seed']}")
     if method == "mcts_confidence":
         m = config["decoding"]["mcts"]
-        name += (f"-medal-v1-lc{m['init_tokens']}-c{m['num_candidates']}-k1_{m['top_k_tokens']}"
+        name += (f"-medal-v2-lc{m['init_tokens']}-c{m['num_candidates']}-k1_{m['top_k_tokens']}"
                  f"-k2_{m['top_k_actions']}-budget{m['max_model_calls'] if m['max_model_calls'] is not None else 'none'}-gamma{m['margin_gamma']:g}"
                  f"-ucb{m['exploration_c']:g}-eps{m['epsilon']:g}-stop-{m['stop_mode']}")
         if m["max_simulations"] is not None:

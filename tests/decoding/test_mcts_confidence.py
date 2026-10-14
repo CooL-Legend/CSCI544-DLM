@@ -10,7 +10,7 @@ def options(**kw):
     return {'init_tokens':2,'num_candidates':1,'top_k_tokens':2,'top_k_actions':2,**kw}
 
 
-@pytest.mark.parametrize('cap,depth',[(1,0),(2,0),(6,1)])
+@pytest.mark.parametrize('cap,depth',[(1,0),(2,1),(6,2)])
 def test_explicit_budget_completion_preserves_committed_tokens_and_costs(cap,depth):
     model=FakeModel();sink=[]
     r=mcts_confidence.decode(model,PROMPT,MASK,gen_length=6,steps=6,block_length=6,
@@ -27,18 +27,20 @@ def test_explicit_budget_completion_preserves_committed_tokens_and_costs(cap,dep
     assert r.details['completion_seed']==derive_seed(1,'final_completion')
 
 
-def test_uncapped_candidate_search_full_cost_and_global_completion():
+def test_uncapped_candidate_search_single_forward_cost_and_global_completion():
     model=FakeModel()
     r=mcts_confidence.decode(model,PROMPT,MASK,gen_length=4,steps=4,block_length=4,
                              mcts=options(num_candidates=3),tokenizer=FakeTokenizer())
     assert r.details['candidate_count']==r.details['evaluated_candidates']==3
-    assert r.details['search_model_calls']==21
+    assert r.details['search_model_calls']==7
     assert r.details['completion_model_calls']==2
-    assert r.total_nfes==len(model.seen)==23
-    assert r.details['implementation_version']=='medal_reconstruction_v1'
+    assert r.total_nfes==len(model.seen)==9
+    assert r.details['implementation_version']=='medal_reconstruction_v2'
     assert not r.details['fallback_used']
-    assert r.trace[-1]['generation_nfes']==23
-    assert r.details['candidate_evaluations'][0]['raw_output'] is not None
+    assert r.trace[-1]['generation_nfes']==9
+    assert r.details['candidate_evaluations'][0]['remaining_masks']==2
+    assert r.details['candidate_evaluation_model_calls']==0
+    assert all(e.get('phase')=='completion' for e in r.trace if e['stage']=='rollout_step')
 
 
 def test_seed_reproducibility_and_phase_separation():
@@ -79,4 +81,4 @@ def test_registered_model_mask_ids_are_excluded_from_all_commitments(family):
                              mcts=options(top_k_tokens=1,top_k_actions=1))
     assert torch.equal(r.token_ids[:,:2],prompt)
     assert (r.token_ids[:,2:]!=mask).all()
-    assert r.total_nfes==len(model.seen)==10
+    assert r.total_nfes==len(model.seen)==5

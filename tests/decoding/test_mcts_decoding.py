@@ -1,6 +1,5 @@
-"""Controlled MEDAL trajectories, filtering, tree statistics, and sampling."""
+"""Immediate-child rewards, filtering, tree statistics, and final sampling."""
 import json
-from dataclasses import replace
 import pytest
 import torch
 from dlm_project.decoding import mcts_decoding as md
@@ -34,11 +33,11 @@ def test_epsilon_entropy_and_confidence_filtering():
     assert len(model.seen)==1
 
 
-def test_uct_and_backups_are_per_simulation_not_per_rollout_step():
+def test_uct_and_backups_are_per_evaluated_child():
     tree=search()
     tree.step()
     assert tree.root.visits==2
-    assert len(tree.model.seen)==7  # Root + two three-forward rollouts.
+    assert len(tree.model.seen)==3  # Root + one forward per immediate child.
     assert [n.visits for n in tree.root.children]==[1,1]
     tree.root.children[0].visits=0
     chosen,path=md.select_node(tree.root,.01)
@@ -52,25 +51,25 @@ def test_uct_and_backups_are_per_simulation_not_per_rollout_step():
     assert leaf.visits==1 and tree.root.reward_sum==pytest.approx(before-.5)
 
 
-def test_rollouts_preserve_independent_tree_states_and_prompt_masks():
+def test_simulations_preserve_partial_tree_states_and_prompt_masks(monkeypatch):
+    monkeypatch.setattr(md, 'rollout', lambda *a, **kw: pytest.fail('Search performed a rollout'))
     tree=search()
     tree.step()
     root=tree.root.state.clone()
     for child in tree.root.children:
         assert child.state.data_ptr()!=tree.root.state.data_ptr()
         assert (child.state[:,2:]!=MASK).sum()==1
-        assert (child.rollout.token_ids[:,2:]!=MASK).all()
-        committed=child.state!=MASK
-        assert torch.equal(child.rollout.token_ids[committed],child.state[committed])
-        assert torch.equal(child.rollout.token_ids[:,:2],PROMPT)
-        assert child.rollout.model_calls==3
-        assert len(child.rollout.gains)==4
-        assert child.rollout.mean_reward==pytest.approx(sum(child.rollout.gains)/4)
+        assert torch.equal(child.state[:,:2],PROMPT)
+        assert child.analysis.state_key==tuple(child.state[0].tolist())
+        assert child.immediate_reward==pytest.approx(.25)
+        assert child.mean_reward==child.immediate_reward
     assert torch.equal(tree.root.state,root)
     assert all(torch.equal(state[:,:2],PROMPT) for state in tree.model.seen)
+    assert [(state[:,2:]!=MASK).sum().item() for state in tree.model.seen]==[0,1,1]
+    assert not any(event['stage']=='rollout_step' for event in tree.trace)
 
 
-def test_equal_immediate_gain_is_distinguished_by_later_trajectory():
+def test_reward_depends_only_on_immediate_child_not_later_trajectory():
     def policy(output):
         if (output!=MASK).sum() < 2:
             return [0,.9,.05,.05]
@@ -80,26 +79,44 @@ def test_equal_immediate_gain_is_distinguished_by_later_trajectory():
     root.analysis=md.analyze_state(model,root.state,2,MASK,settings())
     left=md.expand_node(root,md.Action(0,1,.5),1,2,MASK,2)
     right=md.expand_node(root,md.Action(0,2,.4),2,2,MASK,2)
-    a=md.evaluate_action(model,root,left,2,MASK,settings(),seed=4)
-    b=md.evaluate_action(model,root,right,2,MASK,settings(),seed=4)
+    a=md.evaluate_action(model,root,left,2,MASK,settings())
+    b=md.evaluate_action(model,root,right,2,MASK,settings())
     assert a['immediate_gain']==pytest.approx(b['immediate_gain'])
-    assert a['reward']>b['reward']
-    assert any(gain<0 for gain in b['gains'])
-    assert a['reward']!=pytest.approx(a['immediate_gain'])
+    assert a['reward']==pytest.approx(b['reward'])
+    assert a['reward']==a['immediate_gain']==pytest.approx(.25)
+    assert a['evaluation_model_calls']==b['evaluation_model_calls']==1
+    assert len(model.seen)==3
     assert md.information_gain(0,20,1e-8)==0
 
 
-def test_candidates_are_distinct_closed_and_freshly_ranked():
+@pytest.mark.parametrize('probabilities', [[0,.99,.005,.005], [0,1.,0.,0.]])
+def test_negative_and_zero_parent_entropy_rewards(probabilities):
+    model=FakeModel(lambda output: probabilities if (output==MASK).all() else [0,1/3,1/3,1/3])
+    tree=search(model)
+    events=tree.step()
+    evaluations=[event for event in events if event['stage']=='evaluation']
+    assert len(model.seen)==3
+    for event in evaluations:
+        expected=md.information_gain(event['entropy_before'],event['entropy_after'],settings().epsilon)
+        assert event['reward']==pytest.approx(expected)
+        if probabilities[1]<1:
+            assert event['reward']<0
+        else:
+            assert event['reward']==0
+
+
+def test_candidates_are_distinct_closed_and_ranked_without_extra_forwards():
     tree=search()
     result=tree.run()
     assert len(result.candidates)==3
     assert len({tuple(n.state[0].tolist()) for n in result.candidates})==3
     assert all(n.closed and not n.children for n in result.candidates)
     assert result.stats['evaluated_candidates']==3
-    assert result.stats['candidate_evaluation_model_calls']==6
-    assert result.stats['selected_score']==max(r.mean_reward for r in tree.candidate_rollouts.values())
+    assert result.stats['candidate_evaluation_model_calls']==0
+    assert result.stats['selected_score']==max(n.mean_reward for n in result.candidates)
     assert result.selected is result.candidates[0]  # Static entropies tie; collection order wins.
-    assert {n.rollout.seed for n in result.candidates}.isdisjoint({r.seed for r in tree.candidate_rollouts.values()})
+    assert all(n.mean_reward==n.immediate_reward for n in result.candidates)
+    assert all(e['model_calls']==0 for e in result.stats['candidate_evaluations'])
     assert (result.selected.state[:,2:]==MASK).sum()==2
     assert sum(e.get('duplicate',False) for e in result.trace)==1
     before=len(tree.model.seen)
@@ -107,20 +124,20 @@ def test_candidates_are_distinct_closed_and_freshly_ranked():
     assert len(tree.model.seen)==before
 
 
-def test_candidate_ranking_uses_fresh_rollouts_not_root_entropy(monkeypatch):
-    original=md.rollout
-    def controlled(*a,**kw):
-        result=original(*a,**kw)
-        if kw.get('parent_analysis') is None:
-            # Independent candidate samples drive the final ranking.
-            state=a[1][0,2:]
-            score=.9 if state[2]!=MASK else .1
-            return replace(result,mean_reward=score)
-        return result
-    monkeypatch.setattr(md,'rollout',controlled)
-    result=search().run()
-    assert result.stats['selected_score']==.9
+def test_candidate_ranking_uses_cached_immediate_rewards(monkeypatch):
+    monkeypatch.setattr(md, 'rollout', lambda *a, **kw: pytest.fail('Search performed a rollout'))
+    def policy(output):
+        if (output!=MASK).sum()<2:
+            return [0,.7,.2,.1]
+        return [0,.99,.005,.005] if output[2]!=MASK else [0,.7,.2,.1]
+    tree=search(FakeModel(policy))
+    result=tree.run()
+    assert len(tree.model.seen)==1+result.stats['mcts_simulations']
     assert result.selected.state[0,4]!=MASK
+    expected=md.information_gain(result.selected.parent.analysis.total_entropy,
+                                 result.selected.analysis.total_entropy,settings().epsilon)
+    assert result.stats['selected_score']==pytest.approx(expected)
+    assert result.stats['selected_score']>result.candidates[0].mean_reward
 
 
 def test_native_sampling_uses_tokens_outside_tree_top_k():
@@ -159,7 +176,7 @@ def test_step_run_equivalence_and_json_events():
     result=stepped.result()
     assert result.trace==streamed==direct.trace
     assert torch.equal(result.selected.state,direct.selected.state)
-    assert stepped.model_calls==len(stepped.model.seen)==21
+    assert stepped.model_calls==len(stepped.model.seen)==7
     assert stepped.root.visits==result.stats['evaluated_children']==6
     assert stepped.model_calls==sum(result.stats[f'{p}_model_calls'] for p in
                                   ('tree_analysis','simulation','candidate_evaluation'))

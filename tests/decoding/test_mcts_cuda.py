@@ -46,7 +46,7 @@ def test_cuda_search_and_completion_match_cpu(root_probabilities, child_probabil
     gpu_model = ControlledModel("cuda", root_probabilities, child_probabilities)
     gpu = MCTSSearch(gpu_model, prompt, mask_id=0, gen_length=4, config=config)
     first_cycle = gpu.step()
-    assert gpu.model_calls == len(gpu_model.forward_devices) == 7
+    assert gpu.model_calls == len(gpu_model.forward_devices) == 3
     initialization = next(e for e in first_cycle if e["stage"] == "initialization")
     assert torch.device(initialization["model_device"]).type == "cuda"
     assert initialization["search_state_device"] == "cpu"

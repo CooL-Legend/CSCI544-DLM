@@ -2,7 +2,7 @@
 
 Evaluate **LLaDA-8B-Instruct**, **iLLaDA-8B-Instruct**, and **LLaDA-8B-BGPO-sudoku** on Sudoku for CSCI 544 Applied NLP. Develop locally, run inference on **Google Colab Pro**, and keep model weights and experiment artifacts in **Google Drive**.
 
-The **LLaDA and iLLaDA GSM8K notebooks** evaluate four shared decoding methods and display accuracy, inference cost, and randomly selected saved answers. LLaDA also includes the documented MEDAL reconstruction with full rollouts, candidate evaluation, and adjusted-score sampling.
+The **LLaDA and iLLaDA GSM8K notebooks** evaluate four shared decoding methods and display accuracy, inference cost, and randomly selected saved answers. LLaDA also includes the documented MEDAL reconstruction with immediate-child information gain, cached candidate ranking, and adjusted-score sampling.
 
 | Model | Notebook on `adi` | Dependency profile |
 | --- | --- | --- |
@@ -42,9 +42,9 @@ Top-K Margin, token-probability confidence decoding, and majority-vote Best-of-5
 Both LLaDA and iLLaDA use their pinned checkpoints and the same frozen GSM8K examples; the guide defines
 their accuracy, NFE, runtime and method-specific metrics.
 
-The LLaDA GSM8K notebook now has an **Accuracy, compute, and MCTS simulation comparison** section. It loads one model in a subprocess for all four baselines and MCTS caps of 4, 8, 16, 32, and 64 completed simulations. It uses shared MEDAL prompting and generation settings, saves uncertainty signals without additional forwards, and displays a paired metric table plus accuracy-versus-simulations/NFEs/time plots. The [metric definitions and commands](src/dlm_project/decoding/README.md#accuracy-compute-and-search-metrics) explain decoding-step counts, full rollout cost, and fallback behavior. Start with two examples; simulation caps are distinct from NFE caps.
+The LLaDA GSM8K notebook now has an **Accuracy, compute, and MCTS simulation comparison** section. It loads one model in a subprocess for all four baselines and MCTS caps of 4, 8, 16, 32, and 64 completed simulations. It uses shared MEDAL prompting and generation settings, saves uncertainty signals without additional forwards, and displays a paired metric table plus accuracy-versus-simulations/NFEs/time plots. The [metric definitions and commands](src/dlm_project/decoding/README.md#accuracy-compute-and-search-metrics) explain decoding-step counts, immediate-child evaluation cost, and fallback behavior. Start with two examples; simulation caps are distinct from NFE caps.
 
-The [milestone sweep guide](docs/milestone1_sweeps.md) provides two scripts using the **same pinned original LLaDA** model: GSM8K and BGPO's **4×4 dataset**. Each compares baseline, confidence-only, and fixed-branching MCTS with search caps of **128, 256 and 512 forwards**, using **full sampled rollouts and mean stepwise information gain** as explicit budget-limited MEDAL ablations. It saves frozen manifests, per-example traces/scores/compute, paired summaries, Wilson intervals, and PNG/PDF reports.
+The [milestone sweep guide](docs/milestone1_sweeps.md) provides two scripts using the **same pinned original LLaDA** model: GSM8K and BGPO's **4×4 dataset**. Each compares baseline, confidence-only, and fixed-branching MCTS with search caps of **128, 256 and 512 forwards**, using **immediate parent-to-child information gain** as explicit budget-limited MEDAL ablations. It saves frozen manifests, per-example traces/scores/compute, paired summaries, Wilson intervals, and PNG/PDF reports.
 
 ```bash
 python scripts/run_gsm8k_sweep.py --profile smoke
@@ -109,9 +109,9 @@ Each iLLaDA method streams its subprocess output, writes a unique run receipt, a
 
 The LLaDA notebook appends **MCTS initialization + confidence decoding** as a fifth method. Run its configuration, execution, and preview cells after the shared setup and benchmark configuration. It inherits the active prompt, model/cache paths, generation controls, profile, seed, and current `NUM_SAMPLES = 2` override; set that override to `None` for profile counts. Its run streams errors and selects previews through a unique receipt, displaying accuracy, random saved answers, initialization depth, fallback status, and search/completion costs.
 
-MCTS now uses the [MEDAL paper reconstruction](docs/mcts_walkthrough.md) across GSM8K, Sudoku, inspection, and sweeps. Defaults are Lc=20, C=3, K1=3, K2=5, temperature 1.0, 256 output tokens/steps/global block length, seed 1, and **no forward cap**. Full native-probability rollouts back up mean stepwise information gain; fresh candidate rollouts select the partial state, and literal adjusted-score softmax fills its remaining masks. Inline three-subtask prompting uses disjoint training/synthetic demonstrations. Gamma 10 and exploration constant 0.01 remain repository defaults, not verified author settings. Author-code parity is unverified.
+MCTS now uses the [MEDAL paper reconstruction](docs/mcts_walkthrough.md) across GSM8K, Sudoku, inspection, and sweeps. Defaults are Lc=20, C=3, K1=3, K2=5, temperature 1.0, 256 output tokens/steps/global block length, seed 1, and **no forward cap**. Each simulation evaluates one immediate child and backs up its normalized entropy reduction. Cached candidate rewards select the partial state, and literal adjusted-score softmax fills its remaining masks. Inline three-subtask prompting uses disjoint training/synthetic demonstrations. Gamma 10 and exploration constant 0.01 remain repository defaults, not verified author settings. Author-code parity is unverified.
 
-All branch simulations and candidate evaluations count as search; final completion is additional. Three default candidate evaluations cost 708 forwards and completion costs 236. A direct-path example costs **25,023 forwards**, with more possible under broader exploration. Strict candidate mode fails instead of silently falling back. Explicit finite-budget sweeps remain labeled ablations, retaining only completed simulation rewards. New artifact labels include `medal-v1`; historical runs and the four standalone decoding sections are preserved.
+Search costs one root forward plus one forward per evaluated child; candidate ranking adds no forwards. Final completion costs 236 forwards at depth 20. A direct-path example costs **335 forwards**, with more possible under broader exploration. Strict candidate mode fails instead of silently falling back. Explicit finite-budget sweeps remain labeled ablations, retaining only completed simulation rewards. New artifact labels include `medal-v2`; historical runs and the four standalone decoding sections are preserved.
 
 On a configured CUDA machine with the LLaDA dependency profile installed:
 
@@ -206,9 +206,9 @@ All search components live in [`src/dlm_project/decoding/mcts_decoding.py`](src/
 
 - `baseline`: the existing sampler, unchanged by default.
 - `confidence`: greedy confidence-adjusted decoding from an entirely masked output.
-- `mcts_entropy`: full sampled rollout MCTS and independent candidate evaluation initialize the output; literal adjusted-score sampling completes it.
+- `mcts_entropy`: MCTS with immediate-child information gain and cached candidate ranking initializes the output; literal adjusted-score sampling completes it.
 
-This is a versioned paper-based MEDAL reconstruction, with explicit choices for rollout position selection, mean stepwise reward, candidate evaluation, and completion sampling. Each action fixes one output token, but evaluation completes an independent cloned trajectory. Rewards can be negative; references and Sudoku validators never guide search. See the [function flowchart, definitions, and cost accounting](docs/mcts_walkthrough.md).
+This is a versioned paper-based MEDAL reconstruction, with explicit choices for immediate entropy-change rewards, cached candidate ranking, and completion sampling. Each action fixes one output token; evaluation performs one forward on that child and leaves its remaining masks in place. Rewards can be negative; references and Sudoku validators never guide search. See the [function flowchart, definitions, and cost accounting](docs/mcts_walkthrough.md).
 
 `predict_with_stats(...)` returns text, stats, and streamed trace events. It reuses one model for every branch, candidate, and final completion. Metrics separate tree analysis, simulation, candidate evaluation, and completion forwards and latency, plus peak allocated GPU memory. Failure preserves completed records and partial traces. Inline prompting is prepared by task runners; the standalone greedy confidence baseline retains its behavior.
 

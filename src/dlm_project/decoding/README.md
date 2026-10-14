@@ -3,7 +3,7 @@
 Four decoder modules evaluate the pinned `GSAI-ML/LLaDA-8B-Instruct` and
 `GSAI-ML/iLLaDA-8B-Instruct` checkpoints on GSM8K. They share fixed-length masked sampling, block scheduling,
 chat formatting, and strict final-answer scoring. A fifth LLaDA method adds MCTS
-initialization with full sampled rollouts, independent candidate evaluation, and adjusted-score softmax completion. These
+initialization with immediate-child information gain, cached candidate ranking, and adjusted-score softmax completion. These
 methods perform inference without training.
 
 ## Algorithms
@@ -14,7 +14,7 @@ methods perform inference without training.
 | [Top-K Margin](top_k_margin.py) | Fill positions with the largest difference between their top two token probabilities. | 256 |
 | [Confidence](confidence.py) | Fill positions whose sampled tokens have the largest model probabilities. | 256 |
 | [Best-of-5](best_of_5.py) | Generate five confidence-decoded candidates and select the most frequent normalized final answer. | 1,280 |
-| [MCTS + Confidence](mcts_confidence.py) | MEDAL reconstruction: full-rollout search, fresh candidate ranking, adjusted-score sampling. | Search calls + 256 − selected depth |
+| [MCTS + Confidence](mcts_confidence.py) | MEDAL reconstruction: immediate-child search, cached candidate ranking, adjusted-score sampling. | Search calls + 256 − selected depth |
 
 All four default to **temperature 1.0**, **256 output positions**, **256 denoising
 steps**, **128-token blocks**, and **seed 1**. Tokens are sampled using the
@@ -47,15 +47,15 @@ confidence candidates identical despite their distinct seeds.
 
 ### MEDAL paper reconstruction
 
-All MCTS paths now use the [documented MEDAL reconstruction](../../../docs/mcts_walkthrough.md), with implementation version `medal_reconstruction_v1`. The historical `mcts_confidence` and `mcts_entropy` identifiers remain available. Author-code parity is unverified.
+All MCTS paths now use the [documented MEDAL reconstruction](../../../docs/mcts_walkthrough.md), with implementation version `medal_reconstruction_v2`. The historical `mcts_confidence` and `mcts_entropy` identifiers remain available. Author-code parity is unverified.
 
-Search performs complete native-probability rollouts on cloned child states and backs up the mean stepwise information gain once per completed simulation. It collects three distinct depth-20 states, evaluates each with a fresh independently seeded rollout, and selects the highest rollout mean. Final completion starts afresh from the selected partial state and samples literal `softmax(s / temperature)` over all legal masked position-token actions, where `s = p * exp(-H) * sigmoid(gamma * margin)`. It does not use token-probability confidence completion or reuse a candidate's completed sample.
+Search performs one forward per immediate child and backs up `(S_parent - S_child) / S_parent`, using cached parent entropy and newly computed child entropy. It collects three distinct depth-20 states and selects the highest cached mean tree reward. Each candidate is a leaf evaluated once, so its mean reward equals its last-edge information gain. Candidate ranking adds no forwards. Final completion starts afresh from the selected partial state and samples literal `softmax(s / temperature)` over all legal masked position-token actions, where `s = p * exp(-H) * sigmoid(gamma * margin)`. Only this final completion fills all remaining masks.
 
-Defaults: 256 output tokens, steps and global block length; temperature 1.0; seed 1; Lc=20, C=3, K1=3, K2=5, gamma=10, exploration constant 0.01, epsilon=1e-8, and no search cap. Gamma/c are repository defaults rather than verified author parameters. Reward aggregation, native rollout position selection, fresh candidate evaluation, and completion softmax scope are explicit reconstruction assumptions.
+Defaults: 256 output tokens, steps and global block length; temperature 1.0; seed 1; Lc=20, C=3, K1=3, K2=5, gamma=10, exploration constant 0.01, epsilon=1e-8, and no search cap. Gamma/c are repository defaults rather than verified author parameters. Immediate-child reward, cached candidate ranking, and completion softmax scope are explicit reconstruction assumptions.
 
 Task runners use inline three-subtask prompting with disjoint two-shot examples. GSM8K training rows 0/1 share the frozen test revision; evaluated references never enter prompts or rewards. Low-level decoder APIs accept already prepared prompt IDs. Setting `NUM_SAMPLES=None` restores profile counts; the LLaDA notebook retains its two-question override and all four standalone sections.
 
-Strict candidate mode fails explicitly if quota/evaluation cannot finish. Finite `stop_mode: budget` runs remain labeled ablations and complete the deepest fully evaluated state, or root. Every search and candidate-evaluation forward counts against an explicit cap; unfinished simulations do not update visits. Final completion is additional. Historical runs remain readable; new directory labels include `medal-v1`.
+Strict candidate mode fails explicitly if the candidate quota cannot finish. Finite `stop_mode: budget` runs rank any collected target-depth candidates; otherwise they select the deepest evaluated state, or root. Every root/child forward counts against an explicit cap; unfinished evaluations do not update visits. Final completion is additional. Historical runs remain readable; new directory labels include `medal-v2`.
 
 ## Accuracy, compute, and search metrics
 
@@ -78,8 +78,8 @@ python scripts/run_gsm8k_metrics.py --report-only /path/to/comparison
 | Accuracy and Wilson 95% interval | Strict GSM8K exact match; malformed/empty outputs are wrong. Execution failures have no fabricated answer. |
 | Total NFEs / state evaluations | All forwards, including tree analysis, full simulations, terminal candidate scoring and completion. Batch size is recorded as 1, so these counts are equal. |
 | Wall-clock time | CUDA-synchronized inference, including tokenization, output decoding, signal reductions and compact trace writing; model loading, warm-up and report generation are recorded separately. |
-| MCTS simulations | Fully completed child rollouts and backups. Starts, interruptions, cycles and terminal candidate-evaluation rollouts are distinct. Per-invocation counts are saved as a list, and totals are per example. |
-| Decoding steps | Actual final-output commitment iterations. Best-of-5 sums all five trajectories and separately records the selected trajectory. MCTS reports final completion steps; selected tree depth and internal rollout steps are separate. |
+| MCTS simulations | Immediate-child evaluations and backups. Starts, interruptions, cycles and cached candidate rankings are distinct. Per-invocation counts are saved as a list, and totals are per example. |
+| Decoding steps | Actual final-output commitment iterations. Best-of-5 sums all five trajectories and separately records the selected trajectory. MCTS reports final completion steps and selected tree depth separately; internal rollout steps are zero. |
 | Average search depth | Mean depth of children whose simulations completed. Selected and maximum depths are also saved. |
 | Expanded nodes | Number of distinct evaluated child states, excluding root; expanded-parent and total tree-state counts are separate. |
 | Entropy and margin | Mean native full-vocabulary entropy in nats and top-two probability gap over all unresolved output positions, from existing forwards. Compact traces store scalar values, never vocabulary logits. |
@@ -102,7 +102,7 @@ Each comparison saves `setup.json`, exact run paths in `runs.json`, and individu
 incrementally saved predictions/traces. Its `report/` directory contains
 `results.csv`, `summary.csv`, `summary.json`, `plot_data.json`, `report.md`, and plots.
 Set `METRICS_NUM_SAMPLES` and `METRICS_SIMULATION_BUDGETS` in the notebook before
-launching. Start with two examples and `[4]` for the smallest full-rollout check.
+launching. Start with two examples and `[4]` for the smallest immediate-child search check.
 
 ## Python API
 
@@ -296,7 +296,7 @@ and search/completion latencies. Trace events carry `phase: search` or
 - Peak allocated CUDA memory in bytes, including resident weights; `null` on CPU.
 - Model loading time and load count, model/dataset revisions, run status, and errors.
 
-MEDAL counts tree analysis, every branch simulation, candidate evaluation, and fresh final completion. Three default candidate evaluations cost 708 forwards; completion costs 236. A direct-path example totals 25,023 forwards, and broader exploration can cost more. The walkthrough gives the formula and explicit assumptions. No CPU or smoke-run result is a reproduction of the paper's reported accuracy.
+MEDAL counts one root-analysis forward, one forward per evaluated child, and fresh final completion. Candidate ranking costs zero forwards; completion costs 236 at depth 20. A direct-path example totals 335 forwards, and broader exploration can cost more. The walkthrough gives the formula and explicit assumptions. No CPU or smoke-run result is a reproduction of the paper's reported accuracy.
 
 Latency includes prompt encoding, decoding, response decoding, and voting, with
 CUDA synchronization. It excludes model loading, dataset preparation, scoring

@@ -102,7 +102,7 @@ def test_benchmark_one_load_reference_isolation_and_cost(tmp_path, monkeypatch, 
     assert metrics["model_family"] == family
     assert metrics["accuracy"] == 1 and metrics["correct"] == metrics["processed"] == 2
     assert metrics["parse_failures"] == 0 and metrics["questions_per_second"] > 0
-    forwards = {"best_of_5": 20, "mcts_confidence": 10}.get(method, 4)
+    forwards = {"best_of_5": 20, "mcts_confidence": 5}.get(method, 4)
     assert metrics["mean_model_calls"] == forwards
     assert metrics["total_model_calls"] == len(instance.model.seen) == 2 * forwards
     records = [json.loads(line) for line in (directory / "predictions.jsonl").read_text().splitlines()]
@@ -127,11 +127,11 @@ def test_benchmark_one_load_reference_isolation_and_cost(tmp_path, monkeypatch, 
         assert records[0]["votes"] == {"1": 5}
         assert records[0]["candidate_seeds"] == [1, 2, 3, 4, 5]
     elif method == "mcts_confidence":
-        assert metrics["total_search_model_calls"] == 16
+        assert metrics["total_search_model_calls"] == 6
         assert metrics["total_completion_model_calls"] == 4
         assert metrics["fallback_count"] == 0 and metrics["mean_selected_depth"] == 2
         assert metrics["search_latency_seconds"] >= 0 and metrics["completion_latency_seconds"] >= 0
-        assert all(row["search_model_calls"] == 8 and row["completion_model_calls"] == 2
+        assert all(row["search_model_calls"] == 3 and row["completion_model_calls"] == 2
                    for row in records)
         assert "lc2-c1-k1_1-k2_1-budget8" in directory.parent.name
         assert saved["decoding"]["mcts"]["init_tokens"] == 2
@@ -175,9 +175,9 @@ def test_interruption_keeps_completed_prediction_and_metrics(tmp_path, monkeypat
     assert "controlled failure" in metrics["error"]
     assert all("REFERENCE_ONLY" not in prompt for prompt in prompts)
     if method == "mcts_confidence":
-        assert metrics["total_search_model_calls"] == 8
+        assert metrics["total_search_model_calls"] == 3
         assert metrics["total_completion_model_calls"] == 2
-        assert metrics["total_model_calls"] == len(instance.model.seen) == 10
+        assert metrics["total_model_calls"] == len(instance.model.seen) == 5
 
 
 @pytest.mark.parametrize("profile,count", [("smoke", 20), ("initial", 100), ("full", 1319)])
@@ -510,13 +510,13 @@ def test_mcts_entrypoint_failure_does_not_publish_receipt(tmp_path, monkeypatch)
     assert not receipt.exists()
 
 
-def test_interrupted_rollout_keeps_prior_record_and_active_cost_trace(tmp_path, monkeypatch):
+def test_interrupted_child_evaluation_keeps_prior_record_and_active_cost_trace(tmp_path, monkeypatch):
     monkeypatch.setattr(benchmark, 'get_manifest', lambda *a, **k: manifest())
     instance, _ = wrapper()
     class Failing(FakeModel):
         def __call__(self, ids, **kw):
-            if len(self.seen) == 12:
-                raise RuntimeError('failure during second question rollout')
+            if len(self.seen) == 7:
+                raise RuntimeError('failure during second question child evaluation')
             return super().__call__(ids, **kw)
     instance.model = Failing()
     with pytest.raises(RuntimeError, match='second question'):
@@ -524,8 +524,8 @@ def test_interrupted_rollout_keeps_prior_record_and_active_cost_trace(tmp_path, 
     directory=next(tmp_path.rglob('metrics.json')).parent
     metrics=json.loads((directory/'metrics.json').read_text())
     assert metrics['status']=='failed' and metrics['processed']==1
-    assert metrics['total_model_calls']==10
+    assert metrics['total_model_calls']==5
     assert metrics['active_prediction_model_calls']==3
     trace=[json.loads(line) for line in (directory/'traces/test_0001.jsonl').read_text().splitlines()]
     assert trace[-1]['stage']=='forward' and trace[-1]['search_model_calls']==3
-    assert not any(e['stage']=='backpropagation' for e in trace)
+    assert sum(e['stage']=='backpropagation' for e in trace)==1
