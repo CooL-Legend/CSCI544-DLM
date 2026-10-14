@@ -68,6 +68,26 @@ def test_notebook_is_valid_and_contains_no_saved_outputs(name):
     assert "Compare 128" not in source
 
 
+def test_carc_notebook_is_valid_and_uses_project_storage():
+    notebook = nbformat.read(ROOT / "notebooks/sudoku/LLaDA_Sudoku_CARC.ipynb", as_version=4)
+    nbformat.validate(notebook)
+    for index, cell in enumerate(notebook.cells):
+        if cell.cell_type == "code":
+            assert cell.outputs == []
+            assert cell.execution_count is None
+            compile(cell.source, f"carc-cell-{index}", "exec")
+    source = "\n".join(cell.source for cell in notebook.cells)
+    assert 'EXPECTED_BRANCH = "sean-carc"' in source
+    assert 'Path("/project2") / PROJECT_ACCOUNT' in source
+    assert 'os.environ["HF_DATASETS_CACHE"]' in source
+    assert "PERSISTENT_MODEL_DIR" in source
+    assert "EXPERIMENT_ROOT" in source
+    assert "google.colab" not in source
+    assert "/content" not in source
+    assert "DRIVE_ROOT" not in source
+    assert "--run-manifest" in source
+
+
 def test_yaml_files_parse():
     for path in [ROOT / "environment.yaml", ROOT / "configs/sudoku/llada.yaml", ROOT / "configs/sudoku/llada_mcts.yaml", ROOT / "configs/sudoku/illada.yaml", ROOT / ".github/workflows/checks.yaml"]:
         assert isinstance(yaml.safe_load(path.read_text()), dict)

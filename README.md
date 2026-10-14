@@ -1,12 +1,13 @@
 # CSCI544-DLM
 
-Evaluate **LLaDA-8B-Instruct**, **iLLaDA-8B-Instruct**, and **LLaDA-8B-BGPO-sudoku** on Sudoku for CSCI 544 Applied NLP. Develop locally, run inference on **Google Colab Pro**, and keep model weights and experiment artifacts in **Google Drive**.
+Evaluate **LLaDA-8B-Instruct**, **iLLaDA-8B-Instruct**, and **LLaDA-8B-BGPO-sudoku** on Sudoku for CSCI 544 Applied NLP. Develop locally and run inference on **Google Colab Pro** or **USC CARC** with persistent model weights and experiment artifacts.
 
 The **LLaDA and iLLaDA GSM8K notebooks** evaluate four shared decoding methods and display accuracy, inference cost, and randomly selected saved answers. LLaDA also includes the documented MEDAL reconstruction with immediate-child information gain, cached candidate ranking, and adjusted-score sampling.
 
-| Model | Notebook on `adi` | Dependency profile |
+| Model | Notebook | Dependency profile |
 | --- | --- | --- |
 | LLaDA | [Open LLaDA in Colab](https://colab.research.google.com/github/CooL-Legend/CSCI544-DLM/blob/adi/notebooks/sudoku/LLaDA_Sudoku_Colab.ipynb) | Transformers 4.38.2 |
+| LLaDA — USC CARC | [`LLaDA_Sudoku_CARC.ipynb`](notebooks/sudoku/LLaDA_Sudoku_CARC.ipynb) on `sean-carc` | Dedicated Python 3.11/CUDA kernel, Transformers 4.38.2 |
 | iLLaDA | [Open iLLaDA in Colab](https://colab.research.google.com/github/CooL-Legend/CSCI544-DLM/blob/adi/notebooks/sudoku/iLLaDA_Sudoku_Colab.ipynb) | Transformers 4.57.1, Tokenizers 0.22.2, Hugging Face Hub 0.36.2 |
 | Original LLaDA vs BGPO — 4×4 Sudoku | [Open comparison in Colab](https://colab.research.google.com/github/CooL-Legend/CSCI544-DLM/blob/adi/notebooks/sudoku/LLaDA_BGPO_Sudoku_Colab.ipynb) | Transformers 4.53.2 |
 | LLaDA — GSM8K decoders | [Open LLaDA GSM8K in Colab](https://colab.research.google.com/github/CooL-Legend/CSCI544-DLM/blob/adi/notebooks/gsm8k/LLaDA_GSM8K_Colab.ipynb) | Transformers 4.38.2 |
@@ -26,13 +27,13 @@ src/dlm_project/
     └── gsm8k/              # Prompt construction, answer scoring, runner
 scripts/                    # Thin command-line entry points
 configs/{sudoku,gsm8k}/      # Task settings
-notebooks/{sudoku,gsm8k}/    # Colab workflows
+notebooks/{sudoku,gsm8k}/    # Colab and CARC workflows
 requirements/               # LLaDA, iLLaDA, BGPO comparison, and test dependencies
 tests/{decoding,models,tasks,workflows}/
 docs/                       # Structure guide and MCTS walkthrough
 ```
 
-Install the package with `python -m pip install --no-deps -e .` after installing a dependency profile. The Colab notebooks do this automatically. See [the structure guide](docs/project_structure.md) for file locations, imports, and commands. Model weights and run artifacts stay outside the source package.
+Install the package with `python -m pip install --no-deps -e .` after installing a dependency profile. The Colab notebooks do this automatically; the CARC notebook expects a persistent preconfigured Jupyter kernel. See [the structure guide](docs/project_structure.md) for file locations, imports, and commands. Model weights and run artifacts stay outside the source package.
 
 ## Milestone 1 decoder sweeps
 
