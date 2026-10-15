@@ -80,6 +80,7 @@ def test_carc_notebook_is_valid_and_uses_project_storage():
     assert 'EXPECTED_BRANCH = "sean-carc"' in source
     assert 'Path("/project2/xiangren_1987/group_37/model-cache")' in source
     assert 'Path("/project2/xiangren_1987/group_37/datasets")' in source
+    assert "/project2/xiangren_1987/group_37/envs/dlm" in source
     assert "EXPERIMENT_ROOT = Path.home()" in source
     assert 'os.environ["HF_DATASETS_CACHE"]' in source
     assert "PERSISTENT_MODEL_DIR" in source
@@ -88,6 +89,7 @@ def test_carc_notebook_is_valid_and_uses_project_storage():
     assert "/content" not in source
     assert "DRIVE_ROOT" not in source
     assert "--run-manifest" in source
+    assert notebook.metadata.kernelspec.name == "dlm-carc"
 
 
 def test_yaml_files_parse():
