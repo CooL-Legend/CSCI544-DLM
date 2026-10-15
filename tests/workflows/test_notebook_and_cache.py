@@ -78,7 +78,9 @@ def test_carc_notebook_is_valid_and_uses_project_storage():
             compile(cell.source, f"carc-cell-{index}", "exec")
     source = "\n".join(cell.source for cell in notebook.cells)
     assert 'EXPECTED_BRANCH = "sean-carc"' in source
-    assert 'Path("/project2") / PROJECT_ACCOUNT' in source
+    assert 'Path("/project2/xiangren_1987/group_37/model-cache")' in source
+    assert 'Path("/project2/xiangren_1987/group_37/datasets")' in source
+    assert "EXPERIMENT_ROOT = Path.home()" in source
     assert 'os.environ["HF_DATASETS_CACHE"]' in source
     assert "PERSISTENT_MODEL_DIR" in source
     assert "EXPERIMENT_ROOT" in source
