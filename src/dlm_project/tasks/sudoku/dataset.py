@@ -1,10 +1,7 @@
 # sudoku_dataset.py
-from pathlib import Path
 import re
 
-from datasets import (Dataset as HFDataset, Features, Value,
-                      concatenate_datasets, config as datasets_config, load_dataset)
-from datasets.naming import camelcase_to_snakecase
+from datasets import Features, Value, load_dataset
 from torch.utils.data import Dataset
 
 BGPO_DATA_REVISION = "2d3e819a65b42ff5bd9cce958fb4412d57c1609d"
@@ -16,33 +13,6 @@ BGPO_PROVENANCE = {
     "source": "bgpo_4x4", "url": BGPO_DATA_URL,
     "revision": BGPO_DATA_REVISION, "split": "test", "board_size": 4,
 }
-
-SUDOKU_REPO_ID = "certen/Sudoku-1M-Puzzles"
-
-
-def _load_cached_sudoku(n, cache_dir=None):
-    """Read prepared Arrow shards without asking the Hub to resolve a config."""
-    cache_root = Path(cache_dir or datasets_config.HF_DATASETS_CACHE).expanduser()
-    namespace, name = SUDOKU_REPO_ID.split("/", 1)
-    dataset_root = cache_root / f"{namespace}___{camelcase_to_snakecase(name)}"
-    prepared = []
-    for info_path in dataset_root.glob("*/*/*/dataset_info.json"):
-        train_files = sorted(info_path.parent.glob("*-train*.arrow"))
-        if train_files:
-            prepared.append((info_path.stat().st_mtime_ns, train_files))
-    if not prepared:
-        raise FileNotFoundError(
-            f"Prepared offline cache for {SUDOKU_REPO_ID} was not found under {cache_root}. "
-            "Populate the dataset cache before starting the experiment job."
-        )
-    train_files = max(prepared, key=lambda item: item[0])[1]
-    shards = [HFDataset.from_file(str(path)) for path in train_files]
-    data = shards[0] if len(shards) == 1 else concatenate_datasets(shards)
-    if not {"puzzle", "solution"}.issubset(data.column_names):
-        raise ValueError("Cached Sudoku dataset must contain puzzle and solution columns.")
-    if len(data) < n:
-        raise ValueError(f"Cached Sudoku dataset contains {len(data)} rows; requested {n}.")
-    return data.select(range(n))
 
 
 class BGPOSudokuDataset(Dataset):
@@ -98,20 +68,16 @@ class SudokuDataset(Dataset):
     def __init__(self, n=100, cache_dir=None):
         if not isinstance(n, int) or isinstance(n, bool) or n < 1:
             raise ValueError("n must be a positive integer")
-        if datasets_config.HF_DATASETS_OFFLINE:
-            ds = _load_cached_sudoku(n, cache_dir)
-        else:
-            ds = load_dataset(
-                SUDOKU_REPO_ID,
-                split=f"train[:{n}]",
-                cache_dir=cache_dir,
-                # Boards are 81-character strings; preserve leading zeros and
-                # avoid integer overflow during initial online preparation.
-                features=Features({
-                    "puzzle": Value("string"),
-                    "solution": Value("string"),
-                }),
-            )
+        ds = load_dataset(
+            "certen/Sudoku-1M-Puzzles",
+            split=f"train[:{n}]",
+            cache_dir=cache_dir,
+            # Boards are 81-character strings; preserve leading zeros and avoid integer overflow.
+            features=Features({
+                "puzzle": Value("string"),
+                "solution": Value("string"),
+            }),
+        )
         self.data = ds
 
     def __len__(self):
