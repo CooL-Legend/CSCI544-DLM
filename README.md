@@ -34,6 +34,21 @@ docs/                       # Structure guide and MCTS walkthrough
 
 Install the package with `python -m pip install --no-deps -e .` after installing a dependency profile. The Colab notebooks do this automatically. See [the structure guide](docs/project_structure.md) for file locations, imports, and commands. Model weights and run artifacts stay outside the source package.
 
+## Single-prompt MEDAL demo
+
+Use [MEDAL_MCTS_Demo.ipynb](notebooks/gsm8k/MEDAL_MCTS_Demo.ipynb) to see the current method without running an evaluation. It loads one model from the runtime, Drive, or the pinned Hub checkpoint; shows the inline three-subtask guidance; runs MCTS initialization; and displays the top three partial-state candidates with their unmasked tokens, selection values, and root-to-candidate entropy reductions. Short cells report actual NFE by MCTS phase and synchronized wall-clock time, then complete the selected state.
+
+The completion cell reuses the same initialization and accepts `method="medal"`, an imported callable, or `"my_sampler:decode"`. Copy that cell to try a sampler implemented in your own Python module. Each sampler receives a fresh partial-state copy; the helper counts its actual forwards and checks that it preserves the prompt and initialized tokens. Setup and validation stay outside the main action cells. Decomposition is inline prompting, so its generated reasoning appears in the final response and adds no separate planning NFE.
+
+The same flow is available as a script after installing the LLaDA dependencies and package:
+
+```bash
+python scripts/demo_medal.py --model-path /path/to/LLaDA-8B-Instruct --local-files-only \
+  --prompt-file /path/to/question.txt
+```
+
+Omit `--model-path` to load the pinned Hub model, or use `--question "..."` instead of a file. `--demonstrations-path` can point to the existing Drive `manifests/gsm8k_decomposition_train.json`; otherwise the demo caches the two training examples separately. No test dataset, accuracy calculation, or evaluation artifacts are produced. See `--help` for initialization settings and `--decoding-method my_sampler:decode`.
+
 ## Milestone 1 decoder sweeps
 
 Four separate search-free GSM8K decoders and their evaluation commands are in the

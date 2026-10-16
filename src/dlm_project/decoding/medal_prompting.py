@@ -64,7 +64,13 @@ def get_gsm8k_demonstrations(path, *, revision, cache_dir=None):
 def _normalize(text):
     return re.sub(r"\s+", " ", text).strip().casefold()
 
-
+# GSM8K prompt template for MEDAL task runners, using two training demonstrations.
+# Prompt Decomposition: 
+'''
+    1. Identify the quantities and the quantity being asked for.
+    2. Calculate using the relevant quantities: <reasoning>
+    3. State the resulting quantity.
+'''
 def gsm8k_prompt(base_prompt, question, demonstrations):
     examples = demonstrations["examples"]
     if _normalize(question) in {_normalize(e["question"]) for e in examples}:

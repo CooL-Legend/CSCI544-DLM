@@ -1,0 +1,198 @@
+"""The interactive demo reuses one initialization and measures actual forwards."""
+
+import json
+from pathlib import Path
+from types import SimpleNamespace
+
+import nbformat
+import pytest
+import torch
+
+from dlm_project.decoding import medal_demo as demo
+from dlm_project.decoding.mcts_decoding import MCTSConfig
+from dlm_project.experiments.manifests import digest
+from tests.decoding.helpers import FakeModel, FakeTokenizer, MASK, PROMPT
+
+
+@pytest.fixture
+def demonstrations_path(tmp_path):
+    examples = []
+    for index in range(2):
+        content = {"question": f"Training example {index}?", "reference_solution": "1 + 1 = 2.\n#### 2"}
+        examples.append({"row_id": index, **content, "content_hash": digest(content)})
+    path = tmp_path / "gsm8k_decomposition_train.json"
+    path.write_text(json.dumps({
+        "version": "medal_inline_v1",
+        "dataset": {"repo_id": "openai/gsm8k", "subset": "main", "split": "train", "revision": "a" * 40},
+        "examples": examples,
+    }))
+    return path
+
+
+def initialize(model=None):
+    return demo.run_initialization(
+        model or FakeModel(), PROMPT, MASK, gen_length=4, seed=7,
+        mcts=MCTSConfig(init_tokens=2, num_candidates=3, top_k_tokens=2, top_k_actions=2),
+        tokenizer=FakeTokenizer(),
+    )
+
+
+def test_cached_candidate_reports_cost_no_forwards_and_explain_entropy(capsys):
+    initial = initialize()
+    model = initial.search.model
+    calls = len(model.seen)
+    rows = demo.candidate_summaries(initial)
+    assert len(rows) == 3
+    assert rows[0]["selected"]
+    assert [row["value"] for row in rows] == sorted((n.mean_reward for n in initial.result.candidates), reverse=True)
+    root_entropy = initial.search.root.analysis.total_entropy
+    for row in rows:
+        assert len(row["tokens"]) == 2
+        assert row["entropy_reduction"] == pytest.approx(root_entropy - row["entropy"])
+        assert row["relative_entropy_reduction"] == pytest.approx(0.5)
+        assert row["value"] == pytest.approx(1 / 3)  # Last edge, not the root-relative 1/2.
+        assert all(token["token_id"] != MASK for token in row["tokens"])
+    demo.show_candidates(initial)
+    demo.show_metrics(initial)
+    assert len(model.seen) == calls == 7
+    report = capsys.readouterr().out
+    assert "C1 [selected]" in report and "C2:" in report and "C3:" in report
+    assert "root-to-candidate reduction" in report
+    assert "Selection" in report and "Backpropagation" in report
+    assert "Total NFE: 7" in report
+
+
+def test_medal_completion_reuses_initialization_and_is_repeatable(capsys):
+    initial = initialize()
+    saved = initial.state.clone()
+    calls = len(initial.search.model.seen)
+    first = demo.run_completion(initial, seed=7)
+    second = demo.run_completion(initial, seed=7)
+    assert first.model_calls == second.model_calls == 2
+    assert len(initial.search.model.seen) == calls + 4
+    assert torch.equal(initial.state, saved)
+    assert torch.equal(first.token_ids, second.token_ids)
+    assert torch.equal(first.token_ids[:, :2], PROMPT)
+    assert not (first.token_ids[:, 2:] == MASK).any()
+    demo.show_metrics(initial, second)
+    assert len(initial.search.model.seen) == calls + 4
+    assert "Total NFE: 9" in capsys.readouterr().out  # One search plus this completion.
+
+
+def test_custom_module_sampler_gets_a_copy_and_cannot_misreport_nfe(tmp_path, monkeypatch):
+    (tmp_path / "custom_sampler.py").write_text('''from types import SimpleNamespace
+
+def decode(model, state, prompt_len, mask_id, config, *, seed, temperature, tokenizer):
+    model(state.to(model.device))
+    output = state[:, prompt_len:]
+    output[output == mask_id] = 3
+    return SimpleNamespace(token_ids=state, model_calls=999)
+''')
+    monkeypatch.syspath_prepend(str(tmp_path))
+    initial = initialize()
+    saved = initial.state.clone()
+    before = len(initial.search.model.seen)
+    completion = demo.run_completion(initial, method="custom_sampler:decode")
+    assert completion.model_calls == 1
+    assert len(initial.search.model.seen) == before + 1
+    assert torch.equal(initial.state, saved)
+    assert torch.equal(completion.token_ids[:, :2], PROMPT)
+    assert completion.trace == []
+
+
+@pytest.mark.parametrize("failure", ["prompt", "commitment", "masks", "shape"])
+def test_custom_sampler_output_checks_stay_inside_helper(failure):
+    initial = initialize()
+    saved = initial.state.clone()
+
+    def sampler(model, state, prompt_len, mask_id, config, **kwargs):
+        if failure == "shape":
+            return SimpleNamespace(token_ids=state[:, :-1])
+        if failure == "masks":
+            return SimpleNamespace(token_ids=state)
+        output = state[:, prompt_len:]
+        output[output == mask_id] = 1
+        if failure == "prompt":
+            state[0, 1] = 2  # A mask in the prompt must also remain untouched.
+        else:
+            position = torch.nonzero(saved[0, prompt_len:] != mask_id)[0].item()
+            state[0, prompt_len + position] = 3
+        return SimpleNamespace(token_ids=state)
+
+    with pytest.raises(ValueError, match="sampler"):
+        demo.run_completion(initial, method=sampler)
+    assert torch.equal(initial.state, saved)
+
+
+def test_entropy_increases_are_not_clamped():
+    model = FakeModel(lambda output: [0, .999, .0005, .0005] if (output == MASK).all()
+                      else [0, 1 / 3, 1 / 3, 1 / 3])
+    initial = initialize(model)
+    assert all(row["entropy_reduction"] < 0 for row in demo.candidate_summaries(initial))
+
+
+def test_prompt_reuses_frozen_training_examples_offline(demonstrations_path, monkeypatch, capsys):
+    import datasets
+    import huggingface_hub
+
+    monkeypatch.setattr(datasets, "load_dataset", lambda *a, **kw: pytest.fail("Unexpected dataset load"))
+    monkeypatch.setattr(huggingface_hub, "HfApi", lambda: pytest.fail("Unexpected network access"))
+    prompt, metadata = demo.prepare_prompt("A new question?", demonstrations_path)
+    assert "Training example 0" in prompt and "Training example 1" in prompt
+    assert "A new question?" in prompt
+    assert metadata["planning_model_calls"] == 0
+    assert metadata["demonstrations_dataset"]["split"] == "train"
+    demo.show_prompt("A new question?")
+    assert "Planning NFE: 0" in capsys.readouterr().out
+
+
+def test_cli_runs_one_question_without_an_evaluation(demonstrations_path, tmp_path, monkeypatch, capsys):
+    model, tokenizer = FakeModel(), FakeTokenizer()
+    wrapper = SimpleNamespace(model=model, tokenizer=tokenizer, mask_id=MASK,
+                              encode_prompt=lambda text: tokenizer(text).input_ids)
+    loads = []
+    monkeypatch.setattr(demo, "load_demo_model", lambda **settings: loads.append(settings) or wrapper)
+    question_file = tmp_path / "question.txt"
+    question_file.write_text("A custom question loaded from disk?")
+    monkeypatch.setattr("sys.argv", [
+        "demo_medal.py", "--model-path", "/drive/model", "--local-files-only",
+        "--prompt-file", str(question_file), "--demonstrations-path", str(demonstrations_path),
+        "--gen-length", "4", "--init-tokens", "2", "--top-k-tokens", "2", "--top-k-actions", "2",
+    ])
+    demo.main()
+    assert len(loads) == 1 and loads[0]["model_path"] == "/drive/model"
+    assert loads[0]["local_files_only"]
+    assert len(model.seen) == 9
+    output = capsys.readouterr().out
+    assert "A custom question loaded from disk?" in output
+    assert "Generated response:" in output and "Total NFE: 9" in output
+    assert "accuracy" not in output.lower()
+
+
+def test_notebook_action_cells_run_with_one_model(demonstrations_path):
+    root = Path(__file__).resolve().parents[2]
+    notebook = nbformat.read(root / "notebooks/gsm8k/MEDAL_MCTS_Demo.ipynb", as_version=4)
+    nbformat.validate(notebook)
+    for index, cell in enumerate(notebook.cells):
+        if cell.cell_type == "code":
+            assert cell.outputs == [] and cell.execution_count is None
+            compile(cell.source, f"cell-{index}", "exec")
+    # Execute the actual action cells with a controlled model, not copied orchestration.
+    model, tokenizer = FakeModel(), FakeTokenizer()
+    wrapper = SimpleNamespace(model=model, tokenizer=tokenizer, mask_id=MASK,
+                              encode_prompt=lambda text: tokenizer(text).input_ids)
+    loads = []
+    scope = {name: getattr(demo, name) for name in (
+        "prepare_prompt", "show_prompt", "run_initialization", "show_candidates", "show_metrics", "run_completion")}
+    scope.update(Path=Path, MODEL_PATH="/drive/model", QUESTION="A custom question?", PROMPT_FILE=None,
+                 DEMONSTRATIONS_PATH=demonstrations_path, os=SimpleNamespace(environ={"HF_DATASETS_CACHE": "cache"}),
+                 GEN_LENGTH=4, SEED=7, TEMPERATURE=1.0,
+                 MCTS_SETTINGS=MCTSConfig(init_tokens=2, num_candidates=3, top_k_tokens=2, top_k_actions=2),
+                 load_demo_model=lambda **kw: loads.append(kw) or wrapper)
+    start = next(i for i, cell in enumerate(notebook.cells) if cell.source.startswith("llada = load_demo_model"))
+    for cell in notebook.cells[start:]:
+        if cell.cell_type == "code":
+            assert len(cell.source.splitlines()) <= 5
+            exec(cell.source, scope)
+    assert len(loads) == 1 and len(model.seen) == 9
+    assert scope["completion"].model_calls == 2
