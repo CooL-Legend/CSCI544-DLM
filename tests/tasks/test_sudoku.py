@@ -49,6 +49,23 @@ def test_csv_preserves_81_digit_strings_and_leading_zeros(tmp_path, monkeypatch)
     assert ". . 9 . 8 3 4 . ." in sudoku_dataset.format_prompt(PUZZLE)
 
 
+def test_offline_dataset_reuses_stored_config_and_schema(monkeypatch):
+    calls = []
+
+    def cached_loader(repo_id, **kwargs):
+        calls.append((repo_id, kwargs))
+        return [{"puzzle": PUZZLE, "solution": SOLUTION}]
+
+    monkeypatch.setattr(sudoku_dataset.datasets_config, "HF_DATASETS_OFFLINE", True)
+    monkeypatch.setattr(sudoku_dataset, "load_dataset", cached_loader)
+    dataset = sudoku_dataset.SudokuDataset(n=1, cache_dir="prepared-cache")
+
+    assert dataset[0]["puzzle"] == PUZZLE
+    assert calls == [("certen/Sudoku-1M-Puzzles", {
+        "split": "train[:1]", "cache_dir": "prepared-cache",
+    })]
+
+
 def test_scoring_requires_a_complete_answer_and_does_not_truncate():
     assert score_prediction(SOLUTION, SOLUTION)["exact"] is True
     assert score_prediction("123", SOLUTION)["correct_cells"] == 0

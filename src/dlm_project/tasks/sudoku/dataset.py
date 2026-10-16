@@ -1,7 +1,7 @@
 # sudoku_dataset.py
 import re
 
-from datasets import Features, Value, load_dataset
+from datasets import Features, Value, config as datasets_config, load_dataset
 from torch.utils.data import Dataset
 
 BGPO_DATA_REVISION = "2d3e819a65b42ff5bd9cce958fb4412d57c1609d"
@@ -68,15 +68,23 @@ class SudokuDataset(Dataset):
     def __init__(self, n=100, cache_dir=None):
         if not isinstance(n, int) or isinstance(n, bool) or n < 1:
             raise ValueError("n must be a positive integer")
+        # In offline mode, datasets 5.x must discover the prepared cache by its
+        # stored config ID. Re-supplying custom features creates a different ID
+        # before Hub metadata is available, even though the Arrow cache already
+        # records these fields as strings.
+        feature_options = {} if datasets_config.HF_DATASETS_OFFLINE else {
+            "features": Features({
+                "puzzle": Value("string"),
+                "solution": Value("string"),
+            })
+        }
         ds = load_dataset(
             "certen/Sudoku-1M-Puzzles",
             split=f"train[:{n}]",
             cache_dir=cache_dir,
-            # Boards are 81-character strings; preserve leading zeros and avoid integer overflow.
-            features=Features({
-                "puzzle": Value("string"),
-                "solution": Value("string"),
-            }),
+            # Online preparation forces strings to preserve leading zeros and
+            # avoid integer overflow; offline reuse reads that cached schema.
+            **feature_options,
         )
         self.data = ds
 
