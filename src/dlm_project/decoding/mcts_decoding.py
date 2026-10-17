@@ -9,7 +9,7 @@ claimed. Trees retain compact CPU states and never accept reference answers.
 from dataclasses import asdict, dataclass, field
 import math
 import hashlib
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from time import perf_counter
 from typing import Callable
 
@@ -213,15 +213,20 @@ def _distribution(model, state, prompt_len, mask_id, config, *, legacy_entropy=F
     top_two = probabilities.topk(2, dim=-1).values
     margins = top_two[:, 0] - top_two[:, 1]
     factors = torch.exp(-h) * torch.sigmoid(config.margin_gamma * margins)
-    token_rows = _token_topk(probabilities, config.top_k_tokens, mask_id)
-    h_cpu, margins_cpu, factors_cpu = h.cpu(), margins.cpu().tolist(), factors.cpu().tolist()
-    entropies[positions] = h_cpu
-    actions = []
-    for row, position in enumerate(positions.tolist()):
-        for probability, token_id in token_rows[row]:
-            actions.append(Action(position, token_id, probability * factors_cpu[row],
-                                  probability, h_cpu[row].item(), margins_cpu[row]))
-    actions.sort(key=_action_order)
+    # Root filtering is already in tree_analysis. Split child filtering out for
+    # the demo's stage report; the existing simulation timer stays inclusive.
+    timing = (model.phase("candidate_filtering")
+              if isinstance(model, _SearchModel) and model.current_phase == "simulation" else nullcontext())
+    with timing:
+        token_rows = _token_topk(probabilities, config.top_k_tokens, mask_id)
+        h_cpu, margins_cpu, factors_cpu = h.cpu(), margins.cpu().tolist(), factors.cpu().tolist()
+        entropies[positions] = h_cpu
+        actions = []
+        for row, position in enumerate(positions.tolist()):
+            for probability, token_id in token_rows[row]:
+                actions.append(Action(position, token_id, probability * factors_cpu[row],
+                                      probability, h_cpu[row].item(), margins_cpu[row]))
+        actions.sort(key=_action_order)
     return (StateAnalysis(entropies, tuple(actions[:config.top_k_actions]), _state_key(state), margins.mean().item()),
             positions, probabilities, factors)
 
@@ -325,7 +330,8 @@ class _SearchModel:
         self.calls = 0
         self.current_phase = "tree_analysis"
         self.counts = {name: 0 for name in ("tree_analysis", "simulation", "candidate_evaluation")}
-        self.seconds = dict.fromkeys(self.counts, 0.0)
+        self.seconds = dict.fromkeys((*self.counts, "selection", "candidate_filtering",
+                                     "expansion", "backpropagation"), 0.0)
 
     def __getattr__(self, name):
         return getattr(self.model, name)
@@ -548,12 +554,14 @@ class MCTSSearch:
         return self.config.max_simulations is not None and self.simulations_completed >= self.config.max_simulations
 
     def _finish(self, reason):
-        for node in self.candidates.values():
-            self._emit("candidate_evaluation", phase="candidate_evaluation", node_id=node.node_id,
-                       reward=node.mean_reward, immediate_gain=node.immediate_reward, model_calls=0,
-                       state=state_record(node.state, self.prompt_len, self.mask_id, self.tokenizer))
-        self.stop_reason = reason
-        result = self.result()
+        with self._counted.phase("candidate_evaluation"):
+            for node in self.candidates.values():
+                self._emit("candidate_evaluation", phase="candidate_evaluation", node_id=node.node_id,
+                           reward=node.mean_reward, immediate_gain=node.immediate_reward, model_calls=0,
+                           state=state_record(node.state, self.prompt_len, self.mask_id, self.tokenizer))
+            self.stop_reason = reason
+            result = self.result()
+        result.stats["candidate_evaluation_latency_seconds"] = self._counted.seconds["candidate_evaluation"]
         self._emit("termination", **{k:v for k,v in result.stats.items() if not k.endswith("_latency_seconds")},
                    selected_state=state_record(result.selected.state, self.prompt_len, self.mask_id, self.tokenizer))
         if self.config.stop_mode == "candidates" and result.stats["fallback_used"]:
@@ -585,7 +593,8 @@ class MCTSSearch:
         if self._at_simulation_cap():
             self._finish("simulation_budget")
             return self.trace[start:]
-        parent, decisions = select_node(self.root, self.config.exploration_c)
+        with self._counted.phase("selection"):
+            parent, decisions = select_node(self.root, self.config.exploration_c)
         if parent is None:
             self._finish("frontier_exhausted")
             return self.trace[start:]
@@ -593,8 +602,9 @@ class MCTSSearch:
                    path=[0] + [hop["chosen_id"] for hop in decisions], decisions=decisions)
         parent.expanded = True
         for action in parent.analysis.actions:
-            child = expand_node(parent, action, len(self.nodes), self.prompt_len, self.mask_id, self.config.init_tokens)
-            self.nodes.append(child)
+            with self._counted.phase("expansion"):
+                child = expand_node(parent, action, len(self.nodes), self.prompt_len, self.mask_id, self.config.init_tokens)
+                self.nodes.append(child)
             self._emit("expansion", parent_id=parent.node_id, child_id=child.node_id,
                        depth=child.depth, action=action_record(action, self.tokenizer))
             self.simulations_started += 1
@@ -613,8 +623,9 @@ class MCTSSearch:
             self._emit("evaluation", parent_id=parent.node_id, child_id=child.node_id,
                        depth=child.depth, action=action_record(action, self.tokenizer),
                        child_state=state_record(child.state, self.prompt_len, self.mask_id, self.tokenizer), **evaluation)
-            self._emit("backpropagation", child_id=child.node_id, reward=evaluation["reward"],
-                       updates=backpropagate(child, evaluation["reward"]))
+            with self._counted.phase("backpropagation"):
+                updates = backpropagate(child, evaluation["reward"])
+            self._emit("backpropagation", child_id=child.node_id, reward=evaluation["reward"], updates=updates)
             if child.depth == self.config.init_tokens:
                 key = _state_key(child.state)
                 duplicate = key in self.candidates

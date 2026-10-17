@@ -169,7 +169,8 @@ def test_cli_runs_one_question_without_an_evaluation(demonstrations_path, tmp_pa
     assert "accuracy" not in output.lower()
 
 
-def test_notebook_action_cells_run_with_one_model(demonstrations_path):
+@pytest.mark.parametrize("question", ["A custom question?", demo.DEFAULT_QUESTION])
+def test_notebook_action_cells_run_with_one_model(demonstrations_path, tmp_path, question):
     root = Path(__file__).resolve().parents[2]
     notebook = nbformat.read(root / "notebooks/gsm8k/MEDAL_MCTS_Demo.ipynb", as_version=4)
     nbformat.validate(notebook)
@@ -183,8 +184,11 @@ def test_notebook_action_cells_run_with_one_model(demonstrations_path):
                               encode_prompt=lambda text: tokenizer(text).input_ids)
     loads = []
     scope = {name: getattr(demo, name) for name in (
-        "prepare_prompt", "show_prompt", "run_initialization", "show_candidates", "show_metrics", "run_completion")}
-    scope.update(Path=Path, MODEL_PATH="/drive/model", QUESTION="A custom question?", PROMPT_FILE=None,
+        "prepare_demo_prompt", "show_prompt", "run_initialization", "show_candidates", "show_metrics", "run_completion",
+        "score_answer")}
+    scope.update(Path=Path, MODEL_PATH="/drive/model", QUESTION=question, PROMPT_FILE=None,
+                 DEFAULT_QUESTION=demo.DEFAULT_QUESTION, REFERENCE_SOLUTION=None, DRIVE_ROOT=tmp_path,
+                 run_demo_batch=lambda *a, **kw: pytest.fail("Disabled batch must not run"),
                  DEMONSTRATIONS_PATH=demonstrations_path, os=SimpleNamespace(environ={"HF_DATASETS_CACHE": "cache"}),
                  GEN_LENGTH=4, SEED=7, TEMPERATURE=1.0,
                  MCTS_SETTINGS=MCTSConfig(init_tokens=2, num_candidates=3, top_k_tokens=2, top_k_actions=2),
@@ -196,3 +200,142 @@ def test_notebook_action_cells_run_with_one_model(demonstrations_path):
             exec(cell.source, scope)
     assert len(loads) == 1 and len(model.seen) == 9
     assert scope["completion"].model_calls == 2
+    assert scope["metrics"]["total_nfe"] == 9
+    assert scope["score"]["reference_answer"] == ("27" if question == demo.DEFAULT_QUESTION else None)
+    assert scope["RUN_BATCH"] is False
+
+
+def test_prompt_timing_separates_setup_and_adds_no_forwards(demonstrations_path, monkeypatch):
+    model = FakeModel()
+    wrapper = SimpleNamespace(model=model, encode_prompt=lambda text: PROMPT.clone())
+    clock = iter([10.0, 12.0, 15.0, 18.0])
+    monkeypatch.setattr(demo, "perf_counter", lambda: next(clock))
+    prompt, ids, metadata = demo.prepare_demo_prompt(wrapper, "A new question?", demonstrations_path)
+    assert "A new question?" in prompt and torch.equal(ids, PROMPT)
+    assert metadata["setup_wall_seconds"] == 3.0
+    assert metadata["prompt_wall_seconds"] == 5.0
+    assert metadata["planning_model_calls"] == 0 and model.seen == []
+
+
+def test_stage_report_charges_nested_filtering_once_and_reconciles_totals():
+    initial = initialize()
+    completion = demo.run_completion(initial)
+    initial.wall_seconds, completion.wall_seconds = 20.0, 3.0
+    initial.result.stats.update(tree_analysis_latency_seconds=1.0, simulation_latency_seconds=7.0,
+                                candidate_filtering_latency_seconds=2.0, selection_latency_seconds=.5,
+                                expansion_latency_seconds=.25, backpropagation_latency_seconds=.75,
+                                candidate_evaluation_latency_seconds=.5)
+    report = demo.show_metrics(initial, completion, prompt_seconds=2.0, setup_seconds=99.0, display=False)
+    stages = {row["substage"]: row for row in report["stages"]}
+    assert stages["Candidate generation / filtering"]["wall_seconds"] == 3.0
+    assert stages["Child evaluation / r_IG"]["wall_seconds"] == 5.0
+    assert stages["Bookkeeping / trace overhead"]["wall_seconds"] == 10.0
+    assert stages["Full rollout (disabled)"]["wall_seconds"] == stages["Full rollout (disabled)"]["nfe"] == 0
+    assert sum(row["nfe"] for row in report["stages"]) == report["total_nfe"] == 9
+    assert sum(row["wall_seconds"] for row in report["stages"]) == report["total_wall_seconds"] == 25.0
+    assert report["initialization_nfe"] == 7 and report["decoding_nfe"] == 2
+    assert report["model_evaluations"] == len(initial.search.model.seen) == 9
+    assert report["tree"]["expanded_parents"] == 3
+    assert report["tree"]["evaluated_children"] == 6
+    assert report["tree"]["unique_tree_states"] == 6
+    assert report["tree"]["average_search_depth"] == pytest.approx(10 / 6)
+    assert report["tree"]["max_evaluated_depth"] == 2
+    assert report["tree"]["realized_branching_factor"] == 2
+    assert demo.show_metrics(initial, completion, prompt_seconds=2.0, setup_seconds=99.0, display=False) == report
+    assert len(initial.search.model.seen) == 9
+    json.dumps(report, allow_nan=False)
+
+
+def test_budget_root_only_has_zero_tree_depth_and_nonnegative_exclusive_times():
+    initial = demo.run_initialization(FakeModel(), PROMPT, MASK, gen_length=4,
+                                     mcts=MCTSConfig(init_tokens=2, stop_mode="budget", max_model_calls=1))
+    report = demo.show_metrics(initial, display=False)
+    assert report["total_nfe"] == 1
+    assert report["tree"]["max_evaluated_depth"] == report["tree"]["expanded_parents"] == 0
+    assert report["tree"]["average_search_depth"] == report["tree"]["realized_branching_factor"] == 0
+    assert report["tree"]["stop_reason"] == "model_call_budget"
+    assert all(row["wall_seconds"] >= 0 for row in report["stages"])
+    assert sum(row["wall_seconds"] for row in report["stages"]) == pytest.approx(initial.wall_seconds)
+
+
+@pytest.mark.parametrize("text,reference,accuracy", [
+    ("#### 27.0", "#### 27", 1.0), ("#### 28", "#### 27", 0.0),
+    ("Answer: 27", "#### 27", 0.0), ("Answer: 27", None, None),
+])
+def test_report_scores_only_supplied_final_answers_without_inference(text, reference, accuracy):
+    initial = initialize()
+    score = demo.score_answer(text, reference)
+    report = demo.show_metrics(initial, score=score, display=False)
+    assert report["accuracy"] == accuracy
+    assert report["score"] == score
+    assert len(initial.search.model.seen) == 7
+
+
+@pytest.fixture
+def batch_inputs(demonstrations_path, monkeypatch):
+    from dlm_project.tasks.gsm8k import benchmark_dataset
+
+    manifest = {"dataset": {"revision": "a" * 40}, "examples": [
+        {"example_id": f"test:{i}", "row_id": i, "question": f"Held-out question {i}?",
+         "reference_solution": "REFERENCE_ONLY\n#### 2"} for i in range(3)]}
+    requests = []
+    monkeypatch.setattr(benchmark_dataset, "get_manifest",
+                        lambda path, **kw: requests.append((path, kw)) or manifest)
+    model, tokenizer, prompts = FakeModel(), FakeTokenizer(), []
+    decode_token = tokenizer.decode
+    outputs = iter(["#### 2", "Answer: 2", "#### 3"])
+    tokenizer.decode = lambda ids, **kw: next(outputs) if kw.get("skip_special_tokens") else decode_token(ids, **kw)
+    wrapper = SimpleNamespace(model=model, tokenizer=tokenizer, mask_id=MASK,
+                              encode_prompt=lambda text: prompts.append(text) or PROMPT.clone())
+    return wrapper, prompts, requests
+
+
+def test_optional_batch_reuses_model_pinned_first_rows_and_saves_metrics(batch_inputs, demonstrations_path, tmp_path):
+    wrapper, prompts, requests = batch_inputs
+    directory, summary = demo.run_demo_batch(
+        wrapper, demonstrations_path, tmp_path / "gsm8k_test.json", tmp_path / "results",
+        num_samples=2, gen_length=4, seed=7,
+        mcts=MCTSConfig(init_tokens=2, num_candidates=3, top_k_tokens=2, top_k_actions=2))
+    records = [json.loads(line) for line in (directory / "predictions.jsonl").read_text().splitlines()]
+    assert [row["example_id"] for row in records] == ["test:0", "test:1"]
+    assert [row["seed"] for row in records] == [7, 12]
+    assert requests[0][1]["revision"] == "a" * 40
+    assert len(wrapper.model.seen) == summary["total_nfe"] == 18
+    assert summary["status"] == "completed" and summary["processed"] == summary["requested"] == 2
+    assert summary["correct"] == 1 and summary["accuracy"] == .5
+    assert summary["mean_nfe"] == 9 and summary["mean_wall_seconds"] == summary["total_wall_seconds"] / 2
+    assert records[1]["metrics"]["score"]["parse_success"] is False
+    assert all("REFERENCE_ONLY" not in prompt for prompt in prompts)
+    assert summary["mean_tree"]["expanded_parents"] == 3
+    assert summary["max_evaluated_depth"] == 2
+    assert sum(row["nfe"] for row in summary["stages"]) == 18
+    assert sum(row["wall_seconds"] for row in summary["stages"]) == pytest.approx(summary["total_wall_seconds"])
+    assert json.loads((directory / "summary.json").read_text()) == summary
+    assert json.loads((directory / "config.json").read_text())["dataset"]["revision"] == "a" * 40
+
+
+@pytest.mark.parametrize("error,status", [(KeyboardInterrupt, "interrupted"), (RuntimeError, "failed")])
+def test_batch_keeps_completed_records_on_interruption_or_failure(
+        batch_inputs, demonstrations_path, tmp_path, monkeypatch, error, status):
+    wrapper, _, _ = batch_inputs
+    original = demo.run_completion
+    calls = []
+
+    def complete(*args, **kwargs):
+        calls.append(None)
+        if len(calls) == 2:
+            raise error("Stopped during second example")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(demo, "run_completion", complete)
+    with pytest.raises(error):
+        demo.run_demo_batch(wrapper, demonstrations_path, tmp_path / "gsm8k_test.json", tmp_path / "results",
+                            num_samples=2, gen_length=4,
+                            mcts=MCTSConfig(init_tokens=2, top_k_tokens=2, top_k_actions=2))
+    summary_path = next((tmp_path / "results").rglob("summary.json"))
+    summary = json.loads(summary_path.read_text())
+    assert summary["status"] == status and summary["processed"] == 1
+    assert summary["requested"] == 2 and summary["accuracy"] == 1
+    assert summary["total_nfe"] == 9
+    assert summary["error"].startswith(error.__name__)
+    assert len((summary_path.parent / "predictions.jsonl").read_text().splitlines()) == 1

@@ -1,7 +1,7 @@
 """Single-prompt MEDAL demo: inspect initialization, then swap the completion sampler."""
 
 import argparse
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 import importlib
 import json
 from pathlib import Path
@@ -15,7 +15,9 @@ from dlm_project.decoding.mcts_decoding import (
     information_gain, model_device,
 )
 from dlm_project.decoding.medal_prompting import get_gsm8k_demonstrations, gsm8k_prompt
+from dlm_project.experiments.artifacts import save_json
 from dlm_project.tasks.gsm8k.dataset import build_prompt
+from dlm_project.tasks.gsm8k.evaluation import score_answer
 
 
 DEFAULT_QUESTION = (
@@ -72,6 +74,7 @@ def load_demo_model(**settings):
 def prepare_prompt(question, demonstrations_path, *, revision=None, cache_dir=None,
                    instructions=DEFAULT_INSTRUCTIONS):
     """Use the current two-shot prompt without loading a test set or scoring answers."""
+    started = perf_counter()
     path = Path(demonstrations_path).expanduser()
     if revision is None:
         # Reuse the existing Drive demonstrations/revision, including offline.
@@ -83,7 +86,21 @@ def prepare_prompt(question, demonstrations_path, *, revision=None, cache_dir=No
         from huggingface_hub import HfApi
         revision = HfApi().dataset_info("openai/gsm8k").sha
     demonstrations = get_gsm8k_demonstrations(path, revision=revision, cache_dir=cache_dir)
-    return gsm8k_prompt(build_prompt(question, instructions), question, demonstrations)
+    setup_seconds = perf_counter() - started
+    prompt, metadata = gsm8k_prompt(build_prompt(question, instructions), question, demonstrations)
+    metadata["setup_wall_seconds"] = setup_seconds
+    return prompt, metadata
+
+
+def prepare_demo_prompt(wrapper, question, demonstrations_path, **settings):
+    """Time prompt rendering and tokenization separately from demonstration setup."""
+    _sync(wrapper.model)
+    started = perf_counter()
+    prompt, metadata = prepare_prompt(question, demonstrations_path, **settings)
+    prompt_ids = wrapper.encode_prompt(prompt)
+    _sync(wrapper.model)
+    metadata["prompt_wall_seconds"] = perf_counter() - started - metadata["setup_wall_seconds"]
+    return prompt, prompt_ids, metadata
 
 
 def show_prompt(question):
@@ -203,30 +220,145 @@ def run_completion(initialization, *, method="medal", seed=1, temperature=1.0,
     return DecodingResult(ids, counted.calls, seconds, name, getattr(output, "trace", []))
 
 
-def show_metrics(initialization, completion=None):
-    """Only inference costs; reading/printing this report performs no forwards."""
+def show_metrics(initialization, completion=None, *, prompt_seconds=0.0,
+                 setup_seconds=0.0, score=None, display=True):
+    """Return JSON-ready metrics; reporting and answer scoring add no forwards."""
     stats = initialization.result.stats
+    # Legacy simulation time includes filtering; move that portion to the
+    # candidate-generation row, leaving the original stats compatible.
+    filtering_seconds = stats["candidate_filtering_latency_seconds"]
     phases = [
-        ("Root analysis", stats["tree_analysis_model_calls"]),
-        ("Selection", 0),
-        ("Expansion", 0),
-        ("Simulation / child evaluation", stats["simulation_model_calls"]),
-        ("Backpropagation", 0),
-        ("Candidate ranking (cached)", stats["candidate_evaluation_model_calls"]),
+        ("Selection", 0, stats["selection_latency_seconds"]),
+        ("Candidate generation / filtering", stats["tree_analysis_model_calls"],
+         stats["tree_analysis_latency_seconds"] + filtering_seconds),
+        ("Child expansion", 0, stats["expansion_latency_seconds"]),
+        ("Child evaluation / r_IG", stats["simulation_model_calls"],
+         stats["simulation_latency_seconds"] - filtering_seconds),
+        ("Full rollout (disabled)", 0, 0.0),
+        ("Backpropagation", 0, stats["backpropagation_latency_seconds"]),
+        ("Candidate ranking (cached)", stats["candidate_evaluation_model_calls"],
+         stats["candidate_evaluation_latency_seconds"]),
     ]
-    for phase, count in phases:
-        print(f"{phase:<32} {count:>6} NFE")
-    search_nfe = stats["search_model_calls"]
-    print(f"{'Initialization total':<32} {search_nfe:>6} NFE")
-    print(f"Initialization wall clock: {initialization.wall_seconds:.3f}s | "
-          f"{stats['mcts_simulations']} child evaluations")
-    total_nfe, seconds = search_nfe, initialization.wall_seconds
+    overhead = initialization.wall_seconds - sum(seconds for _, _, seconds in phases)
+    phases.append(("Bookkeeping / trace overhead", 0, overhead))
+    rows = [{"stage": "Prompt", "substage": "Preparation / tokenization", "nfe": 0,
+             "wall_seconds": prompt_seconds}]
+    rows += [{"stage": "Initialization", "substage": name, "nfe": nfe, "wall_seconds": seconds}
+             for name, nfe, seconds in phases]
+    decoding_nfe = completion.model_calls if completion is not None else 0
+    decoding_seconds = completion.wall_seconds if completion is not None else 0.0
     if completion is not None:
-        total_nfe += completion.model_calls
-        seconds += completion.wall_seconds
-        print(f"Completion ({completion.method}): {completion.model_calls} NFE | {completion.wall_seconds:.3f}s")
-        print("Final remaining-mask entropy: 0 nats (all output positions committed).")
-    print(f"Total NFE: {total_nfe} | inference wall clock: {seconds:.3f}s", flush=True)
+        rows.append({"stage": "Decoding", "substage": f"Completion ({completion.method})",
+                     "nfe": decoding_nfe, "wall_seconds": decoding_seconds})
+    tree = {key: stats[key] for key in (
+        "expanded_parents", "evaluated_children", "unique_tree_states", "average_search_depth",
+        "realized_branching_factor", "selected_depth", "candidate_count", "candidate_target", "stop_reason")}
+    tree["max_evaluated_depth"] = max((node.depth for node in initialization.search.nodes
+                                       if node.immediate_reward is not None), default=0)
+    total_nfe = stats["search_model_calls"] + decoding_nfe
+    report = {"stages": rows, "initialization_nfe": stats["search_model_calls"],
+              "initialization_wall_seconds": initialization.wall_seconds,
+              "decoding_nfe": decoding_nfe, "decoding_wall_seconds": decoding_seconds,
+              "total_nfe": total_nfe, "model_evaluations": total_nfe, "batch_size": 1,
+              "total_wall_seconds": prompt_seconds + initialization.wall_seconds + decoding_seconds,
+              "setup_wall_seconds": setup_seconds, "tree": tree, "score": score,
+              "accuracy": float(score["exact_match"]) if score and score["exact_match"] is not None else None,
+              "prompt_token_count": initialization.search.prompt_len,
+              "timing_mode": "CUDA-synchronized" if model_device(initialization.search.model).type == "cuda" else "CPU"}
+    if display:
+        print(f"{'Stage':<16} {'Substage':<35} {'NFE':>6} {'Seconds':>10}")
+        for row in rows:
+            print(f"{row['stage']:<16} {row['substage']:<35} {row['nfe']:>6} {row['wall_seconds']:>10.6f}")
+        print(f"Initialization total: {report['initialization_nfe']} NFE | {initialization.wall_seconds:.3f}s")
+        print(f"Total NFE: {total_nfe} | pipeline wall clock: {report['total_wall_seconds']:.3f}s")
+        print(f"Demonstration setup/cache: {setup_seconds:.3f}s (separate; model loading reported above)")
+        print(f"Expanded parents: {tree['expanded_parents']} | evaluated children: {tree['evaluated_children']} | "
+              f"unique states: {tree['unique_tree_states']} | model evaluations: {total_nfe} (batch size 1)")
+        print(f"Evaluated depth (non-root): mean={tree['average_search_depth']:.3f}, "
+              f"max={tree['max_evaluated_depth']} | average branching factor={tree['realized_branching_factor']:.3f}")
+        print(f"Selected depth: {tree['selected_depth']} | candidates: {tree['candidate_count']}/{tree['candidate_target']} | "
+              f"stop: {tree['stop_reason']}")
+        if score is not None:
+            accuracy = f"{report['accuracy']:.0%} (n=1)" if report["accuracy"] is not None else "unavailable (no reference)"
+            print(f"Task accuracy: {accuracy} | parsed answer: {score['predicted_answer']}", flush=True)
+    return report
+
+
+def run_demo_batch(wrapper, demonstrations_path, manifest_path, output_dir, *, num_samples=10,
+                   gen_length=256, mcts=None, seed=1, temperature=1.0, method="medal", cache_dir=None):
+    """Optional ordered GSM8K test subset, reusing the demo's model and helpers."""
+    from dlm_project.experiments.paths import create_run_directory
+    from dlm_project.tasks.gsm8k.benchmark import example_seed
+    from dlm_project.tasks.gsm8k.benchmark_dataset import get_manifest, select_examples
+
+    config = mcts if isinstance(mcts, MCTSConfig) else MCTSConfig(**(mcts or {}))
+    config.validate_length(gen_length)
+    started = perf_counter()
+    path = Path(demonstrations_path).expanduser()
+    revision = json.loads(path.read_text())["dataset"]["revision"] if path.is_file() else None
+    manifest = get_manifest(manifest_path, cache_dir=cache_dir, revision=revision)
+    examples = select_examples(manifest, "smoke", num_samples)
+    setup_seconds = perf_counter() - started
+    directory, _ = create_run_directory({"output_dir": str(output_dir)})
+    save_json(directory / "config.json", {"mcts": asdict(config), "gen_length": gen_length,
+              "seed": seed, "temperature": temperature, "method": method if isinstance(method, str) else method.__name__,
+              "dataset": manifest["dataset"], "model": getattr(wrapper, "identity", {}),
+              "example_ids": [row["example_id"] for row in examples]})
+    records = []
+
+    def save_summary(status, error=None):
+        count = len(records)
+        metrics = [row["metrics"] for row in records]
+        correct = sum(row["accuracy"] for row in metrics)
+        stages = []
+        for index, stage in enumerate(metrics[0]["stages"] if metrics else []):
+            stages.append({**stage, "nfe": sum(row["stages"][index]["nfe"] for row in metrics),
+                           "wall_seconds": sum(row["stages"][index]["wall_seconds"] for row in metrics)})
+        summary = {"status": status, "requested": len(examples), "processed": count, "correct": int(correct),
+                   "accuracy": correct / count if count else None, "stages": stages,
+                   "total_nfe": sum(row["total_nfe"] for row in metrics),
+                   "total_wall_seconds": sum(row["total_wall_seconds"] for row in metrics),
+                   "mean_nfe": sum(row["total_nfe"] for row in metrics) / count if count else None,
+                   "mean_wall_seconds": sum(row["total_wall_seconds"] for row in metrics) / count if count else None,
+                   "totals_cover": "completed_examples",
+                   "setup_wall_seconds": setup_seconds + sum(row["setup_wall_seconds"] for row in metrics),
+                   "mean_tree": {key: sum(row["tree"][key] for row in metrics) / count if count else None
+                                 for key in ("expanded_parents", "evaluated_children", "unique_tree_states",
+                                             "average_search_depth", "realized_branching_factor")},
+                   "max_evaluated_depth": max((row["tree"]["max_evaluated_depth"] for row in metrics), default=0),
+                   "error": error}
+        save_json(directory / "summary.json", summary)
+        return summary
+
+    save_summary("running")
+    print(f"Batch results: {directory}", flush=True)
+    try:
+        with (directory / "predictions.jsonl").open("a", encoding="utf-8") as predictions:
+            for example in examples:
+                prompt, prompt_ids, metadata = prepare_demo_prompt(
+                    wrapper, example["question"], path, revision=manifest["dataset"]["revision"], cache_dir=cache_dir)
+                current_seed = example_seed(seed, example["row_id"])
+                initial = run_initialization(wrapper.model, prompt_ids, wrapper.mask_id, gen_length=gen_length,
+                                             mcts=config, seed=current_seed, tokenizer=wrapper.tokenizer)
+                completion = run_completion(initial, method=method, seed=current_seed,
+                                            temperature=temperature, tokenizer=wrapper.tokenizer)
+                text = wrapper.tokenizer.decode(completion.token_ids[0, prompt_ids.shape[1]:].tolist(), skip_special_tokens=True)
+                metrics = show_metrics(initial, completion, prompt_seconds=metadata["prompt_wall_seconds"],
+                                       setup_seconds=metadata["setup_wall_seconds"],
+                                       score=score_answer(text, example["reference_solution"]), display=False)
+                record = {"example_id": example["example_id"], "seed": current_seed,
+                          "question": example["question"], "raw_output": text, "metrics": metrics}
+                predictions.write(json.dumps(record, allow_nan=False) + "\n")
+                predictions.flush()
+                records.append(record)
+                summary = save_summary("running")
+                print(f"{example['example_id']} | accuracy={summary['accuracy']:.3f} | "
+                      f"NFE={metrics['total_nfe']} | {metrics['total_wall_seconds']:.2f}s", flush=True)
+    except BaseException as error:
+        save_summary("interrupted" if isinstance(error, KeyboardInterrupt) else "failed",
+                     f"{type(error).__name__}: {error}")
+        raise
+    return directory, save_summary("completed")
 
 
 def main():
