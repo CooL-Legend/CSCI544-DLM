@@ -377,6 +377,9 @@ class RolloutResult:
     trace: list[dict]
 
 
+_MULTINOMIAL_MAX_CATEGORIES = 2**24
+
+
 def _sample_action(analysis, positions, probabilities, factors, mask_id, generator,
                    policy, temperature):
     if policy == "native":
@@ -392,8 +395,15 @@ def _sample_action(analysis, positions, probabilities, factors, mask_id, generat
         scores = probabilities * factors[:, None]
         scores[:, mask_id] = -torch.inf
         weights = torch.softmax(scores.flatten() / temperature, dim=0)
-        flat = torch.multinomial(weights, 1, generator=generator).item()
-        row, token = divmod(flat, probabilities.shape[1])
+        if weights.numel() > _MULTINOMIAL_MAX_CATEGORIES:
+            # Same joint distribution, using two draws below PyTorch's limit:
+            # P(position, token) = P(position) * P(token | position).
+            weights = weights.view_as(scores)
+            row = torch.multinomial(weights.sum(dim=1), 1, generator=generator).item()
+            token = torch.multinomial(weights[row], 1, generator=generator).item()
+        else:
+            flat = torch.multinomial(weights, 1, generator=generator).item()
+            row, token = divmod(flat, probabilities.shape[1])
         position = positions[row].item()
     probability = probabilities[row, token].item()
     top_two = probabilities[row].topk(2).values

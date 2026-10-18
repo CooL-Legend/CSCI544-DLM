@@ -168,6 +168,65 @@ def test_literal_softmax_covers_all_legal_actions_not_log_scores(monkeypatch):
     assert r.model_calls==2 and (r.token_ids[:,2:]!=MASK).all()
 
 
+@pytest.mark.parametrize("temperature", [.2, 1.0, 2.0])
+@pytest.mark.parametrize("chosen_row", [0, 1])
+def test_large_action_sampling_preserves_joint_probabilities(monkeypatch, temperature, chosen_row):
+    # Exercise the fallback on a small, nonuniform distribution so both the
+    # position marginal and each conditional token distribution can be checked.
+    monkeypatch.setattr(md, "_MULTINOMIAL_MAX_CATEGORIES", 4)
+    probabilities = torch.tensor([[0, .9, .05, .05], [0, .4, .3, .3]])
+    factors = torch.tensor([.2, .9])
+    positions = torch.tensor([1, 4])
+    analysis = md.StateAnalysis(torch.zeros(5), (), ())
+    draws = []
+
+    def draw(weights, *args, **kwargs):
+        draws.append(weights.clone())
+        index = chosen_row if len(draws) == 1 else weights.argmax().item()
+        return torch.tensor([index])
+
+    monkeypatch.setattr(torch, "multinomial", draw)
+    action = md._sample_action(analysis, positions, probabilities, factors, MASK,
+                               torch.Generator().manual_seed(7), "adjusted_softmax", temperature)
+    scores = probabilities * factors[:, None]
+    scores[:, MASK] = -torch.inf
+    expected = torch.softmax(scores.flatten() / temperature, dim=0).view_as(scores)
+    marginal = draws[0] / draws[0].sum()
+    conditional = draws[1] / draws[1].sum()
+    assert torch.allclose(marginal, expected.sum(dim=1))
+    assert torch.allclose(marginal[chosen_row] * conditional, expected[chosen_row])
+    assert conditional[MASK] == 0
+    assert action.output_position == positions[chosen_row].item()
+    assert action.token_id == conditional.argmax().item()
+
+
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="CUDA runtime required"))])
+def test_sampling_more_than_2_to_24_actions_is_repeatable_and_excludes_mask(monkeypatch, device):
+    # 129 * 131072 exceeds the real limit; each hierarchical draw stays below it.
+    rows, vocabulary, mask_id = 129, 131072, 126336
+    probabilities = torch.full((rows, vocabulary), 1 / vocabulary, device=device)
+    positions = torch.arange(rows)
+    factors = torch.ones(rows, device=device)
+    analysis = md.StateAnalysis(torch.zeros(rows), (), ())
+    original = torch.multinomial
+    sizes = []
+
+    def draw(weights, *args, **kwargs):
+        assert weights.numel() <= 2**24
+        sizes.append(weights.numel())
+        return original(weights, *args, **kwargs)
+
+    monkeypatch.setattr(torch, "multinomial", draw)
+    actions = [md._sample_action(analysis, positions, probabilities, factors, mask_id,
+                                torch.Generator(device=device).manual_seed(7), "adjusted_softmax", 1.0)
+               for _ in range(2)]
+    assert actions[0] == actions[1]
+    assert 0 <= actions[0].output_position < rows
+    assert 0 <= actions[0].token_id < vocabulary and actions[0].token_id != mask_id
+    assert sizes == [rows, vocabulary, rows, vocabulary]
+
+
 def test_step_run_equivalence_and_json_events():
     streamed=[]
     stepped=search();stepped.on_event=streamed.append
