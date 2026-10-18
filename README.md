@@ -243,6 +243,14 @@ The parser accepts exactly 81 digits in 1–9 after removing whitespace, or a st
 
 Incomplete numeric lines remain at their original row positions in the plot. Eight rows of eight digits are labeled **Incomplete: 64/81 digits**, with the ninth row and column blank. Layouts that cannot be represented without reshaping appear as raw text. Complete invalid grids are flagged; red digits conflict with given clues.
 
+To run the original LLaDA Sudoku sampler as a no-MCTS control using only the prepared local model and dataset caches:
+
+```bash
+bash scripts/run_llada_sudoku_baseline.sh 1
+```
+
+The script detects the pinned RunPod snapshot and `/workspace/datasets` when present, otherwise it uses the CARC project paths. Set `MODEL_DIR`, `HF_DATASETS_CACHE`, or `RESULTS_DIR` to override them. It uses `configs/sudoku/llada.yaml`, forces Hugging Face offline mode, and writes the same prediction, metrics, trace, and plot artifacts under the ignored repository `results/` directory.
+
 ## Local commands
 
 Use separate Python environments for the LLaDA, iLLaDA, and BGPO comparison dependency profiles. For the existing LLaDA environment:

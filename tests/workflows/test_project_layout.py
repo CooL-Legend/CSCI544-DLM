@@ -21,6 +21,16 @@ def test_carc_batch_writes_to_ignored_repository_results():
     assert "/results/" in ignored
 
 
+def test_pure_llada_sudoku_script_is_offline_and_does_not_use_mcts():
+    script = (ROOT / "scripts/run_llada_sudoku_baseline.sh").read_text()
+    assert 'CONFIG_FILE="$REPO_DIR/configs/sudoku/llada.yaml"' in script
+    assert "llada_mcts.yaml" not in script
+    assert "HF_HUB_OFFLINE=1" in script
+    assert "HF_DATASETS_OFFLINE=1" in script
+    assert "--local-files-only" in script
+    assert 'RESULTS_DIR="${RESULTS_DIR:-$REPO_DIR/results}"' in script
+
+
 @pytest.mark.parametrize("script", [
     "cache_model.py", "run_sudoku.py", "run_illada_sudoku.py",
     "run_gsm8k.py", "inspect_mcts.py", "compare_generation.py",
