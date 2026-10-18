@@ -3,6 +3,7 @@ import json
 import pytest
 import torch
 from dlm_project.decoding import mcts_decoding as md
+from dlm_project.decoding import mcts_confidence
 from tests.decoding.helpers import FakeModel, FakeTokenizer, MASK, PROMPT
 
 
@@ -31,6 +32,30 @@ def test_epsilon_entropy_and_confidence_filtering():
     assert [(a.output_position,a.token_id) for a in analysis.actions]==[(i,v) for _,i,v in expected]
     assert all(a.token_id!=MASK for a in analysis.actions)
     assert len(model.seen)==1
+
+
+def test_search_excludes_terminal_tokens_but_dlm_completion_can_generate_them():
+    class TerminalTokenizer(FakeTokenizer):
+        def get_vocab(self):
+            return {"[MASK]": 0, "<|endoftext|>": 1, "<|eot_id|>": 2, "3": 3}
+
+        def decode(self, ids, **kwargs):
+            return "".join({0: "[MASK]", 1: "<|endoftext|>",
+                            2: "<|eot_id|>", 3: "3"}[i] for i in ids)
+
+    result = mcts_confidence.decode(
+        FakeModel(), PROMPT, MASK, gen_length=4, steps=4, block_length=4,
+        temperature=0.0, seed=1,
+        mcts=md.MCTSConfig(init_tokens=1, num_candidates=1, top_k_tokens=3,
+                           top_k_actions=1, completion_policy="dlm"),
+        tokenizer=TerminalTokenizer(),
+    )
+    initialization = result.details["selected_initialization"]
+    assert initialization["committed"][0]["token_id"] == 3
+    assert result.details["search_excluded_tokens"] == list(md.MCTS_EXCLUDED_TOKENS)
+    assert result.details["search_excluded_token_ids"] == [1, 2]
+    # The filter belongs only to tree initialization; DLM remains unrestricted.
+    assert sorted(result.token_ids[0, PROMPT.shape[1]:].tolist()) == [1, 1, 1, 3]
 
 
 def test_uct_and_backups_are_per_evaluated_child():
