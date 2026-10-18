@@ -17,11 +17,13 @@ dist/
 .env.*
 !.env.example
 
-# Downloaded data, model weights, caches, and experiment outputs
+# Downloaded data, model weights, and caches
 .cache/
 .firecrawl/
 /models/
 /data/
+
+# Generated experiment outputs (including CARC batch runs)
 /results/
 *.safetensors
 *.pt

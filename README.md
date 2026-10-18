@@ -13,7 +13,7 @@ The **LLaDA and iLLaDA GSM8K notebooks** evaluate four shared decoding methods a
 | LLaDA — GSM8K decoders | [Open LLaDA GSM8K in Colab](https://colab.research.google.com/github/CooL-Legend/CSCI544-DLM/blob/adi/notebooks/gsm8k/LLaDA_GSM8K_Colab.ipynb) | Transformers 4.38.2 |
 | iLLaDA — GSM8K decoders | [Open iLLaDA GSM8K in Colab](https://colab.research.google.com/github/CooL-Legend/CSCI544-DLM/blob/adi/notebooks/gsm8k/iLLaDA_GSM8K_Colab.ipynb) | Transformers 4.57.1, Tokenizers 0.22.2, Hugging Face Hub 0.36.2 |
 
-The CARC notebook uses the existing `/project2/xiangren_1987/group_37/envs/dlm` environment, stores the LLaDA snapshot in `/project2/xiangren_1987/group_37/model-cache`, the Sudoku dataset cache in `/project2/xiangren_1987/group_37/datasets`, and experiment runs under `~/LLaDA/Sudoku`.
+The CARC workflow uses the existing `/project2/xiangren_1987/group_37/envs/dlm` environment, stores the LLaDA snapshot in `/project2/xiangren_1987/group_37/model-cache`, the Sudoku dataset cache in `/project2/xiangren_1987/group_37/datasets`, and batch experiment runs under the repository's ignored `results/` directory.
 
 This repository is private. Authorize Colab to read it through GitHub, or download the desired notebook and use **File → Upload notebook**. An older notebook copy saved in Drive does not automatically receive repository changes. Both GSM8K notebooks check out `adi` and display its commit before running.
 

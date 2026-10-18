@@ -14,6 +14,13 @@ import yaml
 from dlm_project.paths import PROJECT_ROOT as ROOT
 
 
+def test_carc_batch_writes_to_ignored_repository_results():
+    script = (ROOT / "scripts/run_carc_llada_sudoku.sbatch").read_text()
+    ignored = (ROOT / ".gitignore").read_text().splitlines()
+    assert 'RESULTS_DIR="${RESULTS_DIR:-$REPO_DIR/results}"' in script
+    assert "/results/" in ignored
+
+
 @pytest.mark.parametrize("script", [
     "cache_model.py", "run_sudoku.py", "run_illada_sudoku.py",
     "run_gsm8k.py", "inspect_mcts.py", "compare_generation.py",

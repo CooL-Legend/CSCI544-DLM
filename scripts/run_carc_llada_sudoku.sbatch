@@ -17,7 +17,7 @@ set -euo pipefail
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MODEL_DIR="${MODEL_DIR:-/project2/xiangren_1987/group_37/model-cache}"
 DATASET_DIR="${HF_DATASETS_CACHE:-/project2/xiangren_1987/group_37/datasets}"
-RESULTS_DIR="${RESULTS_DIR:-$HOME/LLaDA/Sudoku}"
+RESULTS_DIR="${RESULTS_DIR:-$REPO_DIR/results}"
 NUM_SAMPLES="${1:-${NUM_SAMPLES:-1}}"
 
 mkdir -p "$RESULTS_DIR"

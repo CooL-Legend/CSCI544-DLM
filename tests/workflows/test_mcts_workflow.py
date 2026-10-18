@@ -10,6 +10,7 @@ import torch
 
 from dlm_project.models.llada import LLaDA
 from dlm_project.experiments.paths import experiment_name
+from dlm_project.tasks.sudoku import runner as sudoku_runner
 from dlm_project.tasks.sudoku.inspect_mcts import inspect_puzzle
 from dlm_project.decoding.mcts_decoding import MCTSConfig, MCTSSearch, resolve_decoding
 from dlm_project.experiments.config import load_config, validate_config
@@ -130,6 +131,36 @@ def test_runner_saves_resolved_config_search_stats_and_matching_trace(tmp_path):
     assert events[-1]["text"] == record["raw_output"]
     assert summary["status"] == "completed"
     assert (run_dir / record["plot_file"]).is_file()
+
+
+def test_runner_progress_tracks_maximum_mcts_depth_and_candidates(tmp_path, monkeypatch):
+    bars = []
+
+    class FakeBar:
+        def __init__(self, **options):
+            self.options = options
+            self.n = 0
+            self.postfixes = []
+            self.closed = False
+            bars.append(self)
+
+        def set_postfix(self, refresh=True, **values):
+            self.postfixes.append(values)
+
+        def update(self, amount):
+            self.n += amount
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(sudoku_runner, "tqdm", FakeBar)
+    run_experiment(tiny_config(tmp_path), [{"puzzle": "0" * 81, "solution": "1" * 81}], wrapper())
+
+    assert len(bars) == 1
+    assert bars[0].options["total"] == bars[0].n == 2
+    assert bars[0].options["unit"] == "layer"
+    assert bars[0].closed is True
+    assert any(postfix["candidates"] == "3/3" for postfix in bars[0].postfixes)
 
 
 def test_interrupted_search_flushes_prior_trace_events(tmp_path):

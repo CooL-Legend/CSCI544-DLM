@@ -7,6 +7,8 @@ from pathlib import Path
 import copy
 import subprocess
 
+from tqdm.auto import tqdm
+
 from dlm_project.experiments.config import load_config, validate_config
 from dlm_project.experiments.artifacts import save_json
 from dlm_project.experiments.paths import DEFAULT_TIMEZONE, create_run_directory, experiment_name
@@ -16,6 +18,50 @@ from dlm_project.tasks.sudoku.evaluation import is_valid_sudoku, preserves_clues
 from dlm_project.decoding.medal_prompting import sudoku_prompt
 from dlm_project.experiments.manifests import digest
 from dlm_project.paths import PROJECT_ROOT as ROOT
+
+
+def _mcts_progress(decoding, puzzle_index):
+    """Track maximum completed tree depth; MCTS may evaluate many branches per depth."""
+    settings = decoding["mcts"]
+    target_depth = settings["init_tokens"]
+    target_candidates = settings["num_candidates"]
+    bar = tqdm(
+        total=target_depth,
+        desc=f"Puzzle {puzzle_index:03d} MCTS depth",
+        unit="layer",
+        dynamic_ncols=True,
+        mininterval=1.0,
+    )
+    state = {"max_depth": 0, "candidates": 0, "closed": False}
+    bar.set_postfix(candidates=f"0/{target_candidates}", calls=0, refresh=True)
+
+    def close():
+        if not state["closed"]:
+            bar.close()
+            state["closed"] = True
+
+    def update(event):
+        if state["closed"]:
+            return
+        stage = event.get("stage")
+        depth = event.get("max_depth") if stage == "termination" else event.get("depth")
+        if isinstance(depth, int):
+            state["max_depth"] = max(state["max_depth"], min(depth, target_depth))
+        candidate_count = event.get("candidate_count")
+        if isinstance(candidate_count, int):
+            state["candidates"] = candidate_count
+        advance = state["max_depth"] - bar.n
+        bar.set_postfix(
+            candidates=f"{state['candidates']}/{target_candidates}",
+            calls=event.get("search_model_calls", 0),
+            refresh=stage in {"candidate", "termination"} and advance <= 0,
+        )
+        if advance > 0:
+            bar.update(advance)
+        if stage == "termination":
+            close()
+
+    return update, close
 
 
 def run_experiment(config, dataset, model):
@@ -79,17 +125,25 @@ def run_experiment(config, dataset, model):
                     trace_file = f"traces/puzzle_{index:03d}.jsonl"
                     (run_dir / "traces").mkdir(exist_ok=True)
                     decoding = {**config["decoding"], "seed": (config["decoding"]["seed"] + index) % 2**63}
+                    update_progress = lambda event: None
+                    close_progress = lambda: None
+                    if decoding["method"] == "mcts_entropy":
+                        update_progress, close_progress = _mcts_progress(decoding, index)
                     with (run_dir / trace_file).open("w") as trace_handle:
                         def save_event(event):
                             trace_handle.write(json.dumps(event, allow_nan=False) + "\n")
                             trace_handle.flush()
                             summary["active_prediction_model_calls"] = event.get("generation_nfes",
                                 event.get("search_model_calls", event.get("stats", {}).get("total_model_calls", 0)))
+                            update_progress(event)
 
-                        prediction = model.predict_with_stats(
-                            prompt, **config["generation"],
-                            decoding=decoding, on_event=save_event,
-                        )
+                        try:
+                            prediction = model.predict_with_stats(
+                                prompt, **config["generation"],
+                                decoding=decoding, on_event=save_event,
+                            )
+                        finally:
+                            close_progress()
                     output, stats = prediction["text"], prediction["stats"]
                 else:
                     if config["decoding"]["method"] != "baseline":
