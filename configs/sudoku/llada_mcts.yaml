@@ -8,6 +8,9 @@ model:
   device: cuda
   dtype: bfloat16
   local_files_only: false
+prompt:
+  # Keep the task's strict 81-digit answer instruction; do not add reasoning demos.
+  medal_decomposition: false
 generation:
   steps: 256
   gen_length: 256

@@ -53,7 +53,7 @@ Search performs one forward per immediate child and backs up `(S_parent - S_chil
 
 Defaults: 256 output tokens, steps and global block length; temperature 1.0; seed 1; Lc=20, C=3, K1=3, K2=5, gamma=10, exploration constant 0.01, epsilon=1e-8, and no search cap. Gamma/c are repository defaults rather than verified author parameters. Immediate-child reward, cached candidate ranking, and completion softmax scope are explicit reconstruction assumptions.
 
-Task runners use inline three-subtask prompting with disjoint two-shot examples. GSM8K training rows 0/1 share the frozen test revision; evaluated references never enter prompts or rewards. Low-level decoder APIs accept already prepared prompt IDs. Setting `NUM_SAMPLES=None` restores profile counts; the LLaDA notebook retains its two-question override and all four standalone sections.
+Task runners can use inline three-subtask prompting with disjoint two-shot examples. The RunPod Sudoku configuration disables it to preserve the task's strict 81-digit-only response contract. GSM8K training rows 0/1 share the frozen test revision; evaluated references never enter prompts or rewards. Low-level decoder APIs accept already prepared prompt IDs. Setting `NUM_SAMPLES=None` restores profile counts; the LLaDA notebook retains its two-question override and all four standalone sections.
 
 Strict candidate mode fails explicitly if the candidate quota cannot finish. Finite `stop_mode: budget` runs rank any collected target-depth candidates; otherwise they select the deepest evaluated state, or root. Every root/child forward counts against an explicit cap; unfinished evaluations do not update visits. Final completion is additional. Historical runs remain readable; new directory labels include `medal-v2`.
 

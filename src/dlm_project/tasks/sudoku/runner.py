@@ -64,11 +64,23 @@ def _mcts_progress(decoding, puzzle_index):
     return update, close
 
 
+def _use_medal_decomposition(config):
+    """Resolve the optional Sudoku prompt augmentation without mutating config."""
+    prompt = config.get("prompt", {})
+    if not isinstance(prompt, dict):
+        raise ValueError("prompt must be a mapping.")
+    enabled = prompt.get("medal_decomposition", config["decoding"]["method"] == "mcts_entropy")
+    if type(enabled) is not bool:
+        raise ValueError("prompt.medal_decomposition must be boolean.")
+    return enabled
+
+
 def run_experiment(config, dataset, model):
     from dlm_project.tasks.sudoku.visualization import save_prediction_plot
 
     config = copy.deepcopy(config)
     config["decoding"] = resolve_decoding(config.get("decoding"), config["generation"])
+    use_decomposition = _use_medal_decomposition(config)
     config["data"]["num_samples"] = len(dataset)
     board_size = 4 if config["data"].get("source") == "bgpo_4x4" else 9
     family = config["model"].setdefault("family", "llada")
@@ -118,7 +130,7 @@ def run_experiment(config, dataset, model):
                 item = dataset[index]
                 base_prompt = prompt = item_prompt(item)
                 decomposition = None
-                if config["decoding"]["method"] == "mcts_entropy":
+                if config["decoding"]["method"] == "mcts_entropy" and use_decomposition:
                     prompt, decomposition = sudoku_prompt(base_prompt, board_size, item["puzzle"])
                 trace_file, stats = None, None
                 if hasattr(model, "predict_with_stats"):

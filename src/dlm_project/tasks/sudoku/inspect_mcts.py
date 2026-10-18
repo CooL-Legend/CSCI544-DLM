@@ -12,6 +12,7 @@ from dlm_project.experiments.config import load_config, validate_config
 from dlm_project.paths import PROJECT_ROOT as ROOT
 from dlm_project.tasks.sudoku.dataset import format_prompt
 from dlm_project.decoding.medal_prompting import sudoku_prompt
+from dlm_project.tasks.sudoku.runner import _use_medal_decomposition
 
 
 def inspect_puzzle(wrapper, puzzle, config, phase, trace_path):
@@ -42,7 +43,9 @@ def inspect_puzzle(wrapper, puzzle, config, phase, trace_path):
         emit({"stage": "metadata", "phase": phase, "puzzle": puzzle,
               "generation": config["generation"], "decoding": options,
               "model": getattr(wrapper, "identity", None)})
-        effective_prompt, decomposition = sudoku_prompt(format_prompt(puzzle), 9, puzzle)
+        effective_prompt, decomposition = format_prompt(puzzle), None
+        if _use_medal_decomposition({**config, "decoding": options}):
+            effective_prompt, decomposition = sudoku_prompt(effective_prompt, 9, puzzle)
         emit({"stage": "prompt", "effective_prompt": effective_prompt, "decomposition": decomposition})
         prompt = wrapper.encode_prompt(effective_prompt)
         search = MCTSSearch(wrapper.model, prompt, wrapper.mask_id,

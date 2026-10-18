@@ -98,6 +98,10 @@ def test_inspection_jsonl_contains_actual_events_and_no_completion(tmp_path, pha
     result = inspect_puzzle(instance, "0" * 81, tiny_config(tmp_path), phase, trace_path)
     events = [json.loads(line) for line in trace_path.read_text().splitlines()]
     assert events[0]["stage"] == "metadata"
+    prompt_event = next(event for event in events if event["stage"] == "prompt")
+    assert "return only the completed sudoku as exactly 81 digits" in prompt_event["effective_prompt"].lower()
+    assert "three short subtasks" not in prompt_event["effective_prompt"]
+    assert prompt_event["decomposition"] is None
     assert events[-1]["stage"] == "inspection"
     assert events[-1]["completion_model_calls"] == 0
     assert events[-1]["model_device"] == events[-1]["search_state_device"] == "cpu"
@@ -121,6 +125,9 @@ def test_runner_saves_resolved_config_search_stats_and_matching_trace(tmp_path):
     assert len(record["raw_output"]) > 0  # Unmodified, unparseable output remains visible.
     assert record["parse_success"] is False
     assert record["decoding_method"] == "mcts_entropy"
+    assert record["prompt"] == record["base_prompt"]
+    assert record["effective_prompt_hash"] == record["base_prompt_hash"]
+    assert record["decomposition"] is None
     assert stats["selected_depth"] == 2 and stats["candidate_count"] == 3
     assert stats["mcts_config"] == saved["decoding"]["mcts"]
     assert stats["search_model_calls"] == summary["search_model_calls"] == 7
