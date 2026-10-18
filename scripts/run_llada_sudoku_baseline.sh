@@ -7,7 +7,7 @@ set -euo pipefail
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RUNPOD_MODEL="/workspace/model-cache/huggingface/hub/models--GSAI-ML--LLaDA-8B-Instruct/snapshots/08b83a6feb34df1a6011b80c3c00c7563e963b07"
 CARC_MODEL="/project2/xiangren_1987/group_37/model-cache"
-if [[ -z "${MODEL_DIR:-}" ]]; then
+if [[ -z "${MODEL_DIR:-}" || "$MODEL_DIR" == "GSAI-ML/LLaDA-8B-Instruct" ]]; then
     if [[ -d "$RUNPOD_MODEL" ]]; then
         MODEL_DIR="$RUNPOD_MODEL"
     else

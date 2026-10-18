@@ -29,6 +29,7 @@ def test_pure_llada_sudoku_script_is_offline_and_does_not_use_mcts():
     assert "HF_DATASETS_OFFLINE=1" in script
     assert "--local-files-only" in script
     assert 'RESULTS_DIR="${RESULTS_DIR:-$REPO_DIR/results}"' in script
+    assert '"$MODEL_DIR" == "GSAI-ML/LLaDA-8B-Instruct"' in script
 
 
 @pytest.mark.parametrize("script", [

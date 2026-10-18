@@ -49,6 +49,42 @@ def test_csv_preserves_81_digit_strings_and_leading_zeros(tmp_path, monkeypatch)
     assert ". . 9 . 8 3 4 . ." in sudoku_dataset.format_prompt(PUZZLE)
 
 
+def test_offline_dataset_reads_prepared_arrow_without_config_resolution(tmp_path, monkeypatch):
+    class CachedDataset:
+        column_names = ["puzzle", "solution"]
+
+        def __init__(self, rows):
+            self.rows = rows
+
+        def __len__(self):
+            return len(self.rows)
+
+        def __getitem__(self, index):
+            return self.rows[index]
+
+        def select(self, indices):
+            return CachedDataset([self.rows[index] for index in indices])
+
+    monkeypatch.setattr(sudoku_dataset.datasets_config, "HF_DATASETS_OFFLINE", True)
+    monkeypatch.setattr(sudoku_dataset.HFDataset, "from_file", staticmethod(
+        lambda path: CachedDataset([{"puzzle": PUZZLE, "solution": SOLUTION}])
+    ))
+    monkeypatch.setattr(sudoku_dataset, "load_dataset", lambda *args, **kwargs: pytest.fail(
+        "Offline loading must not resolve the Hub dataset config."
+    ))
+    cache = tmp_path / "prepared-cache"
+    normalized = sudoku_dataset.camelcase_to_snakecase("Sudoku-1M-Puzzles")
+    prepared = cache / f"certen___{normalized}" / "default-cache" / "0.0.0" / "hash"
+    prepared.mkdir(parents=True)
+    (prepared / "dataset_info.json").write_text("{}")
+    (prepared / "data-train.arrow").touch()
+
+    dataset = sudoku_dataset.SudokuDataset(n=1, cache_dir=cache)
+
+    assert dataset[0]["puzzle"] == PUZZLE
+    assert dataset[0]["solution"] == SOLUTION
+
+
 def test_scoring_requires_a_complete_answer_and_does_not_truncate():
     assert score_prediction(SOLUTION, SOLUTION)["exact"] is True
     assert score_prediction("123", SOLUTION)["correct_cells"] == 0
