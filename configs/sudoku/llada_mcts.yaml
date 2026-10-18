@@ -18,10 +18,10 @@ decoding:
   method: mcts_entropy
   seed: 1
   mcts:
-    init_tokens: 20
-    num_candidates: 3
+    init_tokens: 10
+    num_candidates: 1
     top_k_tokens: 3
-    top_k_actions: 5
+    top_k_actions: 2
     max_model_calls: null
     margin_gamma: 10.0
     exploration_c: 0.01
