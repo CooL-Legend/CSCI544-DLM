@@ -483,7 +483,7 @@ def test_mcts_entrypoint_defaults_and_receipt(tmp_path, monkeypatch):
         "init_tokens": 20, "num_candidates": 3, "top_k_tokens": 3, "top_k_actions": 5,
         "max_model_calls": None, "margin_gamma": 10.0, "exploration_c": .01,
         "max_simulations": None,
-        "epsilon": 1e-8, "stop_mode": "candidates",
+        "epsilon": 1e-8, "stop_mode": "candidates", "completion_policy": "adjusted_softmax",
     }
     assert json.loads(receipt.read_text()) == {"run_dir": str(tmp_path / "exact-run"),
         "status": "completed", "model_family": "llada", "method": "mcts_confidence", "profile": "smoke"}

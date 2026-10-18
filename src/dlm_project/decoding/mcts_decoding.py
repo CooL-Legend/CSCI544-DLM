@@ -1,9 +1,10 @@
 """Documented reconstruction of MEDAL Algorithms 1 and 2.
 
-Immediate parent-to-child information gain, cached candidate ranking,
-and literal adjusted-score softmax completion. The interpretation
-choices are exported in RECONSTRUCTION_ASSUMPTIONS; author-code parity is not
-claimed. Trees retain compact CPU states and never accept reference answers.
+Immediate parent-to-child information gain and cached candidate ranking are
+followed by a recorded choice of adjusted-score or standard DLM completion.
+Interpretation choices are exported in reconstruction metadata; author-code
+parity is not claimed. Trees retain compact CPU states and never accept
+reference answers.
 """
 
 from dataclasses import asdict, dataclass, field
@@ -29,10 +30,13 @@ class MCTSConfig:
     exploration_c: float = 0.01
     epsilon: float = 1e-8
     stop_mode: str = "candidates"
+    completion_policy: str = "adjusted_softmax"
 
     def __post_init__(self):
         if self.stop_mode not in ("candidates", "budget"):
             raise ValueError("mcts.stop_mode must be candidates or budget.")
+        if self.completion_policy not in ("adjusted_softmax", "dlm"):
+            raise ValueError("mcts.completion_policy must be adjusted_softmax or dlm.")
         for name in ("init_tokens", "num_candidates", "top_k_tokens",
                      "top_k_actions"):
             if type(getattr(self, name)) is not int or getattr(self, name) < 1:
@@ -81,8 +85,11 @@ def resolve_decoding(decoding=None, generation=None):
         if method == "confidence" and generation["temperature"] != 0:
             raise ValueError("Greedy confidence requires temperature = 0.")
         if method == "mcts_entropy":
-            if generation["temperature"] <= 0 or not math.isfinite(generation["temperature"]):
-                raise ValueError("MEDAL completion requires positive temperature (default 1.0).")
+            temperature = generation["temperature"]
+            if temperature < 0 or not math.isfinite(temperature):
+                raise ValueError("MCTS completion requires finite nonnegative temperature.")
+            if config.completion_policy == "adjusted_softmax" and temperature == 0:
+                raise ValueError("Adjusted-softmax completion requires positive temperature.")
             config.validate_length(length)
     return {"method": method, "seed": seed, "mcts": asdict(config)}
 
@@ -297,6 +304,16 @@ RECONSTRUCTION_ASSUMPTIONS = {
     "quota": "stop immediately at first C distinct depth-Lc states",
     "constants": "gamma=10 and exploration_c=0.01 are repository defaults, not verified author settings",
 }
+
+
+def reconstruction_assumptions(config):
+    assumptions = dict(RECONSTRUCTION_ASSUMPTIONS)
+    if config.completion_policy == "dlm":
+        assumptions["completion"] = (
+            "standard DLM low-confidence denoising from the selected partial state; "
+            "all MCTS commitments remain fixed"
+        )
+    return assumptions
 
 
 def derive_seed(seed, phase, identifier=0):
@@ -586,7 +603,8 @@ class MCTSSearch:
                        mean_token_entropy=self.root.analysis.total_entropy / (self.root.state.shape[1] - self.prompt_len),
                        mean_confidence_margin=self.root.analysis.mean_margin,
                        signal_nfe=self.model_calls, signal_extra_nfes=0,
-                       implementation_version=IMPLEMENTATION_VERSION, assumptions=RECONSTRUCTION_ASSUMPTIONS,
+                       implementation_version=IMPLEMENTATION_VERSION,
+                       assumptions=reconstruction_assumptions(self.config),
                        model_device=str(model_device(self.model)), search_state_device="cpu",
                        entropies=self.root.analysis.entropies.tolist(),
                        state=state_record(self.root.state, self.prompt_len, self.mask_id, self.tokenizer),
@@ -662,7 +680,7 @@ class MCTSSearch:
         fallback = self.done and not complete
         parents = len({node.parent.node_id for node in evaluated})
         stats = {"implementation_version": IMPLEMENTATION_VERSION, "paper_url": PAPER_URL,
-                 "reconstruction_assumptions": dict(RECONSTRUCTION_ASSUMPTIONS),
+                 "reconstruction_assumptions": reconstruction_assumptions(self.config),
                  "evaluation_variant": "budget-limited MEDAL reconstruction (immediate-child IG)" if self.config.stop_mode == "budget"
                  else "MEDAL reconstruction (immediate-child IG)",
                  "finished": self.done, "stop_reason": self.stop_reason, "stop_mode": self.config.stop_mode,

@@ -14,7 +14,7 @@ methods perform inference without training.
 | [Top-K Margin](top_k_margin.py) | Fill positions with the largest difference between their top two token probabilities. | 256 |
 | [Confidence](confidence.py) | Fill positions whose sampled tokens have the largest model probabilities. | 256 |
 | [Best-of-5](best_of_5.py) | Generate five confidence-decoded candidates and select the most frequent normalized final answer. | 1,280 |
-| [MCTS + Confidence](mcts_confidence.py) | MEDAL reconstruction: immediate-child search, cached candidate ranking, adjusted-score sampling. | Search calls + 256 − selected depth |
+| [MCTS + Confidence](mcts_confidence.py) | MEDAL reconstruction: immediate-child search and cached candidate ranking, followed by adjusted-score or standard DLM completion. | Search calls + remaining masks |
 
 All four default to **temperature 1.0**, **256 output positions**, **256 denoising
 steps**, **128-token blocks**, and **seed 1**. Tokens are sampled using the
@@ -49,7 +49,7 @@ confidence candidates identical despite their distinct seeds.
 
 All MCTS paths now use the [documented MEDAL reconstruction](../../../docs/mcts_walkthrough.md), with implementation version `medal_reconstruction_v2`. The historical `mcts_confidence` and `mcts_entropy` identifiers remain available. Author-code parity is unverified.
 
-Search performs one forward per immediate child and backs up `(S_parent - S_child) / S_parent`, using cached parent entropy and newly computed child entropy. It collects three distinct depth-20 states and selects the highest cached mean tree reward. Each candidate is a leaf evaluated once, so its mean reward equals its last-edge information gain. Candidate ranking adds no forwards. Final completion starts afresh from the selected partial state and samples literal `softmax(s / temperature)` over all legal masked position-token actions, where `s = p * exp(-H) * sigmoid(gamma * margin)`. Only this final completion fills all remaining masks.
+Search performs one forward per immediate child and backs up `(S_parent - S_child) / S_parent`, using cached parent entropy and newly computed child entropy. It collects the configured number of target-depth states and selects the highest cached mean tree reward. Candidate ranking adds no forwards. `completion_policy: adjusted_softmax` retains the literal `softmax(s / temperature)` reconstruction. `completion_policy: dlm` preserves every selected-tree commitment and fills only the remaining masks using standard token-probability, low-confidence DLM denoising.
 
 Defaults: 256 output tokens, steps and global block length; temperature 1.0; seed 1; Lc=20, C=3, K1=3, K2=5, gamma=10, exploration constant 0.01, epsilon=1e-8, and no search cap. Gamma/c are repository defaults rather than verified author parameters. Immediate-child reward, cached candidate ranking, and completion softmax scope are explicit reconstruction assumptions.
 

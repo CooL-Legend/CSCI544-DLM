@@ -1,6 +1,6 @@
 # MEDAL reconstruction walkthrough
 
-The shared implementation is [mcts_decoding.py](../src/dlm_project/decoding/mcts_decoding.py). All MCTS callers evaluate the immediate parent-to-child entropy change. The reference is [MEDAL, Algorithms 1–2 and Sections 3.1–3.3](https://aclanthology.org/2026.findings-eacl.180.pdf). This is a documented paper reconstruction, version `medal_reconstruction_v2`; author-code parity is unverified. Version 1 used full sampled search and candidate rollouts; version 2 removes them.
+The shared implementation is [mcts_decoding.py](../src/dlm_project/decoding/mcts_decoding.py). All MCTS callers evaluate the immediate parent-to-child entropy change. The reference is [MEDAL, Algorithms 1–2 and Sections 3.1–3.3](https://aclanthology.org/2026.findings-eacl.180.pdf). This is a documented paper reconstruction, version `medal_reconstruction_v2`; author-code parity is unverified. Version 1 used full sampled search and candidate rollouts; version 2 removes them. Final completion is recorded separately: the default is the literal adjusted-score reconstruction, while `completion_policy: dlm` continues standard low-confidence DLM denoising from the selected partial state.
 
 ## Definitions and reconstruction choices
 

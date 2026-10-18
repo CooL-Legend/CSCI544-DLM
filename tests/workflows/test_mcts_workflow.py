@@ -195,11 +195,13 @@ def test_config_validation_and_method_sensitive_experiment_names(tmp_path):
             continue
         if key == "max_model_calls":
             changed["mcts"][key] = 100
+        elif key == "completion_policy":
+            changed["mcts"][key] = "adjusted_softmax"
         else:
             changed["mcts"][key] *= 2
         assert experiment_name(config["generation"], changed) != mcts
     for method in ("confidence", "mcts_entropy"):
-        for key, value in [("block_length", 2), ("steps", 2), ("temperature", .1 if method == "confidence" else 0), ("remasking", "random")]:
+        for key, value in [("block_length", 2), ("steps", 2), ("temperature", .1 if method == "confidence" else -.1), ("remasking", "random")]:
             invalid = copy.deepcopy(config)
             invalid["decoding"]["method"] = method
             invalid["generation"][key] = value

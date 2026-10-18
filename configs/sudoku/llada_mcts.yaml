@@ -12,7 +12,7 @@ generation:
   steps: 256
   gen_length: 256
   block_length: 256
-  temperature: 1.0
+  temperature: 0.0
   remasking: low_confidence
 decoding:
   method: mcts_entropy
@@ -27,5 +27,6 @@ decoding:
     exploration_c: 0.01
     epsilon: 1.0e-08
     stop_mode: candidates
+    completion_policy: dlm
 experiment_root: results
 experiment_timezone: America/Los_Angeles

@@ -43,6 +43,22 @@ def test_uncapped_candidate_search_single_forward_cost_and_global_completion():
     assert all(e.get('phase')=='completion' for e in r.trace if e['stage']=='rollout_step')
 
 
+def test_dlm_completion_accepts_greedy_temperature_and_preserves_search_state():
+    model=FakeModel();sink=[]
+    r=mcts_confidence.decode(model,PROMPT,MASK,gen_length=4,steps=4,block_length=4,
+        temperature=0,seed=1,mcts=options(num_candidates=3,completion_policy='dlm'),
+        tokenizer=FakeTokenizer(),on_event=sink.append)
+    assert r.details['completion_policy']=='dlm'
+    assert r.details['completion_model_calls']==2
+    assert r.total_nfes==len(model.seen)==9
+    commits=[e for e in sink if e['stage']=='commit' and e.get('phase')=='completion']
+    assert len(commits)==2 and commits[-1]['generation_nfes']==9
+    assert all(e['completion_model_calls'] in (1,2) for e in commits)
+    assert torch.equal(r.token_ids[:,:2],PROMPT)
+    for commit in r.details['selected_initialization']['committed']:
+        assert r.token_ids[0,2+commit['output_position']]==commit['token_id']
+
+
 def test_seed_reproducibility_and_phase_separation():
     kw=dict(gen_length=24,steps=24,block_length=24,
             mcts=options(stop_mode='budget',max_model_calls=1))
@@ -55,7 +71,8 @@ def test_seed_reproducibility_and_phase_separation():
 
 
 @pytest.mark.parametrize('changes',[{'mcts':options(init_tokens=4)},{'block_length':2},
-                                   {'temperature':0},{'mcts':options(max_model_calls=0)}])
+                                   {'temperature':0},{'mcts':options(max_model_calls=0)},
+                                   {'mcts':options(completion_policy='invalid')}])
 def test_invalid_settings_fail_before_forward(changes):
     model=FakeModel()
     kw=dict(gen_length=4,steps=4,block_length=4,mcts=options())
