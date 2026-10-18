@@ -371,6 +371,20 @@ class RolloutResult:
     trace: list[dict]
 
 
+def _sample_joint_action(scores, temperature, generator):
+    """Draw (position row, token) from softmax(scores / temperature)."""
+    scaled = scores / temperature
+    # Sampling from the flattened position-token distribution can exceed
+    # torch.multinomial's 2^24-category limit for large vocabularies.  The
+    # exact same joint distribution factors into a position marginal and a
+    # token conditional, both of which stay comfortably below the cap.
+    row_weights = torch.softmax(torch.logsumexp(scaled, dim=1), dim=0)
+    row = torch.multinomial(row_weights, 1, generator=generator).item()
+    token_weights = torch.softmax(scaled[row], dim=0)
+    token = torch.multinomial(token_weights, 1, generator=generator).item()
+    return row, token
+
+
 def _sample_action(analysis, positions, probabilities, factors, mask_id, generator,
                    policy, temperature):
     if policy == "native":
@@ -385,9 +399,7 @@ def _sample_action(analysis, positions, probabilities, factors, mask_id, generat
     else:
         scores = probabilities * factors[:, None]
         scores[:, mask_id] = -torch.inf
-        weights = torch.softmax(scores.flatten() / temperature, dim=0)
-        flat = torch.multinomial(weights, 1, generator=generator).item()
-        row, token = divmod(flat, probabilities.shape[1])
+        row, token = _sample_joint_action(scores, temperature, generator)
         position = positions[row].item()
     probability = probabilities[row, token].item()
     top_two = probabilities[row].topk(2).values

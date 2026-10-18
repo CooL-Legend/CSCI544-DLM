@@ -148,7 +148,7 @@ def test_native_sampling_uses_tokens_outside_tree_top_k():
     assert r.model_calls==24
 
 
-def test_literal_softmax_covers_all_legal_actions_not_log_scores(monkeypatch):
+def test_hierarchical_softmax_matches_flat_joint_distribution(monkeypatch):
     weights=[]
     def draw(p,*a,**kw):
         weights.append(p.clone())
@@ -161,11 +161,31 @@ def test_literal_softmax_covers_all_legal_actions_not_log_scores(monkeypatch):
     gap=rows.topk(2,-1).values
     s=rows* (torch.exp(-h)*torch.sigmoid(10*(gap[:,0]-gap[:,1])))[:,None]
     s[:,0]=-torch.inf
-    expected=torch.softmax(s.flatten(),0)
-    assert torch.allclose(weights[0],expected)
-    assert weights[0][1]/weights[0][2]<3  # exp(s), not probabilities proportional to s.
-    assert weights[0][4]==0 and weights[0][0]==0
+    expected=torch.softmax(s.flatten(),0).reshape_as(s)
+    selected_row=weights[0].argmax().item()
+    assert torch.allclose(weights[0],expected.sum(1))
+    assert torch.allclose(weights[1],expected[selected_row]/expected[selected_row].sum())
+    assert torch.allclose(weights[0][selected_row]*weights[1],expected[selected_row])
+    assert weights[1][1]/weights[1][2]<3  # exp(s), not probabilities proportional to s.
+    assert weights[1][0]==0
     assert r.model_calls==2 and (r.token_ids[:,2:]!=MASK).all()
+
+
+def test_hierarchical_sampling_stays_below_multinomial_category_limit(monkeypatch):
+    calls=[]
+    def draw(p,*a,**kw):
+        calls.append(p.numel())
+        return torch.tensor([0])
+    monkeypatch.setattr(torch,'multinomial',draw)
+    # A representative post-MCTS LLaDA shape exceeds the flattened CUDA cap,
+    # while each level of the factored draw remains legal. Meta avoids a large
+    # allocation; only tensor shapes and sampling calls matter in this test.
+    positions, vocabulary = 236, 126_464
+    assert positions*vocabulary > 2**24
+    scores=torch.empty((positions,vocabulary),device='meta')
+    assert md._sample_joint_action(scores,1.0,None)==(0,0)
+    assert calls==[positions,vocabulary]
+    assert max(calls)<2**24
 
 
 def test_step_run_equivalence_and_json_events():
