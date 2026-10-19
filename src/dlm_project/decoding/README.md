@@ -51,7 +51,11 @@ All MCTS paths now use the [documented MEDAL reconstruction](../../../docs/mcts_
 
 Search performs one forward per immediate child and backs up `(S_parent - S_child) / S_parent`, using cached parent entropy and newly computed child entropy. It collects three distinct depth-20 states and selects the highest cached mean tree reward. Each candidate is a leaf evaluated once, so its mean reward equals its last-edge information gain. Candidate ranking adds no forwards. Final completion starts afresh from the selected partial state and samples literal `softmax(s / temperature)` over all legal masked position-token actions, where `s = p * exp(-H) * sigmoid(gamma * margin)`. Only this final completion fills all remaining masks.
 
+MEDAL and Adaptive MEDAL exclude `<|endoftext|>` and `<|eot_id|>` from tree-search actions, so an initialization token cannot terminate the answer. The exclusion applies only to MCTS search; the final completion policy keeps its normal vocabulary behavior. Resolved token IDs are recorded in the trace and run statistics.
+
 Defaults: 256 output tokens, steps and global block length; temperature 1.0; seed 1; Lc=20, C=3, K1=3, K2=5, gamma=10, exploration constant 0.01, epsilon=1e-8, and no search cap. Gamma/c are repository defaults rather than verified author parameters. Immediate-child reward, cached candidate ranking, and completion softmax scope are explicit reconstruction assumptions.
+
+The GSM8K MCTS experiment config uses a smaller search setting: Lc=10, C=1, K1=3, K2=2, stopping at the first candidate with a 256-search-forward hard ceiling.
 
 Task runners use inline three-subtask prompting with disjoint two-shot examples. GSM8K training rows 0/1 share the frozen test revision; evaluated references never enter prompts or rewards. Low-level decoder APIs accept already prepared prompt IDs. Setting `NUM_SAMPLES=None` restores profile counts; the LLaDA notebook retains its two-question override and all four standalone sections.
 

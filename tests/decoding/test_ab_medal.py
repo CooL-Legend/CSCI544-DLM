@@ -12,13 +12,29 @@ from dlm_project.decoding import mcts_decoding as md
 from dlm_project.decoding.ab_medal import (
     ABMEDALConfig, ABMEDALSearch, GaussianPosterior, tree_record, tree_statistics,
 )
-from tests.decoding.helpers import FakeModel, MASK, PROMPT
+from tests.decoding.helpers import FakeModel, FakeTokenizer, MASK, PROMPT
 
 
 def search(**settings):
     config = ABMEDALConfig(**{"init_tokens": 3, "num_candidates": 2,
                               "top_k_tokens": 2, "top_k_actions": 2, **settings})
     return ABMEDALSearch(FakeModel(), PROMPT, MASK, 4, config, seed=1)
+
+
+def test_adaptive_search_inherits_terminal_token_filtering():
+    class TerminalTokenizer(FakeTokenizer):
+        def get_vocab(self):
+            return {"[MASK]": 0, "<|endoftext|>": 1, "<|eot_id|>": 2, "3": 3}
+
+    config = ABMEDALConfig(init_tokens=1, num_candidates=1,
+                           top_k_tokens=3, top_k_actions=1)
+    result = ABMEDALSearch(
+        FakeModel(), PROMPT, MASK, 4, config,
+        tokenizer=TerminalTokenizer(), seed=1,
+    ).run()
+    committed = result.selected.state[0, PROMPT.shape[1]:].tolist()
+    assert [token for token in committed if token != MASK] == [3]
+    assert result.stats["search_excluded_token_ids"] == [1, 2]
 
 
 def finite_tree(monkeypatch, kind, **settings):

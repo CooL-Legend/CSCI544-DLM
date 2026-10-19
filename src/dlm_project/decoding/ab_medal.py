@@ -297,7 +297,9 @@ class ABMEDALSearch(medal.MCTSSearch):
             self.cycle += 1
         if self.root.analysis is None:
             with self._counted.phase("tree_analysis"):
-                self.root.analysis = medal.analyze_state(self._counted, self.root.state, self.prompt_len, self.mask_id, self.config)
+                self.root.analysis = medal.analyze_state(
+                    self._counted, self.root.state, self.prompt_len, self.mask_id,
+                    self.config, excluded_token_ids=self.excluded_token_ids)
                 self._register(self.root)
             self._emit("initialization", node_id=0, entropy=self.root.analysis.total_entropy,
                        actions=[medal.action_record(a, self.tokenizer) for a in self.root.analysis.actions],
@@ -321,7 +323,9 @@ class ABMEDALSearch(medal.MCTSSearch):
         self.simulations_started += 1
         try:
             with self._counted.phase("simulation"):
-                evaluation = medal.evaluate_action(self._counted, parent, child, self.prompt_len, self.mask_id, self.config)
+                evaluation = medal.evaluate_action(
+                    self._counted, parent, child, self.prompt_len, self.mask_id,
+                    self.config, self.excluded_token_ids)
         except medal.BudgetExhausted:
             child.closed = True
             self._emit("simulation_interrupted", child_id=child.node_id)

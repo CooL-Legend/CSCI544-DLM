@@ -33,6 +33,31 @@ def test_epsilon_entropy_and_confidence_filtering():
     assert len(model.seen)==1
 
 
+def test_search_excludes_terminal_tokens_from_every_tree_action():
+    class TerminalTokenizer(FakeTokenizer):
+        def get_vocab(self):
+            return {"[MASK]": 0, "<|endoftext|>": 1, "<|eot_id|>": 2, "3": 3}
+
+        def decode(self, ids, **kwargs):
+            return "".join({0: "[MASK]", 1: "<|endoftext|>",
+                            2: "<|eot_id|>", 3: "3"}[i] for i in ids)
+
+    tree = md.MCTSSearch(
+        FakeModel(), PROMPT, MASK, 4,
+        md.MCTSConfig(init_tokens=2, num_candidates=1, top_k_tokens=3,
+                      top_k_actions=1),
+        tokenizer=TerminalTokenizer(),
+    )
+    result = tree.run()
+    committed = result.selected.state[0, PROMPT.shape[1]:].tolist()
+    assert [token for token in committed if token != MASK] == [3, 3]
+    assert result.stats["search_excluded_tokens"] == list(md.MCTS_EXCLUDED_TOKENS)
+    assert result.stats["search_excluded_token_ids"] == [1, 2]
+    initialization = next(event for event in tree.trace
+                          if event["stage"] == "initialization")
+    assert initialization["search_excluded_token_ids"] == [1, 2]
+
+
 def test_uct_and_backups_are_per_evaluated_child():
     tree=search()
     tree.step()

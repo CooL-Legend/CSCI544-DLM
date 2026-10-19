@@ -16,6 +16,9 @@ from typing import Callable
 import torch
 
 
+MCTS_EXCLUDED_TOKENS = ("<|endoftext|>", "<|eot_id|>")
+
+
 @dataclass(frozen=True)
 class MCTSConfig:
     """Lc, C, K1, K2 and optional cap covering root and child forwards."""
@@ -165,16 +168,32 @@ def _action_order(action):
     return (-action.confidence_score, action.output_position, action.token_id)
 
 
-def _token_topk(probabilities, k, mask_id):
+def _search_excluded_token_ids(tokenizer):
+    """Resolve terminal tokens that tree search must not count as initialization."""
+    if tokenizer is None or not callable(getattr(tokenizer, "get_vocab", None)):
+        return ()
+    vocabulary = tokenizer.get_vocab()
+    if not isinstance(vocabulary, dict):
+        return ()
+    return tuple(sorted({int(vocabulary[token]) for token in MCTS_EXCLUDED_TOKENS
+                         if token in vocabulary}))
+
+
+def _token_topk(probabilities, k, mask_id, excluded_token_ids=()):
     """Top-k per row, resolving boundary ties by smaller token ID.
 
     Usually only k+1 values per row leave the GPU. Only a tied cutoff needs a
     scan; we avoid sorting the entire LLaDA vocabulary for every position.
     """
     legal = probabilities.clone()
-    legal[:, mask_id] = -torch.inf
-    k = min(k, legal.shape[-1] - 1)
-    count = min(k + 1, legal.shape[-1] - 1)
+    excluded = {mask_id, *(token for token in excluded_token_ids
+                           if 0 <= token < legal.shape[-1])}
+    legal[:, list(excluded)] = -torch.inf
+    legal_count = legal.shape[-1] - len(excluded)
+    if legal_count < 1:
+        raise ValueError("No legal token remains after applying the MCTS search filter.")
+    k = min(k, legal_count)
+    count = min(k + 1, legal_count)
     values, indices = torch.topk(legal, count, dim=-1)
     value_rows, index_rows = values.cpu().tolist(), indices.cpu().tolist()
     result = []
@@ -189,7 +208,8 @@ def _token_topk(probabilities, k, mask_id):
     return result
 
 
-def _distribution(model, state, prompt_len, mask_id, config, *, legacy_entropy=False):
+def _distribution(model, state, prompt_len, mask_id, config, *, legacy_entropy=False,
+                  excluded_token_ids=()):
     """One forward; full-vocabulary probabilities stay local to this step."""
     if (state.ndim != 2 or state.shape[0] != 1 or state.dtype != torch.long
             or not 0 <= prompt_len <= state.shape[1]):
@@ -218,7 +238,8 @@ def _distribution(model, state, prompt_len, mask_id, config, *, legacy_entropy=F
     timing = (model.phase("candidate_filtering")
               if isinstance(model, _SearchModel) and model.current_phase == "simulation" else nullcontext())
     with timing:
-        token_rows = _token_topk(probabilities, config.top_k_tokens, mask_id)
+        token_rows = _token_topk(probabilities, config.top_k_tokens, mask_id,
+                                 excluded_token_ids)
         h_cpu, margins_cpu, factors_cpu = h.cpu(), margins.cpu().tolist(), factors.cpu().tolist()
         entropies[positions] = h_cpu
         actions = []
@@ -233,14 +254,15 @@ def _distribution(model, state, prompt_len, mask_id, config, *, legacy_entropy=F
 
 @torch.inference_mode()
 def analyze_state(model, state, prompt_len, mask_id, config, *, force_forward=False,
-                  legacy_entropy=False):
+                  legacy_entropy=False, excluded_token_ids=()):
     """Return compact CPU analysis; completed states need no forward.
 
     force_forward remains accepted for source compatibility, but no longer
     causes unnecessary inference on a completed state.
     """
     return _distribution(model, state, prompt_len, mask_id, config,
-                         legacy_entropy=legacy_entropy)[0]
+                         legacy_entropy=legacy_entropy,
+                         excluded_token_ids=excluded_token_ids)[0]
 
 
 # 1. SELECTION: choose a frontier node using accumulated search statistics.
@@ -456,11 +478,13 @@ def rollout(model, state, prompt_len, mask_id, config, *, seed, policy="native",
 
 # 3. SIMULATION: evaluate only the immediate child, without further commitments.
 @torch.inference_mode()
-def evaluate_action(model, parent, child, prompt_len, mask_id, config):
+def evaluate_action(model, parent, child, prompt_len, mask_id, config,
+                    excluded_token_ids=()):
     """Use the cached parent and one child forward to compute the edge reward."""
     if parent.analysis is None or child.analysis is not None:
         raise ValueError("Evaluation requires a cached parent and an unevaluated child.")
-    analysis = analyze_state(model, child.state, prompt_len, mask_id, config)
+    analysis = analyze_state(model, child.state, prompt_len, mask_id, config,
+                             excluded_token_ids=excluded_token_ids)
     before, after = parent.analysis.total_entropy, analysis.total_entropy
     reward = information_gain(before, after, config.epsilon)
     if not math.isfinite(reward):
@@ -527,6 +551,7 @@ class MCTSSearch:
         derive_seed(seed, "validation")
         self.seed = seed
         self.model, self.mask_id, self.tokenizer = model, mask_id, tokenizer
+        self.excluded_token_ids = _search_excluded_token_ids(tokenizer)
         self.prompt_len = prompt_ids.shape[1]
         state = torch.full((1, self.prompt_len + gen_length), mask_id, dtype=torch.long)
         state[:, :self.prompt_len] = prompt_ids.detach().cpu()
@@ -586,13 +611,16 @@ class MCTSSearch:
         if self.root.analysis is None:
             with self._counted.phase("tree_analysis"):
                 self.root.analysis = analyze_state(self._counted, self.root.state, self.prompt_len,
-                                                   self.mask_id, self.config)
+                                                   self.mask_id, self.config,
+                                                   excluded_token_ids=self.excluded_token_ids)
             self._emit("initialization", node_id=0, entropy=self.root.analysis.total_entropy,
                        masked_count=self.root.state.shape[1] - self.prompt_len,
                        mean_token_entropy=self.root.analysis.total_entropy / (self.root.state.shape[1] - self.prompt_len),
                        mean_confidence_margin=self.root.analysis.mean_margin,
                        signal_nfe=self.model_calls, signal_extra_nfes=0,
                        implementation_version=IMPLEMENTATION_VERSION, assumptions=RECONSTRUCTION_ASSUMPTIONS,
+                       search_excluded_tokens=list(MCTS_EXCLUDED_TOKENS),
+                       search_excluded_token_ids=list(self.excluded_token_ids),
                        model_device=str(model_device(self.model)), search_state_device="cpu",
                        entropies=self.root.analysis.entropies.tolist(),
                        state=state_record(self.root.state, self.prompt_len, self.mask_id, self.tokenizer),
@@ -623,7 +651,7 @@ class MCTSSearch:
             try:
                 with self._counted.phase("simulation"):
                     evaluation = evaluate_action(self._counted, parent, child, self.prompt_len, self.mask_id,
-                                                 self.config)
+                                                 self.config, self.excluded_token_ids)
             except BudgetExhausted:
                 child.closed = True
                 self._emit("simulation_interrupted", phase="simulation", child_id=child.node_id)
@@ -674,6 +702,8 @@ class MCTSSearch:
                  "reconstruction_assumptions": dict(RECONSTRUCTION_ASSUMPTIONS),
                  "evaluation_variant": "budget-limited MEDAL reconstruction (immediate-child IG)" if self.config.stop_mode == "budget"
                  else "MEDAL reconstruction (immediate-child IG)",
+                 "search_excluded_tokens": list(MCTS_EXCLUDED_TOKENS),
+                 "search_excluded_token_ids": list(self.excluded_token_ids),
                  "finished": self.done, "stop_reason": self.stop_reason, "stop_mode": self.config.stop_mode,
                  "search_model_calls": self.model_calls, **self._counted.costs(),
                  **{f"{phase}_latency_seconds": seconds for phase, seconds in self._counted.seconds.items()},
