@@ -35,7 +35,7 @@ decoding:
     margin_gamma: 10.0
     exploration_c: 0.01
     epsilon: 1.0e-08
-    stop_mode: candidates
+    stop_mode: candidates_or_budget
 evaluation:
   profile: smoke
 experiment_root: results

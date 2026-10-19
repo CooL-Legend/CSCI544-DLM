@@ -35,6 +35,22 @@ def test_candidate_mode_fails_instead_of_silently_completing(cap):
     assert search.root.visits==sum(e['stage']=='backpropagation' for e in search.trace)
 
 
+def test_candidate_or_budget_stops_at_first_candidate_or_accepts_cap_fallback():
+    completed=tree(num_candidates=1,top_k_actions=1,stop_mode='candidates_or_budget',
+                   max_model_calls=100)
+    result=completed.run()
+    assert result.stats['stop_reason']=='candidate_quota'
+    assert result.stats['candidate_count']==1 and not result.stats['fallback_used']
+    assert completed.model_calls==3
+
+    capped=tree(num_candidates=1,top_k_actions=1,stop_mode='candidates_or_budget',
+                max_model_calls=2)
+    result=capped.run()
+    assert result.stats['stop_reason']=='model_call_budget'
+    assert result.stats['candidate_count']==0 and result.stats['fallback_used']
+    assert result.stats['selected_depth']==1 and capped.model_calls==2
+
+
 def test_candidate_quota_at_exact_forward_cap_requires_no_extra_evaluation():
     strict=tree(num_candidates=1,top_k_actions=1,max_model_calls=3)
     result=strict.run()
@@ -58,4 +74,7 @@ def test_versioned_names_and_uncapped_defaults():
     generation=dict(gen_length=256,steps=256,block_length=256,temperature=1,remasking='low_confidence')
     name=experiment_name(generation,{'method':'mcts_entropy'})
     assert 'budgetnone' in name and 'medal-v2' in name
+    hybrid=experiment_name(generation,{'method':'mcts_entropy','mcts':{
+        'stop_mode':'candidates_or_budget','max_model_calls':2}})
+    assert '-stop-candidates_or_budget' in hybrid
     assert MCTSConfig().max_model_calls is None

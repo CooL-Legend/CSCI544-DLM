@@ -34,8 +34,9 @@ class MCTSConfig:
     stop_mode: str = "candidates"
 
     def __post_init__(self):
-        if self.stop_mode not in ("candidates", "budget"):
-            raise ValueError("mcts.stop_mode must be candidates or budget.")
+        if self.stop_mode not in ("candidates", "budget", "candidates_or_budget"):
+            raise ValueError(
+                "mcts.stop_mode must be candidates, budget, or candidates_or_budget.")
         for name in ("init_tokens", "num_candidates", "top_k_tokens",
                      "top_k_actions"):
             if type(getattr(self, name)) is not int or getattr(self, name) < 1:
@@ -44,8 +45,10 @@ class MCTSConfig:
             raise ValueError("mcts.max_model_calls must be null or a positive integer.")
         if self.max_simulations is not None and (type(self.max_simulations) is not int or self.max_simulations < 1):
             raise ValueError("mcts.max_simulations must be null or a positive integer.")
-        if self.stop_mode == "budget" and self.max_model_calls is None and self.max_simulations is None:
-            raise ValueError("budget mode requires a finite max_model_calls or max_simulations.")
+        if (self.stop_mode in ("budget", "candidates_or_budget")
+                and self.max_model_calls is None and self.max_simulations is None):
+            raise ValueError(
+                f"{self.stop_mode} mode requires a finite max_model_calls or max_simulations.")
         for name in ("margin_gamma", "exploration_c", "epsilon"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
@@ -670,7 +673,8 @@ class MCTSSearch:
                 self.candidates.setdefault(key, child)
                 self._emit("candidate", node_id=child.node_id, duplicate=duplicate,
                            candidate_count=len(self.candidates), score=evaluation["reward"])
-            if self.config.stop_mode == "candidates" and len(self.candidates) >= self.config.num_candidates:
+            if (self.config.stop_mode in ("candidates", "candidates_or_budget")
+                    and len(self.candidates) >= self.config.num_candidates):
                 self._finish("candidate_quota")
                 return self.trace[start:]
             if self._at_cap():
@@ -700,8 +704,11 @@ class MCTSSearch:
         parents = len({node.parent.node_id for node in evaluated})
         stats = {"implementation_version": IMPLEMENTATION_VERSION, "paper_url": PAPER_URL,
                  "reconstruction_assumptions": dict(RECONSTRUCTION_ASSUMPTIONS),
-                 "evaluation_variant": "budget-limited MEDAL reconstruction (immediate-child IG)" if self.config.stop_mode == "budget"
-                 else "MEDAL reconstruction (immediate-child IG)",
+                 "evaluation_variant": {
+                     "candidates": "MEDAL reconstruction (immediate-child IG)",
+                     "budget": "budget-limited MEDAL reconstruction (immediate-child IG)",
+                     "candidates_or_budget": "candidate-or-budget MEDAL reconstruction (immediate-child IG)",
+                 }[self.config.stop_mode],
                  "search_excluded_tokens": list(MCTS_EXCLUDED_TOKENS),
                  "search_excluded_token_ids": list(self.excluded_token_ids),
                  "finished": self.done, "stop_reason": self.stop_reason, "stop_mode": self.config.stop_mode,

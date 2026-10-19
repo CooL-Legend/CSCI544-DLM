@@ -25,8 +25,8 @@ def experiment_name(generation, decoding=None):
         suffix += (f"-lc{m['init_tokens']}-c{m['num_candidates']}"
                    f"-k1_{m['top_k_tokens']}-k2_{m['top_k_actions']}"
                    f"-budget{m['max_model_calls'] if m['max_model_calls'] is not None else 'none'}-ucb{m['exploration_c']:g}-medal-v2")
-        if m["stop_mode"] == "budget":
-            suffix += "-stop-budget"
+        if m["stop_mode"] != "candidates":
+            suffix += f"-stop-{m['stop_mode']}"
     return name + suffix
 
 

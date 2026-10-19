@@ -270,6 +270,7 @@ def test_step_run_equivalence_and_json_events():
 
 @pytest.mark.parametrize('kwargs',[{'init_tokens':0},{'top_k_tokens':True},{'max_model_calls':0},
                                   {'max_model_calls':False},{'stop_mode':'budget'},
+                                  {'stop_mode':'candidates_or_budget'},
                                   {'epsilon':0},{'exploration_c':-1},{'margin_gamma':float('nan')}])
 def test_invalid_configuration(kwargs):
     with pytest.raises(ValueError): md.MCTSConfig(**kwargs)

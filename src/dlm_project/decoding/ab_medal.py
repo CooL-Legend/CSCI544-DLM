@@ -78,8 +78,9 @@ class ABMEDALConfig(medal.MCTSConfig):
         self.new_posterior()
         if self.search_policy not in ("gaussian", "medal_equivalent"):
             raise ValueError("search_policy must be gaussian or medal_equivalent.")
-        if self.stop_mode != "candidates":
-            raise ValueError("Adaptive MEDAL stops at the candidate target or an explicit cap.")
+        if self.stop_mode not in ("candidates", "candidates_or_budget"):
+            raise ValueError(
+                "Adaptive MEDAL requires candidates or candidates_or_budget stop mode.")
 
     def new_posterior(self):
         return GaussianPosterior(self.prior_m, self.prior_kappa, self.prior_nu, self.prior_tau2)
@@ -274,7 +275,8 @@ class ABMEDALSearch(medal.MCTSSearch):
         self._emit("termination", stop_reason=reason, candidate_count=len(self.candidates),
                    target_reached=len(self.candidates) >= self.config.num_candidates,
                    audit=tree_statistics(self))
-        if len(self.candidates) < self.config.num_candidates:
+        if (self.config.stop_mode == "candidates"
+                and len(self.candidates) < self.config.num_candidates):
             raise medal.SearchIncompleteError(self.result().stats)
 
     @torch.inference_mode()

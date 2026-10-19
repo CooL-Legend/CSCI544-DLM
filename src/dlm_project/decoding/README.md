@@ -55,11 +55,11 @@ MEDAL and Adaptive MEDAL exclude `<|endoftext|>` and `<|eot_id|>` from tree-sear
 
 Defaults: 256 output tokens, steps and global block length; temperature 1.0; seed 1; Lc=20, C=3, K1=3, K2=5, gamma=10, exploration constant 0.01, epsilon=1e-8, and no search cap. Gamma/c are repository defaults rather than verified author parameters. Immediate-child reward, cached candidate ranking, and completion softmax scope are explicit reconstruction assumptions.
 
-The GSM8K MCTS experiment config uses a smaller search setting: Lc=10, C=1, K1=3, K2=2, stopping at the first candidate with a 256-search-forward hard ceiling.
+The GSM8K MCTS experiment config uses a smaller search setting: Lc=10, C=1, K1=3, K2=2, stopping at the first candidate with a 256-search-forward hard ceiling. If no depth-10 candidate is available at that ceiling, it completes from the deepest evaluated fallback instead of aborting the batch.
 
 Task runners use inline three-subtask prompting with disjoint two-shot examples. GSM8K training rows 0/1 share the frozen test revision; evaluated references never enter prompts or rewards. Low-level decoder APIs accept already prepared prompt IDs. Setting `NUM_SAMPLES=None` restores profile counts; the LLaDA notebook retains its two-question override and all four standalone sections.
 
-Strict candidate mode fails explicitly if the candidate quota cannot finish. Finite `stop_mode: budget` runs rank any collected target-depth candidates; otherwise they select the deepest evaluated state, or root. Every root/child forward counts against an explicit cap; unfinished evaluations do not update visits. Final completion is additional. Historical runs remain readable; new directory labels include `medal-v2`.
+Strict candidate mode fails explicitly if the candidate quota cannot finish. Finite `stop_mode: budget` runs rank any collected target-depth candidates; otherwise they select the deepest evaluated state, or root. `stop_mode: candidates_or_budget` stops as soon as the candidate quota is reached, but accepts the same deepest-state fallback if a configured cap arrives first. Every root/child forward counts against an explicit cap; unfinished evaluations do not update visits. Final completion is additional. Historical runs remain readable; new directory labels include `medal-v2`.
 
 ## Accuracy, compute, and search metrics
 

@@ -251,6 +251,16 @@ def test_quota_at_cap_and_no_over_budget_forward(monkeypatch, cap, complete):
     assert tree.step() == []
 
 
+def test_candidate_or_budget_accepts_adaptive_fallback_at_cap():
+    tree = search(num_candidates=1, stop_mode="candidates_or_budget",
+                  max_model_calls=2)
+    result = tree.run()
+    assert result.stats["stop_reason"] == "model_call_budget"
+    assert result.stats["candidate_count"] == 0
+    assert result.stats["fallback_used"]
+    assert result.stats["selected_depth"] == 1
+
+
 def test_duplicate_candidate_states_are_evaluated_but_not_counted_twice():
     # Different action orders reach the same two-commitment state.
     tree = search(init_tokens=2, num_candidates=100, top_k_actions=2)
