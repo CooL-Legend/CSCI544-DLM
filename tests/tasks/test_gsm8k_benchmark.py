@@ -478,12 +478,12 @@ def test_mcts_entrypoint_defaults_and_receipt(tmp_path, monkeypatch):
     assert method == config["decoding"]["method"] == "mcts_confidence"
     assert config["model"]["family"] == "llada" and config["data"]["num_samples"] == 20
     assert config["generation"] == {"gen_length": 256, "steps": 256,
-                                    "block_length": 256, "temperature": 1.0}
+                                    "block_length": 128, "temperature": 1.0}
     assert config["decoding"]["mcts"] == {
-        "init_tokens": 20, "num_candidates": 3, "top_k_tokens": 3, "top_k_actions": 5,
-        "max_model_calls": None, "margin_gamma": 10.0, "exploration_c": .01,
+        "init_tokens": 10, "num_candidates": 1, "top_k_tokens": 3, "top_k_actions": 2,
+        "max_model_calls": 256, "margin_gamma": 10.0, "exploration_c": .01,
         "max_simulations": None,
-        "epsilon": 1e-8, "stop_mode": "candidates",
+        "epsilon": 1e-8, "stop_mode": "candidates_or_budget",
     }
     assert json.loads(receipt.read_text()) == {"run_dir": str(tmp_path / "exact-run"),
         "status": "completed", "model_family": "llada", "method": "mcts_confidence", "profile": "smoke"}

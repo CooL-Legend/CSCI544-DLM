@@ -7,7 +7,7 @@ and conditions sequentially. Sudoku uses **BGPO's released 4×4 dataset**, not i
 fine-tuned weights. The existing BGPO model comparison and single-example
 notebooks retain their behavior.
 
-These experiments now use MEDAL reconstruction with immediate parent-to-child information gain, inline decomposition, and literal adjusted-score completion. Finite caps are budget-limited ablations; author-code parity is unverified. Historical report-only artifacts remain supported. See the [walkthrough](mcts_walkthrough.md) for the assumptions and one-forward-per-child cost accounting.
+These experiments use MEDAL-style immediate parent-to-child information gain and inline decomposition, followed by standard LLaDA confidence completion from the selected partial state. Finite caps are budget-limited ablations; author-code parity is unverified. Historical report-only artifacts remain supported. See the [walkthrough](mcts_walkthrough.md) for the assumptions and one-forward-per-child cost accounting.
 
 ## Conditions and frozen data
 

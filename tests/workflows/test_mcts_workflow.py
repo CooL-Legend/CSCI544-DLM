@@ -168,12 +168,20 @@ def test_config_validation_and_method_sensitive_experiment_names(tmp_path):
             changed["mcts"][key] *= 2
         assert experiment_name(config["generation"], changed) != mcts
     for method in ("confidence", "mcts_entropy"):
-        for key, value in [("block_length", 2), ("steps", 2), ("temperature", .1 if method == "confidence" else 0), ("remasking", "random")]:
+        invalid_settings = [("steps", 2),
+                            ("temperature", .1 if method == "confidence" else 0),
+                            ("remasking", "random")]
+        if method == "confidence":
+            invalid_settings.append(("block_length", 2))
+        for key, value in invalid_settings:
             invalid = copy.deepcopy(config)
             invalid["decoding"]["method"] = method
             invalid["generation"][key] = value
             with pytest.raises(ValueError, match="requires"):
                 validate_config(invalid)
+    blocked_completion = copy.deepcopy(config)
+    blocked_completion["generation"]["block_length"] = 2
+    validate_config(blocked_completion)
     for settings in [{"method": "invalid"}, {"seed": -1}, {"seed": True}, {"mcts": {"typo": 1}},
                      {"mcts": {"init_tokens": 5}}, {"unexpected": 1}]:
         with pytest.raises(ValueError):

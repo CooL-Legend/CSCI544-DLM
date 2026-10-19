@@ -1,4 +1,4 @@
-# MEDAL paper reconstruction; interpretations are saved in every run.
+# MEDAL-style search plus standard LLaDA confidence completion.
 model:
   family: llada
   model_path: GSAI-ML/LLaDA-8B-Instruct
@@ -20,7 +20,7 @@ prompt:
 generation:
   gen_length: 256
   steps: 256
-  block_length: 256
+  block_length: 128
   temperature: 1.0
 decoding:
   method: mcts_confidence

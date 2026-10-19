@@ -134,9 +134,9 @@ class LLaDA:
                            on_event=None):
         """Return {text, stats, trace}; optionally stream each trace event to a sink.
 
-        MCTS initializes a partial state and passes that exact state and its
-        independent candidate evaluations into adjusted-score completion. No model is
-        reloaded here. Timings exclude model loading and synchronize CUDA.
+        MCTS initializes a partial state and passes that exact state into standard
+        LLaDA confidence completion. No model is reloaded here. Timings exclude
+        model loading and synchronize CUDA.
         """
         generation = dict(steps=steps, gen_length=gen_length, block_length=block_length,
                           temperature=temperature, remasking=remasking)

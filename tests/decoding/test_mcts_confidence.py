@@ -1,7 +1,7 @@
 """Public MEDAL adapter preserves commitments and charges every branch."""
 import pytest
 import torch
-from dlm_project.decoding import mcts_confidence
+from dlm_project.decoding import confidence, mcts_confidence
 from dlm_project.decoding.mcts_decoding import MCTSConfig, derive_seed,SearchIncompleteError
 from tests.decoding.helpers import FakeModel,FakeTokenizer,MASK,PROMPT
 
@@ -40,7 +40,27 @@ def test_uncapped_candidate_search_single_forward_cost_and_global_completion():
     assert r.trace[-1]['generation_nfes']==9
     assert r.details['candidate_evaluations'][0]['remaining_masks']==2
     assert r.details['candidate_evaluation_model_calls']==0
-    assert all(e.get('phase')=='completion' for e in r.trace if e['stage']=='rollout_step')
+    commits=[e for e in r.trace if e['stage']=='commit']
+    assert commits and all(e.get('phase')=='completion' for e in commits)
+    assert r.details['completion_policy']=='llada_confidence'
+
+
+def test_completion_exactly_matches_standard_confidence_from_selected_state():
+    model=FakeModel()
+    result=mcts_confidence.decode(
+        model,PROMPT,MASK,gen_length=6,steps=6,block_length=3,seed=7,
+        mcts=options(stop_mode='budget',max_model_calls=2),
+        tokenizer=FakeTokenizer())
+    output=torch.tensor([result.details['selected_initialization']['output_ids']])
+    initial=torch.cat((PROMPT,output),dim=1)
+    expected=confidence.decode(
+        FakeModel(),PROMPT,MASK,gen_length=6,steps=6,block_length=3,
+        temperature=1.0,seed=result.details['completion_seed'],
+        initial_state=initial)
+    assert torch.equal(result.token_ids,expected.token_ids)
+    assert result.details['completion_model_calls']==expected.generation_nfes
+    assert result.details['reconstruction_assumptions']['completion'].startswith(
+        'standard LLaDA confidence')
 
 
 def test_seed_reproducibility_and_phase_separation():
@@ -54,7 +74,7 @@ def test_seed_reproducibility_and_phase_separation():
     assert len({derive_seed(1,p) for p in ['simulation','candidate_evaluation','final_completion']})==3
 
 
-@pytest.mark.parametrize('changes',[{'mcts':options(init_tokens=4)},{'block_length':2},
+@pytest.mark.parametrize('changes',[{'mcts':options(init_tokens=4)},{'block_length':3},
                                    {'temperature':0},{'mcts':options(max_model_calls=0)}])
 def test_invalid_settings_fail_before_forward(changes):
     model=FakeModel()

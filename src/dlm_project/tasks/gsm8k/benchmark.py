@@ -88,8 +88,9 @@ def resolve_settings(method, source, *, profile=None, num_samples=None, seed=Non
         generation["temperature"] = temperature
     validate_generation(**generation, seed=decoding_seed)
     if method == "mcts_confidence":
-        if generation["steps"] != generation["gen_length"] or generation["block_length"] != generation["gen_length"] or generation["temperature"] <= 0:
-            raise ValueError("MEDAL requires steps = block_length = gen_length and positive temperature.")
+        if generation["steps"] != generation["gen_length"] or generation["temperature"] <= 0:
+            raise ValueError(
+                "MCTS with confidence completion requires steps = gen_length and positive temperature.")
         config["implementation_version"] = IMPLEMENTATION_VERSION
         config["decoding"]["mcts"] = asdict(mcts_confidence.resolve_mcts_config(
             decoding_source.get("mcts"), gen_length=generation["gen_length"]))

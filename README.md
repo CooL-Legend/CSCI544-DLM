@@ -2,7 +2,7 @@
 
 Evaluate **LLaDA-8B-Instruct**, **iLLaDA-8B-Instruct**, and **LLaDA-8B-BGPO-sudoku** on Sudoku for CSCI 544 Applied NLP. Develop locally, run inference on **Google Colab Pro**, and keep model weights and experiment artifacts in **Google Drive**.
 
-The **LLaDA and iLLaDA GSM8K notebooks** evaluate four shared decoding methods and display accuracy, inference cost, and randomly selected saved answers. LLaDA also includes the documented MEDAL reconstruction with immediate-child information gain, cached candidate ranking, and adjusted-score sampling.
+The **LLaDA and iLLaDA GSM8K notebooks** evaluate four shared decoding methods and display accuracy, inference cost, and randomly selected saved answers. LLaDA also includes MEDAL-style immediate-child search followed by standard LLaDA confidence completion.
 
 | Model | Notebook on `adi` | Dependency profile |
 | --- | --- | --- |
@@ -124,7 +124,7 @@ Each iLLaDA method streams its subprocess output, writes a unique run receipt, a
 
 The LLaDA notebook appends **MCTS initialization + confidence decoding** as a fifth method. Run its configuration, execution, and preview cells after the shared setup and benchmark configuration. It inherits the active prompt, model/cache paths, generation controls, profile, seed, and current `NUM_SAMPLES = 2` override; set that override to `None` for profile counts. Its run streams errors and selects previews through a unique receipt, displaying accuracy, random saved answers, initialization depth, fallback status, and search/completion costs.
 
-MCTS now uses the [MEDAL paper reconstruction](docs/mcts_walkthrough.md) across GSM8K, Sudoku, inspection, and sweeps. Defaults are Lc=20, C=3, K1=3, K2=5, temperature 1.0, 256 output tokens/steps/global block length, seed 1, and **no forward cap**. Each simulation evaluates one immediate child and backs up its normalized entropy reduction. Cached candidate rewards select the partial state, and literal adjusted-score softmax fills its remaining masks. Inline three-subtask prompting uses disjoint training/synthetic demonstrations. Gamma 10 and exploration constant 0.01 remain repository defaults, not verified author settings. Author-code parity is unverified.
+MCTS now uses the [MEDAL paper reconstruction](docs/mcts_walkthrough.md) across GSM8K, Sudoku, inspection, and sweeps. General search defaults are Lc=20, C=3, K1=3, K2=5, temperature 1.0, 256 output tokens/steps, seed 1, and **no forward cap**. Each simulation evaluates one immediate child and backs up its normalized entropy reduction. Cached candidate rewards select the partial state; standard LLaDA confidence decoding fills its remaining masks, using 128-token blocks in the GSM8K experiment. Inline three-subtask prompting uses disjoint training/synthetic demonstrations. Gamma 10 and exploration constant 0.01 remain repository defaults, not verified author settings. Author-code parity is unverified.
 
 Search costs one root forward plus one forward per evaluated child; candidate ranking adds no forwards. Final completion costs 236 forwards at depth 20. A direct-path example costs **335 forwards**, with more possible under broader exploration. Strict candidate mode fails instead of silently falling back. Explicit finite-budget sweeps remain labeled ablations, retaining only completed simulation rewards. New artifact labels include `medal-v2`; historical runs and the four standalone decoding sections are preserved.
 
@@ -221,7 +221,7 @@ All search components live in [`src/dlm_project/decoding/mcts_decoding.py`](src/
 
 - `baseline`: the existing sampler, unchanged by default.
 - `confidence`: greedy confidence-adjusted decoding from an entirely masked output.
-- `mcts_entropy`: MCTS with immediate-child information gain and cached candidate ranking initializes the output; literal adjusted-score sampling completes it.
+- `mcts_entropy`: MCTS with immediate-child information gain and cached candidate ranking initializes the output; standard LLaDA confidence decoding completes it.
 
 This is a versioned paper-based MEDAL reconstruction, with explicit choices for immediate entropy-change rewards, cached candidate ranking, and completion sampling. Each action fixes one output token; evaluation performs one forward on that child and leaves its remaining masks in place. Rewards can be negative; references and Sudoku validators never guide search. See the [function flowchart, definitions, and cost accounting](docs/mcts_walkthrough.md).
 

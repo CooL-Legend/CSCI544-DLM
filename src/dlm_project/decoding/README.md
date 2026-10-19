@@ -3,7 +3,8 @@
 Four decoder modules evaluate the pinned `GSAI-ML/LLaDA-8B-Instruct` and
 `GSAI-ML/iLLaDA-8B-Instruct` checkpoints on GSM8K. They share fixed-length masked sampling, block scheduling,
 chat formatting, and strict final-answer scoring. A fifth LLaDA method adds MCTS
-initialization with immediate-child information gain, cached candidate ranking, and adjusted-score softmax completion. These
+initialization with immediate-child information gain and cached candidate ranking,
+then completes the selected partial state with standard LLaDA confidence decoding. These
 methods perform inference without training.
 
 ## Algorithms
@@ -14,7 +15,7 @@ methods perform inference without training.
 | [Top-K Margin](top_k_margin.py) | Fill positions with the largest difference between their top two token probabilities. | 256 |
 | [Confidence](confidence.py) | Fill positions whose sampled tokens have the largest model probabilities. | 256 |
 | [Best-of-5](best_of_5.py) | Generate five confidence-decoded candidates and select the most frequent normalized final answer. | 1,280 |
-| [MCTS + Confidence](mcts_confidence.py) | MEDAL reconstruction: immediate-child search, cached candidate ranking, adjusted-score sampling. | Search calls + 256 − selected depth |
+| [MCTS + Confidence](mcts_confidence.py) | MEDAL search initializes a partial state; standard LLaDA confidence fills its remaining masks. | Search calls + 256 − selected depth |
 
 All four default to **temperature 1.0**, **256 output positions**, **256 denoising
 steps**, **128-token blocks**, and **seed 1**. Tokens are sampled using the
@@ -49,11 +50,11 @@ confidence candidates identical despite their distinct seeds.
 
 All MCTS paths now use the [documented MEDAL reconstruction](../../../docs/mcts_walkthrough.md), with implementation version `medal_reconstruction_v2`. The historical `mcts_confidence` and `mcts_entropy` identifiers remain available. Author-code parity is unverified.
 
-Search performs one forward per immediate child and backs up `(S_parent - S_child) / S_parent`, using cached parent entropy and newly computed child entropy. It collects three distinct depth-20 states and selects the highest cached mean tree reward. Each candidate is a leaf evaluated once, so its mean reward equals its last-edge information gain. Candidate ranking adds no forwards. Final completion starts afresh from the selected partial state and samples literal `softmax(s / temperature)` over all legal masked position-token actions, where `s = p * exp(-H) * sigmoid(gamma * margin)`. Only this final completion fills all remaining masks.
+Search performs one forward per immediate child and backs up `(S_parent - S_child) / S_parent`, using cached parent entropy and newly computed child entropy. It collects three distinct depth-20 states and selects the highest cached mean tree reward. Each candidate is a leaf evaluated once, so its mean reward equals its last-edge information gain. Candidate ranking adds no forwards. Final completion passes the selected partial state to the standard LLaDA confidence decoder, which preserves its committed tokens, proposes tokens with the native Gumbel sampler, and fills positions in descending sampled-token probability.
 
 MEDAL and Adaptive MEDAL exclude `<|endoftext|>` and `<|eot_id|>` from tree-search actions, so an initialization token cannot terminate the answer. The exclusion applies only to MCTS search; the final completion policy keeps its normal vocabulary behavior. Resolved token IDs are recorded in the trace and run statistics.
 
-Defaults: 256 output tokens, steps and global block length; temperature 1.0; seed 1; Lc=20, C=3, K1=3, K2=5, gamma=10, exploration constant 0.01, epsilon=1e-8, and no search cap. Gamma/c are repository defaults rather than verified author parameters. Immediate-child reward, cached candidate ranking, and completion softmax scope are explicit reconstruction assumptions.
+General search defaults are 256 output tokens/steps, temperature 1.0, seed 1, Lc=20, C=3, K1=3, K2=5, gamma=10, exploration constant 0.01, epsilon=1e-8, and no search cap. Search can initialize any output position. The GSM8K experiment completes with the same 128-token blocks as the standalone confidence baseline. Gamma/c are repository defaults rather than verified author parameters. Immediate-child reward and cached candidate ranking remain explicit reconstruction assumptions; standard confidence completion is an experimental replacement for the unstable adjusted-score completion.
 
 The GSM8K MCTS experiment config uses a smaller search setting: Lc=10, C=1, K1=3, K2=2, stopping at the first candidate with a 256-search-forward hard ceiling. If no depth-10 candidate is available at that ceiling, it completes from the deepest evaluated fallback instead of aborting the batch.
 

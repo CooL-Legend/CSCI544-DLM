@@ -1,7 +1,8 @@
 """Documented reconstruction of MEDAL Algorithms 1 and 2.
 
 Immediate parent-to-child information gain, cached candidate ranking,
-and literal adjusted-score softmax completion. The interpretation
+and a legacy adjusted-score completion helper. The main MCTS decoder now passes
+its selected partial state to standard LLaDA confidence decoding. Interpretation
 choices are exported in RECONSTRUCTION_ASSUMPTIONS; author-code parity is not
 claimed. Trees retain compact CPU states and never accept reference answers.
 """
@@ -80,15 +81,17 @@ def resolve_decoding(decoding=None, generation=None):
         raise ValueError(f"Invalid decoding.mcts settings: {error}") from error
     if generation is not None and method != "baseline":
         length = generation["gen_length"]
-        if generation["steps"] != length or generation["block_length"] != length:
-            raise ValueError("Confidence/MCTS decoding requires steps = block_length = gen_length.")
+        if generation["steps"] != length:
+            raise ValueError("Confidence/MCTS decoding requires steps = gen_length.")
+        if method == "confidence" and generation["block_length"] != length:
+            raise ValueError("Adjusted confidence decoding requires block_length = gen_length.")
         if generation["remasking"] != "low_confidence":
             raise ValueError("Confidence/MCTS decoding requires remasking = low_confidence.")
         if method == "confidence" and generation["temperature"] != 0:
             raise ValueError("Greedy confidence requires temperature = 0.")
         if method == "mcts_entropy":
             if generation["temperature"] <= 0 or not math.isfinite(generation["temperature"]):
-                raise ValueError("MEDAL completion requires positive temperature (default 1.0).")
+                raise ValueError("MCTS confidence completion requires positive temperature (default 1.0).")
             config.validate_length(length)
     return {"method": method, "seed": seed, "mcts": asdict(config)}
 
@@ -322,7 +325,7 @@ RECONSTRUCTION_ASSUMPTIONS = {
     "simulation": "one forward on the immediate child; cache its entropy and actions",
     "reward": "Eq9 gain from cached parent entropy to immediate child entropy",
     "candidate_evaluation": "rank cached mean tree rewards; no additional model forwards",
-    "completion": "fresh partial-state completion; literal softmax(s/temperature) over all legal position-token actions",
+    "completion": "caller completes the selected partial state; mcts_confidence uses standard LLaDA confidence decoding",
     "decomposition": "inline three subtasks; disjoint two-shot demonstrations",
     "quota": "stop immediately at first C distinct depth-Lc states",
     "constants": "gamma=10 and exploration_c=0.01 are repository defaults, not verified author settings",
