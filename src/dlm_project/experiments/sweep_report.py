@@ -183,8 +183,10 @@ def _markdown(config, summary, rows, directory):
              f"Completed {summary['completed_predictions']}/{summary['expected_predictions']} predictions. "
              f"Every main comparison uses **n={summary['common_n']} common examples** "
              f"out of {summary['requested_examples']} selected examples.", ""]
-    if config.get("implementation_version") == "medal_reconstruction_v2":
+    if config.get("implementation_version") in {
+            "medal_reconstruction_v2", "medal_reconstruction_v3_swd"}:
         lines += ["Immediate-child accounting: search = one root forward + one forward per evaluated child. "
+                  "Stability-aware runs additionally recompute each active parent distribution for temporal KL. "
                   "Candidate ranking reuses cached rewards and adds no forwards. Final completion is additional "
                   "and starts with a fresh forward. Only completed child evaluations update tree visits.", ""]
     elif config.get("report_schema_version", 1) >= 2:
@@ -205,8 +207,9 @@ def _markdown(config, summary, rows, directory):
               f"All settings and package versions: [resolved config](config.json).", "",
               "```json", json.dumps({"generation": config["generation"], "decoding": config["decoding"],
                                      "budgets": config["sweep"]["budgets"], "setup_cost": summary["setup"]}, indent=2), "```", "",
-              ("- Total NFEs = one root forward + evaluated children + fresh final completion."
-               if config.get("implementation_version") == "medal_reconstruction_v2" else
+              ("- Total NFEs = root analysis + evaluated children + any stability-reference forwards + fresh final completion."
+               if config.get("implementation_version") in {
+                   "medal_reconstruction_v2", "medal_reconstruction_v3_swd"} else
                "- Total NFEs = tree analysis + branch simulations + candidate evaluation + fresh final completion."
                if config.get("report_schema_version", 1) >= 2 else
                "- Total NFEs = search NFEs + completion NFEs. Search includes root and each evaluated child; first completion reuses cached analysis."),

@@ -15,7 +15,9 @@ import torch
 from dlm_project.decoding import best_of_5, confidence, mcts_confidence, random_mdm, top_k_margin
 from dlm_project.decoding.common import validate_generation
 from dlm_project.decoding.medal_prompting import get_gsm8k_demonstrations, gsm8k_prompt
-from dlm_project.decoding.mcts_decoding import IMPLEMENTATION_VERSION
+from dlm_project.decoding.mcts_decoding import (
+    IMPLEMENTATION_VERSION, STABILITY_IMPLEMENTATION_VERSION,
+)
 from dlm_project.experiments.artifacts import save_json
 from dlm_project.experiments.config import load_config, validate_config
 from dlm_project.experiments.manifests import digest
@@ -29,9 +31,13 @@ from dlm_project.tasks.gsm8k.dataset import build_prompt
 from dlm_project.tasks.gsm8k.evaluation import extract_answer, score_answer
 
 
+MCTS_METHODS = ("mcts_confidence", "mcts_swd_puct", "mcts_swd_reward",
+                "mcts_swd_adaptive")
+MCTS_STABILITY_MODES = {"mcts_confidence": "none", "mcts_swd_puct": "puct",
+                        "mcts_swd_reward": "reward", "mcts_swd_adaptive": "adaptive"}
 DECODERS = {"random_mdm": random_mdm.decode, "top_k_margin": top_k_margin.decode,
             "confidence": confidence.decode, "best_of_5": best_of_5.decode,
-            "mcts_confidence": mcts_confidence.decode}
+            **{method: mcts_confidence.decode for method in MCTS_METHODS}}
 MODEL_FAMILIES = ("llada", "illada")
 
 
@@ -87,13 +93,21 @@ def resolve_settings(method, source, *, profile=None, num_samples=None, seed=Non
     if temperature is not None:
         generation["temperature"] = temperature
     validate_generation(**generation, seed=decoding_seed)
-    if method == "mcts_confidence":
+    if method in MCTS_METHODS:
         if generation["steps"] != generation["gen_length"] or generation["temperature"] <= 0:
             raise ValueError(
                 "MCTS with confidence completion requires steps = gen_length and positive temperature.")
-        config["implementation_version"] = IMPLEMENTATION_VERSION
+        mcts_settings = dict(decoding_source.get("mcts") or {})
+        expected_mode = MCTS_STABILITY_MODES[method]
+        supplied_mode = mcts_settings.get("stability_mode")
+        if supplied_mode is not None and supplied_mode != expected_mode:
+            raise ValueError(
+                f"{method} requires decoding.mcts.stability_mode: {expected_mode}.")
+        mcts_settings["stability_mode"] = expected_mode
+        config["implementation_version"] = (IMPLEMENTATION_VERSION if expected_mode == "none"
+                                            else STABILITY_IMPLEMENTATION_VERSION)
         config["decoding"]["mcts"] = asdict(mcts_confidence.resolve_mcts_config(
-            decoding_source.get("mcts"), gen_length=generation["gen_length"]))
+            mcts_settings, gen_length=generation["gen_length"]))
     compatible = {**config, "generation": {**generation, "remasking": "low_confidence"},
                   "decoding": {"method": "baseline", "seed": decoding_seed}}
     validate_config(compatible)
@@ -155,7 +169,7 @@ def _metrics(config, state, records):
             "model_loading_seconds": state.get("model_loading_seconds"),
             "model_revision": config.get("provenance", {}).get("model", {}).get("revision"),
             "dataset_revision": config["data"]["revision"], "error": state.get("error")}
-    if config["decoding"]["method"] == "mcts_confidence":
+    if config["decoding"]["method"] in MCTS_METHODS:
         for phase in ("search", "completion"):
             phase_calls = sum(row[f"{phase}_model_calls"] for row in records)
             metrics[f"total_{phase}_model_calls"] = phase_calls
@@ -163,8 +177,8 @@ def _metrics(config, state, records):
             metrics[f"{phase}_latency_seconds"] = sum(row[f"{phase}_latency_seconds"] for row in records)
         metrics["fallback_count"] = sum(row["fallback_used"] for row in records)
         metrics["mean_selected_depth"] = mean(row["selected_depth"] for row in records) if count else None
-    if config["decoding"]["method"] == "mcts_confidence":
-        for phase in ("tree_analysis", "simulation", "candidate_evaluation"):
+    if config["decoding"]["method"] in MCTS_METHODS:
+        for phase in ("tree_analysis", "stability_reference", "simulation", "candidate_evaluation"):
             metrics[f"total_{phase}_model_calls"] = sum(row.get(f"{phase}_model_calls", 0) for row in records)
             metrics[f"total_{phase}_latency_seconds"] = sum(row.get(f"{phase}_latency_seconds", 0) for row in records)
         metrics["active_prediction_model_calls"] = state.get("active_prediction_model_calls", 0)
@@ -188,14 +202,20 @@ def run_evaluation(method, source, *, manifest_path=None, output_dir=None, model
     generation = config["generation"]
     name = (f"gen{generation['gen_length']}-steps{generation['steps']}-blk{generation['block_length']}-"
             f"temp{generation['temperature']:g}-seed{config['decoding']['seed']}")
-    if method == "mcts_confidence":
+    if method in MCTS_METHODS:
         m = config["decoding"]["mcts"]
-        name += (f"-medal-v2-lc{m['init_tokens']}-c{m['num_candidates']}-k1_{m['top_k_tokens']}"
-                 f"-k2_{m['top_k_actions']}-budget{m['max_model_calls'] if m['max_model_calls'] is not None else 'none'}-gamma{m['margin_gamma']:g}"
-                 f"-ucb{m['exploration_c']:g}-eps{m['epsilon']:g}-stop-{m['stop_mode']}")
+        if method == "mcts_confidence":
+            name += (f"-medal-v2-lc{m['init_tokens']}-c{m['num_candidates']}-k1_{m['top_k_tokens']}"
+                     f"-k2_{m['top_k_actions']}-budget{m['max_model_calls'] if m['max_model_calls'] is not None else 'none'}-gamma{m['margin_gamma']:g}"
+                     f"-ucb{m['exploration_c']:g}-eps{m['epsilon']:g}-stop-{m['stop_mode']}")
+        else:
+            name += (f"-medal-v3-{m['stability_mode']}-lc{m['init_tokens']}-c{m['num_candidates']}-k1_{m['top_k_tokens']}"
+                     f"-k2_{m['top_k_actions']}-budget{m['max_model_calls'] if m['max_model_calls'] is not None else 'none'}-gamma{m['margin_gamma']:g}"
+                     f"-explore{m['exploration_c']:g}-lambda{m['stability_lambda']:g}"
+                     f"-beta{m['stability_reward_beta']:g}-eps{m['epsilon']:g}-stop-{m['stop_mode']}")
         if m["max_simulations"] is not None:
             name += f"-sims{m['max_simulations']}"
-    if config["prompt"].get("medal_decomposition") and method != "mcts_confidence":
+    if config["prompt"].get("medal_decomposition") and method not in MCTS_METHODS:
         name += "-medal-prompt"
     model_profile = get_profile(config["model"]["family"])
     parent = Path(output_dir).expanduser() if output_dir else root / model_profile["label"] / "GSM8K"
@@ -237,7 +257,7 @@ def run_evaluation(method, source, *, manifest_path=None, output_dir=None, model
         save_json(directory / "config.json", config)
         save_progress()
         demonstrations = None
-        use_decomposition = config["prompt"].get("medal_decomposition", method == "mcts_confidence")
+        use_decomposition = config["prompt"].get("medal_decomposition", method in MCTS_METHODS)
         if use_decomposition:
             demonstrations = get_gsm8k_demonstrations(Path(manifest_path).with_name("gsm8k_decomposition_train.json"), revision=manifest["dataset"]["revision"],
                                                      cache_dir=config["data"].get("cache_dir"))
@@ -257,7 +277,7 @@ def run_evaluation(method, source, *, manifest_path=None, output_dir=None, model
                 kwargs = {**generation, "seed": seed}
                 if method == "best_of_5":
                     kwargs.update(tokenizer=wrapper.tokenizer, answer_extractor=extract_answer)
-                elif method == "mcts_confidence":
+                elif method in MCTS_METHODS:
                     kwargs.update(mcts=config["decoding"]["mcts"], tokenizer=wrapper.tokenizer)
                 trace_file = f"traces/test_{example['row_id']:04d}.jsonl"
                 with (directory / trace_file).open("w", encoding="utf-8") as trace:
@@ -266,10 +286,10 @@ def run_evaluation(method, source, *, manifest_path=None, output_dir=None, model
                         trace.flush()
                         state["active_example_id"] = example["example_id"]
                         state["active_prediction_model_calls"] = event.get("generation_nfes", event.get("search_model_calls", 0))
-                    if method == "mcts_confidence":
+                    if method in MCTS_METHODS:
                         kwargs["on_event"] = emit
                     result = DECODERS[method](wrapper.model, prompt_ids, wrapper.mask_id, **kwargs)
-                    if method != "mcts_confidence":
+                    if method not in MCTS_METHODS:
                         for event in result.trace:
                             emit(event)
                 state["active_example_id"] = None
@@ -317,7 +337,7 @@ def run_evaluation(method, source, *, manifest_path=None, output_dir=None, model
                               f" | completion={row['completion_model_calls']}"
                               f" | depth={row['selected_depth']}"
                               f" | fallback={row['fallback_used']}"
-                              if method == "mcts_confidence" else "")
+                              if method in MCTS_METHODS else "")
                 print(f"{row['example_id']} | {method} | accuracy={metrics['accuracy']:.3f} | "
                       f"forwards={result.total_nfes}{phase_cost} | {latency:.2f}s", flush=True)
         state["status"] = "completed"

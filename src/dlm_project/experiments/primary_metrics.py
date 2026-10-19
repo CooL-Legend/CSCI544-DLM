@@ -77,7 +77,7 @@ def _load_run(directory):
         row.setdefault("total_nfes", row["total_model_calls"])
         if row["total_nfes"] != row["total_model_calls"]:
             raise ValueError("Saved NFE totals do not reconcile.")
-        is_search = row["method"] == "mcts_confidence"
+        is_search = row["method"].startswith("mcts_")
         if is_search and all(key in row for key in ("search_model_calls", "completion_model_calls")):
             if row["total_nfes"] != row["search_model_calls"] + row["completion_model_calls"]:
                 raise ValueError("Search/completion NFE accounting does not reconcile.")
@@ -88,7 +88,9 @@ def _load_run(directory):
             if events is not None:
                 row.setdefault("decoding_steps", sum(event["stage"] == "commit" or
                     (event["stage"] == "rollout_step" and event.get("phase") == "completion") for event in events))
-                if is_search and row.get("implementation_version") in {"medal_reconstruction_v1", "medal_reconstruction_v2"}:
+                if is_search and row.get("implementation_version") in {
+                        "medal_reconstruction_v1", "medal_reconstruction_v2",
+                        "medal_reconstruction_v3_swd"}:
                     row.setdefault("mcts_simulations", sum(event["stage"] == "evaluation" for event in events))
             if not is_search:
                 row.setdefault("mcts_simulations", 0)

@@ -33,13 +33,25 @@ class MCTSConfig:
     exploration_c: float = 0.01
     epsilon: float = 1e-8
     stop_mode: str = "candidates"
+    stability_mode: str = "none"
+    stability_lambda: float = 3.0
+    stability_reward_beta: float = 1.0
+    adaptive_min_depth: int = 1
+    adaptive_min_model_calls: int = 1
+    adaptive_patience: int = 1
+    adaptive_low_uncertainty: float = 0.10
+    adaptive_high_uncertainty: float = 0.35
 
     def __post_init__(self):
         if self.stop_mode not in ("candidates", "budget", "candidates_or_budget"):
             raise ValueError(
                 "mcts.stop_mode must be candidates, budget, or candidates_or_budget.")
+        if self.stability_mode not in ("none", "puct", "reward", "adaptive"):
+            raise ValueError(
+                "mcts.stability_mode must be none, puct, reward, or adaptive.")
         for name in ("init_tokens", "num_candidates", "top_k_tokens",
-                     "top_k_actions"):
+                     "top_k_actions", "adaptive_min_depth",
+                     "adaptive_min_model_calls", "adaptive_patience"):
             if type(getattr(self, name)) is not int or getattr(self, name) < 1:
                 raise ValueError(f"mcts.{name} must be a positive integer.")
         if self.max_model_calls is not None and (type(self.max_model_calls) is not int or self.max_model_calls < 1):
@@ -50,12 +62,23 @@ class MCTSConfig:
                 and self.max_model_calls is None and self.max_simulations is None):
             raise ValueError(
                 f"{self.stop_mode} mode requires a finite max_model_calls or max_simulations.")
-        for name in ("margin_gamma", "exploration_c", "epsilon"):
+        for name in ("margin_gamma", "exploration_c", "epsilon",
+                     "stability_lambda", "stability_reward_beta",
+                     "adaptive_low_uncertainty", "adaptive_high_uncertainty"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
                 raise ValueError(f"mcts.{name} must be finite.")
             if value < 0 or (name == "epsilon" and not 0 < value < 1):
                 raise ValueError(f"Invalid mcts.{name}: {value}.")
+        if self.adaptive_min_depth > self.init_tokens:
+            raise ValueError("mcts.adaptive_min_depth must not exceed init_tokens.")
+        if not 0 <= self.adaptive_low_uncertainty < self.adaptive_high_uncertainty <= 1:
+            raise ValueError(
+                "Adaptive uncertainty thresholds must satisfy 0 <= low < high <= 1.")
+        if (self.max_model_calls is not None
+                and self.adaptive_min_model_calls > self.max_model_calls):
+            raise ValueError(
+                "mcts.adaptive_min_model_calls must not exceed max_model_calls.")
 
     def validate_length(self, gen_length):
         if type(gen_length) is not int or not 1 <= self.init_tokens < gen_length:
@@ -105,6 +128,9 @@ class Action:
     probability: float = 0.0
     entropy: float = 0.0
     margin: float = 0.0
+    base_score: float = 0.0
+    stability_kl: float = 0.0
+    stability_weight: float = 1.0
 
 
 @dataclass
@@ -114,6 +140,8 @@ class StateAnalysis:
     actions: tuple[Action, ...]
     state_key: tuple[int, ...]
     mean_margin: float | None = None
+    mean_stability_kl: float | None = None
+    stability_q75: float | None = None
 
     @property
     def total_entropy(self):
@@ -135,6 +163,9 @@ class Node:
     expanded: bool = False
     closed: bool = False
     immediate_reward: float | None = None
+    raw_information_gain: float | None = None
+    stability_uncertainty: float | None = None
+    stable_steps: int = 0
 
     @property
     def mean_reward(self):
@@ -215,7 +246,8 @@ def _token_topk(probabilities, k, mask_id, excluded_token_ids=()):
 
 
 def _distribution(model, state, prompt_len, mask_id, config, *, legacy_entropy=False,
-                  excluded_token_ids=()):
+                  excluded_token_ids=(), reference_positions=None,
+                  reference_probabilities=None):
     """One forward; full-vocabulary probabilities stay local to this step."""
     if (state.ndim != 2 or state.shape[0] != 1 or state.dtype != torch.long
             or not 0 <= prompt_len <= state.shape[1]):
@@ -239,6 +271,29 @@ def _distribution(model, state, prompt_len, mask_id, config, *, legacy_entropy=F
     top_two = probabilities.topk(2, dim=-1).values
     margins = top_two[:, 0] - top_two[:, 1]
     factors = torch.exp(-h) * torch.sigmoid(config.margin_gamma * margins)
+    stability_kls = None
+    if reference_positions is not None or reference_probabilities is not None:
+        if reference_positions is None or reference_probabilities is None:
+            raise ValueError("Stability comparison requires positions and probabilities together.")
+        reference_positions = reference_positions.detach().cpu()
+        if reference_positions.ndim != 1 or reference_probabilities.ndim != 2:
+            raise ValueError("Stability reference must be positions [M] and probabilities [M, V].")
+        indices = torch.searchsorted(reference_positions, positions)
+        if (indices.numel() != positions.numel()
+                or (indices >= reference_positions.numel()).any()
+                or not torch.equal(reference_positions[indices], positions)):
+            raise ValueError("Child masked positions must be a subset of the parent positions.")
+        previous = reference_probabilities[indices.to(reference_probabilities.device)]
+        if previous.shape != probabilities.shape:
+            raise ValueError("Parent and child probability shapes must match for temporal KL.")
+        previous = previous.to(probabilities.device)
+        stability_kls = (previous * (
+            torch.log(previous + config.epsilon)
+            - torch.log(probabilities + config.epsilon))).sum(-1).clamp_min(0)
+        if not torch.isfinite(stability_kls).all():
+            raise ValueError("Non-finite temporal KL in stability-aware search.")
+    stability_weights = (torch.exp(-config.stability_lambda * stability_kls)
+                         if stability_kls is not None else torch.ones_like(h))
     # Root filtering is already in tree_analysis. Split child filtering out for
     # the demo's stage report; the existing simulation timer stays inclusive.
     timing = (model.phase("candidate_filtering")
@@ -246,15 +301,28 @@ def _distribution(model, state, prompt_len, mask_id, config, *, legacy_entropy=F
     with timing:
         token_rows = _token_topk(probabilities, config.top_k_tokens, mask_id,
                                  excluded_token_ids)
-        h_cpu, margins_cpu, factors_cpu = h.cpu(), margins.cpu().tolist(), factors.cpu().tolist()
+        h_cpu = h.cpu()
+        margins_cpu = margins.cpu().tolist()
+        factors_cpu = factors.cpu().tolist()
+        kls_cpu = (stability_kls.cpu().tolist() if stability_kls is not None
+                   else [0.0] * positions.numel())
+        weights_cpu = stability_weights.cpu().tolist()
         entropies[positions] = h_cpu
         actions = []
         for row, position in enumerate(positions.tolist()):
             for probability, token_id in token_rows[row]:
-                actions.append(Action(position, token_id, probability * factors_cpu[row],
-                                      probability, h_cpu[row].item(), margins_cpu[row]))
+                base_score = probability * factors_cpu[row]
+                score = (base_score * weights_cpu[row]
+                         if config.stability_mode == "puct" else base_score)
+                actions.append(Action(position, token_id, score, probability,
+                                      h_cpu[row].item(), margins_cpu[row], base_score,
+                                      kls_cpu[row], weights_cpu[row]))
         actions.sort(key=_action_order)
-    return (StateAnalysis(entropies, tuple(actions[:config.top_k_actions]), _state_key(state), margins.mean().item()),
+    mean_kl = stability_kls.mean().item() if stability_kls is not None else None
+    q75 = (torch.quantile(stability_kls, .75).item()
+           if stability_kls is not None and stability_kls.numel() else None)
+    return (StateAnalysis(entropies, tuple(actions[:config.top_k_actions]), _state_key(state),
+                          margins.mean().item(), mean_kl, q75),
             positions, probabilities, factors)
 
 
@@ -272,7 +340,7 @@ def analyze_state(model, state, prompt_len, mask_id, config, *, force_forward=Fa
 
 
 # 1. SELECTION: choose a frontier node using accumulated search statistics.
-def select_node(root, exploration_c):
+def select_node(root, exploration_c, *, use_puct=False, epsilon=1e-8):
     """Return (frontier node or None, UCB decisions along the traversed path)."""
     node, decisions = root, []
     while node.expanded and not node.closed:
@@ -280,14 +348,24 @@ def select_node(root, exploration_c):
         if not eligible:
             return None, decisions
         scores, siblings = {}, []
+        prior_total = sum(max(child.action.confidence_score, epsilon)
+                          for child in eligible)
         for child in node.children:
-            bonus = (exploration_c * math.sqrt(math.log(max(1, node.visits)) / child.visits)
-                     if child.visits else math.inf)
+            prior = (max(child.action.confidence_score, epsilon) / prior_total
+                     if child in eligible else 0.0)
+            if use_puct:
+                bonus = (exploration_c * prior * math.sqrt(max(1, node.visits))
+                         / (1 + child.visits))
+            else:
+                bonus = (exploration_c * math.sqrt(math.log(max(1, node.visits)) / child.visits)
+                         if child.visits else math.inf)
             ucb = child.mean_reward + bonus
             scores[child.node_id] = ucb
             siblings.append({"node_id": child.node_id, "visits": child.visits,
                              "mean_reward": child.mean_reward, "eligible": not child.closed,
                              "unvisited": child.visits == 0,
+                             "selection_policy": "puct" if use_puct else "ucb",
+                             "prior": prior if use_puct else None,
                              "exploration_bonus": bonus if math.isfinite(bonus) else None,
                              "ucb": ucb if math.isfinite(ucb) else None})
         chosen = min(eligible, key=lambda child: (-scores[child.node_id],
@@ -296,6 +374,42 @@ def select_node(root, exploration_c):
                           "siblings": siblings})
         node = chosen
     return (None if node.closed else node), decisions
+
+
+def stability_uncertainty(analysis, config):
+    """Map the 75th-percentile temporal KL to a bounded controller signal."""
+    if analysis is None or analysis.stability_q75 is None:
+        return None
+    return 1.0 - math.exp(-config.stability_lambda * analysis.stability_q75)
+
+
+def adaptive_controls(analysis, config):
+    """Return per-node branch, depth, candidate, and soft-budget targets."""
+    uncertainty = stability_uncertainty(analysis, config)
+    if uncertainty is None:
+        uncertainty = 1.0
+    uncertainty = min(1.0, max(0.0, uncertainty))
+    if uncertainty <= config.adaptive_low_uncertainty:
+        control_scale = 0.0
+    elif uncertainty >= config.adaptive_high_uncertainty:
+        control_scale = 1.0
+    else:
+        control_scale = ((uncertainty - config.adaptive_low_uncertainty)
+                         / (config.adaptive_high_uncertainty
+                            - config.adaptive_low_uncertainty))
+    branches = 1 + round(control_scale * (config.top_k_actions - 1))
+    depth = config.adaptive_min_depth + round(
+        control_scale * (config.init_tokens - config.adaptive_min_depth))
+    candidates = 1 + round(control_scale * (config.num_candidates - 1))
+    if config.max_model_calls is None:
+        soft_budget = None
+    else:
+        soft_budget = config.adaptive_min_model_calls + round(
+            control_scale * (config.max_model_calls - config.adaptive_min_model_calls))
+    return {"uncertainty": uncertainty, "control_scale": control_scale,
+            "branches": branches,
+            "target_depth": depth, "candidate_target": candidates,
+            "soft_model_call_budget": soft_budget}
 
 
 # 2. EXPANSION: each child commits exactly one action to an independent copy.
@@ -320,7 +434,9 @@ def information_gain(before, after, epsilon):
 
 
 IMPLEMENTATION_VERSION = "medal_reconstruction_v2"
+STABILITY_IMPLEMENTATION_VERSION = "medal_reconstruction_v3_swd"
 PAPER_URL = "https://aclanthology.org/2026.findings-eacl.180.pdf"
+STABILITY_PAPER_URL = "https://arxiv.org/abs/2604.17068v1"
 RECONSTRUCTION_ASSUMPTIONS = {
     "simulation": "one forward on the immediate child; cache its entropy and actions",
     "reward": "Eq9 gain from cached parent entropy to immediate child entropy",
@@ -329,6 +445,8 @@ RECONSTRUCTION_ASSUMPTIONS = {
     "decomposition": "inline three subtasks; disjoint two-shot demonstrations",
     "quota": "stop immediately at first C distinct depth-Lc states",
     "constants": "gamma=10 and exploration_c=0.01 are repository defaults, not verified author settings",
+    "stability": "exact parent-to-child full-vocabulary KL; active parents are recomputed and not retained per tree node",
+    "adaptive": "KL controls branching, target depth, candidate quota, and a soft forward budget under the hard cap",
 }
 
 
@@ -357,7 +475,8 @@ class _SearchModel:
         self.model, self.cap, self.emit = model, cap, emit
         self.calls = 0
         self.current_phase = "tree_analysis"
-        self.counts = {name: 0 for name in ("tree_analysis", "simulation", "candidate_evaluation")}
+        self.counts = {name: 0 for name in (
+            "tree_analysis", "stability_reference", "simulation", "candidate_evaluation")}
         self.seconds = dict.fromkeys((*self.counts, "selection", "candidate_filtering",
                                      "expansion", "backpropagation"), 0.0)
 
@@ -485,21 +604,39 @@ def rollout(model, state, prompt_len, mask_id, config, *, seed, policy="native",
 # 3. SIMULATION: evaluate only the immediate child, without further commitments.
 @torch.inference_mode()
 def evaluate_action(model, parent, child, prompt_len, mask_id, config,
-                    excluded_token_ids=()):
+                    excluded_token_ids=(), *, reference_positions=None,
+                    reference_probabilities=None):
     """Use the cached parent and one child forward to compute the edge reward."""
     if parent.analysis is None or child.analysis is not None:
         raise ValueError("Evaluation requires a cached parent and an unevaluated child.")
-    analysis = analyze_state(model, child.state, prompt_len, mask_id, config,
-                             excluded_token_ids=excluded_token_ids)
+    if reference_positions is None:
+        analysis = analyze_state(model, child.state, prompt_len, mask_id, config,
+                                 excluded_token_ids=excluded_token_ids)
+    else:
+        analysis, _, _, _ = _distribution(
+            model, child.state, prompt_len, mask_id, config,
+            excluded_token_ids=excluded_token_ids,
+            reference_positions=reference_positions,
+            reference_probabilities=reference_probabilities)
     before, after = parent.analysis.total_entropy, analysis.total_entropy
-    reward = information_gain(before, after, config.epsilon)
-    if not math.isfinite(reward):
+    immediate_gain = information_gain(before, after, config.epsilon)
+    risk_penalty = (config.stability_reward_beta * child.action.stability_kl
+                    if config.stability_mode == "reward" else 0.0)
+    reward = immediate_gain - risk_penalty
+    if not math.isfinite(reward) or not math.isfinite(immediate_gain):
         raise ValueError("Non-finite child information gain.")
-    child.analysis, child.immediate_reward = analysis, reward
+    child.analysis = analysis
+    child.immediate_reward = reward
+    child.raw_information_gain = immediate_gain
     remaining = int((child.state[0, prompt_len:] == mask_id).sum().item())
     removed = parent.analysis.entropies[child.action.output_position].item()
     return {"entropy_before": before, "entropy_after": after,
-            "immediate_gain": reward, "reward": reward, "evaluation_model_calls": int(remaining > 0),
+            "immediate_gain": immediate_gain, "reward": reward,
+            "stability_risk_penalty": risk_penalty,
+            "action_stability_kl": child.action.stability_kl,
+            "mean_stability_kl": analysis.mean_stability_kl,
+            "stability_q75": analysis.stability_q75,
+            "evaluation_model_calls": int(remaining > 0),
             "masked_count": remaining, "mean_token_entropy": after / remaining if remaining else 0.0,
             "mean_confidence_margin": analysis.mean_margin,
             "signal_nfe": getattr(model, "calls", None), "signal_extra_nfes": 0,
@@ -566,11 +703,18 @@ class MCTSSearch:
         self.trace, self.on_event = [], on_event
         self.cycle, self.stop_reason = 0, None
         self.simulations_started = self.simulations_completed = 0
+        self._adaptive_candidate_target = None
+        self._adaptive_soft_budget = None
         self._counted = _SearchModel(model, self.config.max_model_calls, self._emit)
 
     @property
     def model_calls(self):
         return self._counted.calls
+
+    @property
+    def implementation_version(self):
+        return (IMPLEMENTATION_VERSION if self.config.stability_mode == "none"
+                else STABILITY_IMPLEMENTATION_VERSION)
 
     @property
     def done(self):
@@ -594,11 +738,22 @@ class MCTSSearch:
     def _at_simulation_cap(self):
         return self.config.max_simulations is not None and self.simulations_completed >= self.config.max_simulations
 
+    def _candidate_target(self):
+        if self.config.stability_mode == "adaptive":
+            return self._adaptive_candidate_target or self.config.num_candidates
+        return self.config.num_candidates
+
+    def _at_adaptive_cap(self):
+        return (self.config.stability_mode == "adaptive"
+                and self._adaptive_soft_budget is not None
+                and self.model_calls >= self._adaptive_soft_budget)
+
     def _finish(self, reason):
         with self._counted.phase("candidate_evaluation"):
             for node in self.candidates.values():
                 self._emit("candidate_evaluation", phase="candidate_evaluation", node_id=node.node_id,
-                           reward=node.mean_reward, immediate_gain=node.immediate_reward, model_calls=0,
+                           reward=node.mean_reward,
+                           immediate_gain=node.raw_information_gain, model_calls=0,
                            state=state_record(node.state, self.prompt_len, self.mask_id, self.tokenizer))
             self.stop_reason = reason
             result = self.result()
@@ -624,7 +779,8 @@ class MCTSSearch:
                        mean_token_entropy=self.root.analysis.total_entropy / (self.root.state.shape[1] - self.prompt_len),
                        mean_confidence_margin=self.root.analysis.mean_margin,
                        signal_nfe=self.model_calls, signal_extra_nfes=0,
-                       implementation_version=IMPLEMENTATION_VERSION, assumptions=RECONSTRUCTION_ASSUMPTIONS,
+                       implementation_version=self.implementation_version,
+                       assumptions=RECONSTRUCTION_ASSUMPTIONS,
                        search_excluded_tokens=list(MCTS_EXCLUDED_TOKENS),
                        search_excluded_token_ids=list(self.excluded_token_ids),
                        model_device=str(model_device(self.model)), search_state_device="cpu",
@@ -638,14 +794,44 @@ class MCTSSearch:
             self._finish("simulation_budget")
             return self.trace[start:]
         with self._counted.phase("selection"):
-            parent, decisions = select_node(self.root, self.config.exploration_c)
+            parent, decisions = select_node(
+                self.root, self.config.exploration_c,
+                use_puct=self.config.stability_mode == "puct",
+                epsilon=self.config.epsilon)
         if parent is None:
             self._finish("frontier_exhausted")
             return self.trace[start:]
         self._emit("selection", node_id=parent.node_id,
                    path=[0] + [hop["chosen_id"] for hop in decisions], decisions=decisions)
+        controls = (adaptive_controls(parent.analysis, self.config)
+                    if self.config.stability_mode == "adaptive" else None)
+        if controls is not None:
+            self._adaptive_soft_budget = controls["soft_model_call_budget"]
+            self._emit("adaptive_control", node_id=parent.node_id, **controls)
+            if self._at_adaptive_cap():
+                self._finish("adaptive_model_call_budget")
+                return self.trace[start:]
+        actions = parent.analysis.actions
+        if controls is not None:
+            actions = actions[:controls["branches"]]
+        reference_positions = reference_probabilities = None
+        if self.config.stability_mode != "none":
+            try:
+                with self._counted.phase("stability_reference"):
+                    _, reference_positions, reference_probabilities, _ = _distribution(
+                        self._counted, parent.state, self.prompt_len, self.mask_id,
+                        self.config, excluded_token_ids=self.excluded_token_ids)
+            except BudgetExhausted:
+                self._finish("model_call_budget")
+                return self.trace[start:]
+            if self._at_cap():
+                self._finish("model_call_budget")
+                return self.trace[start:]
+            if self._at_adaptive_cap():
+                self._finish("adaptive_model_call_budget")
+                return self.trace[start:]
         parent.expanded = True
-        for action in parent.analysis.actions:
+        for action in actions:
             with self._counted.phase("expansion"):
                 child = expand_node(parent, action, len(self.nodes), self.prompt_len, self.mask_id, self.config.init_tokens)
                 self.nodes.append(child)
@@ -657,7 +843,9 @@ class MCTSSearch:
             try:
                 with self._counted.phase("simulation"):
                     evaluation = evaluate_action(self._counted, parent, child, self.prompt_len, self.mask_id,
-                                                 self.config, self.excluded_token_ids)
+                                                 self.config, self.excluded_token_ids,
+                                                 reference_positions=reference_positions,
+                                                 reference_probabilities=reference_probabilities)
             except BudgetExhausted:
                 child.closed = True
                 self._emit("simulation_interrupted", phase="simulation", child_id=child.node_id)
@@ -670,21 +858,48 @@ class MCTSSearch:
             with self._counted.phase("backpropagation"):
                 updates = backpropagate(child, evaluation["reward"])
             self._emit("backpropagation", child_id=child.node_id, reward=evaluation["reward"], updates=updates)
-            if child.depth == self.config.init_tokens:
+            child_controls = (adaptive_controls(child.analysis, self.config)
+                              if self.config.stability_mode == "adaptive" else None)
+            if child_controls is not None:
+                child.stability_uncertainty = child_controls["uncertainty"]
+                child.stable_steps = (parent.stable_steps + 1
+                                      if child.stability_uncertainty
+                                      <= self.config.adaptive_low_uncertainty else 0)
+                is_candidate = (child.depth >= self.config.adaptive_min_depth
+                                and (child.depth >= child_controls["target_depth"]
+                                     or child.stable_steps >= self.config.adaptive_patience))
+                if child.depth >= self.config.init_tokens:
+                    is_candidate = True
+                self._emit("adaptive_evaluation", node_id=child.node_id,
+                           stable_steps=child.stable_steps,
+                           is_candidate=is_candidate, **child_controls)
+            else:
+                is_candidate = child.depth == self.config.init_tokens
+            if is_candidate:
+                child.closed = True
                 key = _state_key(child.state)
                 duplicate = key in self.candidates
                 self.candidates.setdefault(key, child)
                 self._emit("candidate", node_id=child.node_id, duplicate=duplicate,
                            candidate_count=len(self.candidates), score=evaluation["reward"])
+                if child_controls is not None:
+                    target = child_controls["candidate_target"]
+                    self._adaptive_candidate_target = (
+                        target if self._adaptive_candidate_target is None
+                        else max(self._adaptive_candidate_target, target))
             if (self.config.stop_mode in ("candidates", "candidates_or_budget")
-                    and len(self.candidates) >= self.config.num_candidates):
-                self._finish("candidate_quota")
+                    and len(self.candidates) >= self._candidate_target()):
+                self._finish("adaptive_candidate_quota" if child_controls is not None
+                             else "candidate_quota")
                 return self.trace[start:]
             if self._at_cap():
                 self._finish("model_call_budget")
                 return self.trace[start:]
             if self._at_simulation_cap():
                 self._finish("simulation_budget")
+                return self.trace[start:]
+            if self._at_adaptive_cap():
+                self._finish("adaptive_model_call_budget")
                 return self.trace[start:]
         self._close_exhausted(parent)
         if self.root.closed:
@@ -702,10 +917,13 @@ class MCTSSearch:
         else:
             selected = min(evaluated or [self.root], key=lambda n: (-n.depth, -n.mean_reward, n.node_id))
         score = selected.mean_reward
-        complete = len(candidates) >= self.config.num_candidates
+        candidate_target = self._candidate_target()
+        complete = len(candidates) >= candidate_target
         fallback = self.done and not complete
         parents = len({node.parent.node_id for node in evaluated})
-        stats = {"implementation_version": IMPLEMENTATION_VERSION, "paper_url": PAPER_URL,
+        stats = {"implementation_version": self.implementation_version, "paper_url": PAPER_URL,
+                 "stability_paper_url": (STABILITY_PAPER_URL
+                                         if self.config.stability_mode != "none" else None),
                  "reconstruction_assumptions": dict(RECONSTRUCTION_ASSUMPTIONS),
                  "evaluation_variant": {
                      "candidates": "MEDAL reconstruction (immediate-child IG)",
@@ -715,6 +933,8 @@ class MCTSSearch:
                  "search_excluded_tokens": list(MCTS_EXCLUDED_TOKENS),
                  "search_excluded_token_ids": list(self.excluded_token_ids),
                  "finished": self.done, "stop_reason": self.stop_reason, "stop_mode": self.config.stop_mode,
+                 "stability_mode": self.config.stability_mode,
+                 "selection_policy": "puct" if self.config.stability_mode == "puct" else "ucb",
                  "search_model_calls": self.model_calls, **self._counted.costs(),
                  **{f"{phase}_latency_seconds": seconds for phase, seconds in self._counted.seconds.items()},
                  "cycles": self.cycle, "requested_depth": self.config.init_tokens, "selected_depth": selected.depth,
@@ -727,7 +947,9 @@ class MCTSSearch:
                  "average_search_depth": sum(n.depth for n in evaluated) / len(evaluated) if evaluated else 0.0,
                  "expanded_nodes": len({_state_key(n.state) for n in evaluated}),
                  "unique_tree_states": len({_state_key(n.state) for n in self.nodes}),
-                 "max_depth": max(n.depth for n in self.nodes), "candidate_target": self.config.num_candidates,
+                 "max_depth": max(n.depth for n in self.nodes), "candidate_target": candidate_target,
+                 "configured_candidate_max": self.config.num_candidates,
+                 "adaptive_soft_model_call_budget": self._adaptive_soft_budget,
                  "candidate_count": len(candidates), "evaluated_candidates": len(candidates),
                  "evaluated_children": len(evaluated), "expanded_parents": parents,
                  "realized_branching_factor": len(evaluated) / parents if parents else 0.0,
@@ -735,7 +957,7 @@ class MCTSSearch:
                  "selected_score": score, "fallback_used": fallback,
                  "fallback_reason": self.stop_reason if fallback else None, "budget_exhausted": self._at_cap(),
                  "candidate_evaluations": [{"node_id": n.node_id, "reward": n.mean_reward,
-                     "immediate_gain": n.immediate_reward, "model_calls": 0,
+                     "immediate_gain": n.raw_information_gain, "model_calls": 0,
                      **state_record(n.state, self.prompt_len, self.mask_id, self.tokenizer)} for n in candidates]}
         return SearchResult(selected, candidates, stats, list(self.trace))
 

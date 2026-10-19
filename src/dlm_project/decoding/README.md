@@ -58,6 +58,24 @@ General search defaults are 256 output tokens/steps, temperature 1.0, seed 1, Lc
 
 The GSM8K MCTS experiment config uses a smaller search setting: Lc=10, C=1, K1=3, K2=2, stopping at the first candidate with a 256-search-forward hard ceiling. If no depth-10 candidate is available at that ceiling, it completes from the deepest evaluated fallback instead of aborting the batch.
 
+Three `medal_reconstruction_v3_swd` ablations based on
+[Stability-Weighted Decoding](https://arxiv.org/abs/2604.17068v1) add exact parent-to-child
+full-vocabulary temporal KL without retaining vocabulary distributions in tree
+nodes. Each expanded parent therefore needs one additional reference forward;
+that cost is recorded as `stability_reference_model_calls` and counts against
+the hard search cap. All three still hand the selected partial state to standard
+LLaDA confidence completion:
+
+- `mcts_swd_puct` multiplies the MEDAL action score by
+  `exp(-stability_lambda * KL)` and uses the normalized score as a PUCT prior.
+- `mcts_swd_reward` keeps UCB/action ordering unchanged and subtracts
+  `stability_reward_beta * KL` from the edge information-gain reward.
+- `mcts_swd_adaptive` keeps the original score/reward and maps the 75th
+  percentile KL to dynamic branching, target depth, candidate quota, and a soft
+  forward budget. Values below `adaptive_low_uncertainty` use the configured
+  minima; values above `adaptive_high_uncertainty` use the maxima; intermediate
+  values are linearly interpolated.
+
 Task runners use inline three-subtask prompting with disjoint two-shot examples. GSM8K training rows 0/1 share the frozen test revision; evaluated references never enter prompts or rewards. Low-level decoder APIs accept already prepared prompt IDs. Setting `NUM_SAMPLES=None` restores profile counts; the LLaDA notebook retains its two-question override and all four standalone sections.
 
 Strict candidate mode fails explicitly if the candidate quota cannot finish. Finite `stop_mode: budget` runs rank any collected target-depth candidates; otherwise they select the deepest evaluated state, or root. `stop_mode: candidates_or_budget` stops as soon as the candidate quota is reached, but accepts the same deepest-state fallback if a configured cap arrives first. Every root/child forward counts against an explicit cap; unfinished evaluations do not update visits. Final completion is additional. Historical runs remain readable; new directory labels include `medal-v2`.
@@ -179,6 +197,9 @@ python scripts/eval_gsm8k_top_k_margin.py
 python scripts/eval_gsm8k_confidence.py
 python scripts/eval_gsm8k_best_of_5.py
 python scripts/eval_gsm8k_mcts_confidence.py --profile smoke --num-samples 2
+python scripts/eval_gsm8k_mcts_swd_puct.py --profile smoke --num-samples 2
+python scripts/eval_gsm8k_mcts_swd_reward.py --profile smoke --num-samples 2
+python scripts/eval_gsm8k_mcts_swd_adaptive.py --profile smoke --num-samples 2
 ```
 
 Defaults come from [the benchmark configuration](../../../configs/gsm8k/decoding.yaml).
@@ -192,6 +213,9 @@ inherits the current two-question override. It streams stdout/stderr, writes a
 unique run receipt, and displays metrics and up to five random saved answers with
 initialization depth, fallback details, and phase costs. Rerunning its preview
 reads existing artifacts. The four earlier sections and saved outputs remain.
+
+On CARC or RunPod, the shared shell dispatcher accepts the same three method
+names: `mcts_swd_puct`, `mcts_swd_reward`, and `mcts_swd_adaptive`.
 
 For iLLaDA, use its dedicated entrypoints and dependency profile in a separate
 environment or rerun the dependency installation in Colab before switching models:

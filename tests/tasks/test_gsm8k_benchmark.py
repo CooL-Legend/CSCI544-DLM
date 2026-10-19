@@ -102,7 +102,9 @@ def test_benchmark_one_load_reference_isolation_and_cost(tmp_path, monkeypatch, 
     assert metrics["model_family"] == family
     assert metrics["accuracy"] == 1 and metrics["correct"] == metrics["processed"] == 2
     assert metrics["parse_failures"] == 0 and metrics["questions_per_second"] > 0
-    forwards = {"best_of_5": 20, "mcts_confidence": 5}.get(method, 4)
+    forwards = {"best_of_5": 20, "mcts_confidence": 5,
+                "mcts_swd_puct": 7, "mcts_swd_reward": 7,
+                "mcts_swd_adaptive": 6}.get(method, 4)
     assert metrics["mean_model_calls"] == forwards
     assert metrics["total_model_calls"] == len(instance.model.seen) == 2 * forwards
     records = [json.loads(line) for line in (directory / "predictions.jsonl").read_text().splitlines()]
@@ -126,17 +128,25 @@ def test_benchmark_one_load_reference_isolation_and_cost(tmp_path, monkeypatch, 
         assert len(records[0]["candidates"]) == 5
         assert records[0]["votes"] == {"1": 5}
         assert records[0]["candidate_seeds"] == [1, 2, 3, 4, 5]
-    elif method == "mcts_confidence":
-        assert metrics["total_search_model_calls"] == 6
-        assert metrics["total_completion_model_calls"] == 4
-        assert metrics["fallback_count"] == 0 and metrics["mean_selected_depth"] == 2
+    elif method in benchmark.MCTS_METHODS:
+        expected_search = 3 if method in ("mcts_confidence", "mcts_swd_adaptive") else 5
+        expected_depth = 1 if method == "mcts_swd_adaptive" else 2
+        expected_completion = 4 - expected_depth
+        assert metrics["total_search_model_calls"] == 2 * expected_search
+        assert metrics["total_completion_model_calls"] == 2 * expected_completion
+        assert metrics["fallback_count"] == 0 and metrics["mean_selected_depth"] == expected_depth
         assert metrics["search_latency_seconds"] >= 0 and metrics["completion_latency_seconds"] >= 0
-        assert all(row["search_model_calls"] == 3 and row["completion_model_calls"] == 2
+        assert all(row["search_model_calls"] == expected_search
+                   and row["completion_model_calls"] == expected_completion
                    for row in records)
+        expected_version = "medal-v2" if method == "mcts_confidence" else "medal-v3"
+        assert expected_version in directory.parent.name
         assert "lc2-c1-k1_1-k2_1-budget8" in directory.parent.name
         assert saved["decoding"]["mcts"]["init_tokens"] == 2
         trace = [json.loads(line) for line in (directory / records[0]["trace_file"]).read_text().splitlines()]
         assert {event.get("phase") for event in trace} >= {"tree_analysis", "simulation", "candidate_evaluation", "completion"}
+        if method != "mcts_confidence":
+            assert "stability_reference" in {event.get("phase") for event in trace}
 
 
 def test_accuracy_includes_wrong_and_unparseable_outputs(tmp_path, monkeypatch):
@@ -484,6 +494,10 @@ def test_mcts_entrypoint_defaults_and_receipt(tmp_path, monkeypatch):
         "max_model_calls": 256, "margin_gamma": 10.0, "exploration_c": .01,
         "max_simulations": None,
         "epsilon": 1e-8, "stop_mode": "candidates_or_budget",
+        "stability_mode": "none", "stability_lambda": 3.0,
+        "stability_reward_beta": 1.0, "adaptive_min_depth": 1,
+        "adaptive_min_model_calls": 1, "adaptive_patience": 1,
+        "adaptive_low_uncertainty": .1, "adaptive_high_uncertainty": .35,
     }
     assert json.loads(receipt.read_text()) == {"run_dir": str(tmp_path / "exact-run"),
         "status": "completed", "model_family": "llada", "method": "mcts_confidence", "profile": "smoke"}

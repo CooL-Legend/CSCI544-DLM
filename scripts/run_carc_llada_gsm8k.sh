@@ -22,8 +22,9 @@ Usage:
 
 Arguments:
   NUM_SAMPLES  Questions to run (default: 2)
-  METHOD       mcts_confidence (default), confidence, random_mdm,
-               top_k_margin, best_of_5, all, or metrics
+  METHOD       mcts_confidence (default), mcts_swd_puct, mcts_swd_reward,
+               mcts_swd_adaptive, confidence, random_mdm, top_k_margin,
+               best_of_5, all, or metrics
   PROFILE      smoke (default), initial, or full
 
 Environment overrides:
@@ -39,6 +40,9 @@ Environment overrides:
 
 Examples:
   sbatch scripts/run_carc_llada_gsm8k.sh 2 mcts_confidence smoke
+  bash scripts/run_carc_llada_gsm8k.sh 20 mcts_swd_puct smoke
+  bash scripts/run_carc_llada_gsm8k.sh 20 mcts_swd_reward smoke
+  bash scripts/run_carc_llada_gsm8k.sh 20 mcts_swd_adaptive smoke
   sbatch scripts/run_carc_llada_gsm8k.sh 20 all smoke
   MCTS_BUDGETS="4 8 16" sbatch scripts/run_carc_llada_gsm8k.sh 2 metrics smoke
 EOF
@@ -81,7 +85,7 @@ case "$PROFILE" in
         ;;
 esac
 case "$METHOD" in
-    mcts_confidence|confidence|random_mdm|top_k_margin|best_of_5|all|metrics) ;;
+    mcts_confidence|mcts_swd_puct|mcts_swd_reward|mcts_swd_adaptive|confidence|random_mdm|top_k_margin|best_of_5|all|metrics) ;;
     *)
         echo "Unknown METHOD: $METHOD" >&2
         usage >&2
@@ -181,6 +185,10 @@ run_method() {
         mcts_confidence)
             entrypoint="scripts/eval_gsm8k_mcts_confidence.py"
             config="configs/gsm8k/mcts_confidence.yaml"
+            ;;
+        mcts_swd_puct|mcts_swd_reward|mcts_swd_adaptive)
+            entrypoint="scripts/eval_gsm8k_${selected}.py"
+            config="configs/gsm8k/${selected}.yaml"
             ;;
         confidence|random_mdm|top_k_margin|best_of_5)
             entrypoint="scripts/eval_gsm8k_${selected}.py"

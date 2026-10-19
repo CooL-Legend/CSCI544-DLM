@@ -1,0 +1,44 @@
+model:
+  family: llada
+  model_path: GSAI-ML/LLaDA-8B-Instruct
+  device: cuda
+  dtype: bfloat16
+  local_files_only: false
+data:
+  num_samples: null
+  cache_dir: null
+  revision: null
+prompt:
+  instructions: 'Solve this math problem in English.
+
+    Use at most three short calculation lines.
+
+    End with a final line containing exactly #### followed by a plain number.
+
+    Do not include units, %, LaTeX, or any text after that number.'
+generation:
+  gen_length: 256
+  steps: 256
+  block_length: 128
+  temperature: 1.0
+decoding:
+  method: mcts_swd_puct
+  seed: 1
+  mcts:
+    init_tokens: 10
+    num_candidates: 1
+    top_k_tokens: 3
+    top_k_actions: 2
+    max_model_calls: 256
+    max_simulations: null
+    margin_gamma: 10.0
+    exploration_c: 0.01
+    epsilon: 1.0e-08
+    stop_mode: candidates_or_budget
+    stability_mode: puct
+    stability_lambda: 3.0
+    stability_reward_beta: 1.0
+evaluation:
+  profile: smoke
+experiment_root: results
+experiment_timezone: America/Los_Angeles

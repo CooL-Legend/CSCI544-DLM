@@ -114,6 +114,64 @@ def test_reward_depends_only_on_immediate_child_not_later_trajectory():
     assert md.information_gain(0,20,1e-8)==0
 
 
+def test_swd_puct_prior_downweights_temporally_unstable_positions():
+    reference = torch.tensor([[0., .8, .1, .1], [0., .8, .1, .1]])
+    current = [[0., .8, .1, .1], [0., .1, .8, .1]]
+    state = torch.cat([PROMPT, torch.zeros((1, 2), dtype=torch.long)], dim=1)
+    config = settings(init_tokens=1, num_candidates=1, top_k_tokens=1,
+                      top_k_actions=2, stability_mode="puct", stability_lambda=3.0)
+    with torch.inference_mode():
+        analysis, _, _, _ = md._distribution(
+            FakeModel(lambda _: current), state, 2, MASK, config,
+            reference_positions=torch.tensor([0, 1]),
+            reference_probabilities=reference,
+        )
+    stable, unstable = analysis.actions
+    assert stable.output_position == 0 and stable.stability_kl == pytest.approx(0)
+    assert unstable.output_position == 1 and unstable.stability_kl > 1
+    assert stable.base_score == pytest.approx(unstable.base_score)
+    assert stable.confidence_score > unstable.confidence_score
+    assert stable.stability_weight == pytest.approx(1)
+    assert unstable.stability_weight < .05
+
+
+def test_stability_reward_penalizes_raw_information_gain_without_relabeling_it():
+    model = FakeModel()
+    config = settings(stability_mode="reward", stability_reward_beta=2.0)
+    root = md.Node(0, torch.cat([PROMPT, torch.zeros((1, 4), dtype=torch.long)], 1))
+    root.analysis = md.analyze_state(model, root.state, 2, MASK, config)
+    action = md.Action(0, 1, .5, stability_kl=.2)
+    child = md.expand_node(root, action, 1, 2, MASK, 2)
+    evaluation = md.evaluate_action(model, root, child, 2, MASK, config)
+    assert evaluation["stability_risk_penalty"] == pytest.approx(.4)
+    assert evaluation["reward"] == pytest.approx(evaluation["immediate_gain"] - .4)
+    assert child.raw_information_gain == pytest.approx(evaluation["immediate_gain"])
+    assert child.immediate_reward == pytest.approx(evaluation["reward"])
+
+
+def test_adaptive_controls_map_low_middle_and_high_kl_to_budget_ranges():
+    config = settings(init_tokens=16, num_candidates=3, top_k_actions=4,
+                      max_model_calls=256, stability_mode="adaptive",
+                      stability_lambda=3.0, adaptive_min_depth=4,
+                      adaptive_min_model_calls=64, adaptive_low_uncertainty=.1,
+                      adaptive_high_uncertainty=.35)
+
+    def analysis_for(uncertainty):
+        q75 = -torch.log(torch.tensor(1 - uncertainty)).item() / config.stability_lambda
+        return md.StateAnalysis(torch.zeros(1), (), (), stability_q75=q75)
+
+    low = md.adaptive_controls(analysis_for(0), config)
+    middle = md.adaptive_controls(analysis_for(.225), config)
+    high = md.adaptive_controls(analysis_for(.8), config)
+    assert (low["branches"], low["target_depth"], low["candidate_target"],
+            low["soft_model_call_budget"]) == (1, 4, 1, 64)
+    assert middle["control_scale"] == pytest.approx(.5)
+    assert 1 < middle["branches"] < 4
+    assert 4 < middle["target_depth"] < 16
+    assert (high["branches"], high["target_depth"], high["candidate_target"],
+            high["soft_model_call_budget"]) == (4, 16, 3, 256)
+
+
 @pytest.mark.parametrize('probabilities', [[0,.99,.005,.005], [0,1.,0.,0.]])
 def test_negative_and_zero_parent_entropy_rewards(probabilities):
     model=FakeModel(lambda output: probabilities if (output==MASK).all() else [0,1/3,1/3,1/3])

@@ -132,7 +132,17 @@ On a configured CUDA machine with the LLaDA dependency profile installed:
 
 ```bash
 python scripts/eval_gsm8k_mcts_confidence.py --profile smoke --num-samples 2
+python scripts/eval_gsm8k_mcts_swd_puct.py --profile smoke --num-samples 2
+python scripts/eval_gsm8k_mcts_swd_reward.py --profile smoke --num-samples 2
+python scripts/eval_gsm8k_mcts_swd_adaptive.py --profile smoke --num-samples 2
 ```
+
+The three SWD variants isolate stability-weighted PUCT priors, stability-aware
+edge rewards, and KL-adaptive search control respectively. Their exact temporal
+KL uses one additional parent-reference forward per expanded node, records that
+phase separately, and never stores full-vocabulary distributions in the tree.
+All variants finish from the selected partial state with the same standard
+LLaDA confidence decoder.
 
 The new CLI defaults to [`configs/gsm8k/mcts_confidence.yaml`](configs/gsm8k/mcts_confidence.yaml), requires `model.family: llada`, and supports the same benchmark overrides and run receipts as the other methods. Edit `decoding.mcts` in YAML or `MCTS_SETTINGS` in the notebook to change the search settings. Results go to `LLaDA/GSM8K/mcts_confidence/<profile>/<generation-and-search-settings>/<timestamp>/`, sharing the frozen test manifest and strict scorer. The four original notebook sections and all their saved outputs remain unchanged.
 
