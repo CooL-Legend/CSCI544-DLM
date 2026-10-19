@@ -31,6 +31,41 @@ def test_training_rows_pinned_published_and_reused_offline(tmp_path, monkeypatch
     with pytest.raises(ValueError,match='hash'):mp.get_gsm8k_demonstrations(path,revision='a'*40)
 
 
+def test_gsm8k_prompt_removes_calculator_annotations_without_repeating_results():
+    demonstrations = {
+        'version': mp.PROMPT_VERSION,
+        'dataset': {'repo_id': 'openai/gsm8k', 'subset': 'main', 'split': 'train', 'revision': 'a'*40},
+        'examples': [
+            {
+                'question': 'How many clips were sold?',
+                'reference_solution': (
+                    'Natalia sold 48/2 = <<48/2=24>>24 clips in May.\n'
+                    'She sold 48+24 = <<48+24=72>>72 clips altogether.\n#### 72'
+                ),
+            },
+            {
+                'question': 'How much did Weng earn?',
+                'reference_solution': (
+                    'Weng earns 12/60 = $<<12/60=0.2>>0.2 per minute.\n'
+                    'She earned 0.2 * 50 = $<<0.2*50=10>>10.\n#### 10'
+                ),
+            },
+        ],
+    }
+
+    prompt, _ = mp.gsm8k_prompt('Solve this problem.', 'A held-out question?', demonstrations)
+
+    assert '<<' not in prompt and '>>' not in prompt
+    assert '48/2 = 24 clips' in prompt
+    assert '48+24 = 72 clips' in prompt
+    assert '12/60 = $0.2 per minute' in prompt
+    assert '0.2 * 50 = $10' in prompt
+    assert '2424' not in prompt
+    assert '7272' not in prompt
+    assert '0.20.2' not in prompt
+    assert '1010' not in prompt
+
+
 @pytest.mark.parametrize('size',[4,9])
 def test_synthetic_sudoku_demonstrations_and_final_format(size):
     prompt,metadata=mp.sudoku_prompt('Original puzzle; return only the original answer format.',size,'0'*(size*size))

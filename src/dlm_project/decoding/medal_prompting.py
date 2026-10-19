@@ -79,7 +79,11 @@ def gsm8k_prompt(base_prompt, question, demonstrations):
     for example in examples:
         answer = extract_answer(example["reference_solution"])
         reasoning = example["reference_solution"].rsplit("####", 1)[0].strip()
-        reasoning = re.sub(r"<<([^>]+)>>", r"\1", reasoning)
+        # GSM8K repeats the calculator result after its annotation, for example
+        # ``48 / 2 = <<48/2=24>>24``.  Remove the annotation itself so the
+        # rendered demonstration reads ``48 / 2 = 24`` instead of duplicating
+        # both the expression and result as ``48 / 2 = 48/2=2424``.
+        reasoning = re.sub(r"<<[^<>]*>>", "", reasoning)
         rendered.append(f"Problem: {example['question']}\n"
                         "1. Identify the quantities and the quantity being asked for.\n"
                         f"2. Calculate using the relevant quantities: {reasoning}\n"
