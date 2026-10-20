@@ -301,7 +301,10 @@ changed beforehand.
 For a single interactive MEDAL run, use
 [`MEDAL_MCTS_Demo.ipynb`](../../notebooks/gsm8k/MEDAL_MCTS_Demo.ipynb).
 Its existing cells use this E0 prompt, search and EOS policy, with `Lc=5` and
-one `SEARCH_BUDGET=512` control (alternatives 1024/2048). Live counters show
+one `SEARCH_BUDGET=512` control (alternatives 1024/2048). A no-search MEDAL
+decoder block runs before MCTS using the same loaded model, prompt and completion
+seed; it displays separate full/scored outputs and metrics, costs 256 forwards
+by default, and is excluded from searched MEDAL's reported totals. Live counters show
 budget use, evaluated depth and candidates. The report includes E0's applicable
 MEDAL metrics and separate pipeline/decoding timings; completion reruns reuse
 the initialization. Its optional batch remains disabled by default. The

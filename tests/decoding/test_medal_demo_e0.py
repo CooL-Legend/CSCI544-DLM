@@ -126,6 +126,30 @@ def test_search_excludes_terminators_and_root_completion_matches_no_search_contr
     assert '<|' in decoded['raw_output']
 
 
+@pytest.mark.parametrize('text,reference,accuracy', [('#### 1', '#### 1', 1.0),
+                                                  ('Answer: 1', '#### 1', 0.0),
+                                                  ('#### 1', None, None)])
+def test_no_search_report_adds_no_forwards_and_keeps_control_cost_separate(text, reference, accuracy, capsys):
+    model = FakeModel()
+    result = medal_no_search.decode(model, PROMPT, MASK, gen_length=4, steps=4, block_length=4,
+                                    mcts=settings(1), seed=1)
+    calls = len(model.seen)
+    report = demo.show_no_search_metrics(result, score=demo.score_answer(text, reference), prompt_seconds=2.0)
+    assert report['method'] == 'medal_no_search'
+    assert report['selection_source'] == 'no_search' and not report['fallback_decode_used']
+    assert report['search_nfes'] == report['selected_depth'] == 0
+    assert report['completion_nfes'] == report['total_nfes'] == len(model.seen) == calls == 4
+    assert report['requested_search_budget'] is report['budget_utilization'] is None
+    assert not report['shortlist_underfilled']
+    assert report['search_seconds'] == 0
+    assert report['completion_seconds'] == report['decoding_seconds']
+    assert report['total_wall_seconds'] == report['decoding_seconds'] + 2.0
+    assert report['accuracy'] == accuracy and report['parse_success'] == text.startswith('####')
+    assert (report['accuracy_ci95_low'] is None) == (reference is None)
+    assert '0 / 4 / 4' in capsys.readouterr().out
+    json.dumps(report, allow_nan=False)
+
+
 @pytest.mark.parametrize('tokens,prefix', [([3, 1, 4, 2], [3]), ([1, 3, 4, 2], []),
                                          ([3, 4, 5, 3], [3, 4, 5, 3])])
 def test_custom_sampler_keeps_full_outputs_and_scores_prefix_with_unknown_reference(tokens, prefix):

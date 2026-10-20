@@ -281,6 +281,44 @@ def run_completion(initialization, *, method="medal", seed=1, temperature=1.0,
     return DecodingResult(ids, counted.calls, seconds, name, getattr(output, "trace", []), decoded)
 
 
+def show_no_search_metrics(result, *, prompt_seconds=0.0, setup_seconds=0.0, score=None, display=True):
+    """Report the independent MEDAL control without creating or charging a tree."""
+    details = result.details
+    if details["search_model_calls"] != 0 or details["completion_model_calls"] != result.total_nfes:
+        raise ValueError("Expected a MEDAL no-search result with completion-only forwards.")
+    seconds = details["completion_latency_seconds"]
+    accuracy = float(score["exact_match"]) if score and score["exact_match"] is not None else None
+    low, high = wilson_interval(accuracy, 1) if accuracy is not None else (None, None)
+    report = {
+        "method": "medal_no_search", "search_nfes": 0, "completion_nfes": result.total_nfes,
+        "total_nfes": result.total_nfes, "total_nfe": result.total_nfes,
+        "search_seconds": 0.0, "completion_seconds": seconds, "decoding_seconds": seconds,
+        "total_wall_seconds": prompt_seconds + seconds, "setup_wall_seconds": setup_seconds,
+        "requested_search_budget": None, "budget_utilization": None, "selected_depth": 0,
+        "max_depth": 0, "average_search_depth": 0.0, "candidate_count": 0, "shortlist_size": 0,
+        "shortlist_underfilled": False, "selection_source": "no_search", "fallback_decode_used": False,
+        "stop_reason": "all_masks_filled", "score": score, "accuracy": accuracy,
+        "accuracy_percent": 100 * accuracy if accuracy is not None else None,
+        "accuracy_ci95_low": low, "accuracy_ci95_high": high,
+        "parse_success": score["parse_success"] if score is not None else None,
+        "parse_rate": float(score["parse_success"]) if score is not None else None,
+        "exact_match": score["exact_match"] if score is not None else None,
+    }
+    if display:
+        print("MEDAL completion without search — independent control")
+        print(f"Search / completion / total NFEs: 0 / {result.total_nfes} / {result.total_nfes}")
+        print(f"Completion / combined decoding: {seconds:.3f}s | "
+              f"pipeline including prompt: {report['total_wall_seconds']:.3f}s")
+        print("Selected depth: 0 | search budget: not applicable | selection: no_search")
+        if score is not None:
+            rate = f"{accuracy:.0%} (n=1)" if accuracy is not None else "unavailable (no reference)"
+            interval = f"{low:.1%}–{high:.1%}" if low is not None else "unavailable (no reference)"
+            print(f"Task accuracy: {rate} | Wilson 95% interval: {interval}")
+            print(f"Parsed: {score['parse_success']} | predicted answer: {score['predicted_answer']} | "
+                  f"correct: {score['exact_match']}", flush=True)
+    return report
+
+
 def show_metrics(initialization, completion=None, *, prompt_seconds=0.0,
                  setup_seconds=0.0, score=None, display=True):
     """Return JSON-ready metrics; reporting and answer scoring add no forwards."""
