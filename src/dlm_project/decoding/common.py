@@ -67,7 +67,7 @@ def decode_masked(model, prompt_ids, mask_id, *, selection_rule, gen_length=256,
     validate_generation(gen_length=gen_length, steps=steps, block_length=block_length,
                         temperature=temperature, seed=seed)
     validate_prompt(prompt_ids, mask_id)
-    if selection_rule not in {"random_position", "top_two_margin", "token_probability"}:
+    if selection_rule not in {"random_position", "top_two_margin", "token_probability", "lowest_entropy"}:
         raise ValueError(f"Unknown position selection rule: {selection_rule}")
     device = torch.device(getattr(model, "device", prompt_ids.device))
     torch.manual_seed(seed)
@@ -103,6 +103,8 @@ def decode_masked(model, prompt_ids, mask_id, *, selection_rule, gen_length=256,
                 scores = torch.rand(positions.numel(), device=device)
             elif selection_rule == "token_probability":
                 scores = proposed_probabilities
+            elif selection_rule == "lowest_entropy":
+                scores = -torch.special.entr(probabilities).sum(dim=-1)
             else:
                 top_two = probabilities.topk(2, dim=-1).values
                 scores = top_two[:, 0] - top_two[:, 1]

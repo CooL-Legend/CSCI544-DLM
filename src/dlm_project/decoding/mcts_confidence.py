@@ -39,7 +39,7 @@ def _sync(device):
 @torch.inference_mode()
 def decode(model, prompt_ids, mask_id, *, gen_length=256, steps=256,
            block_length=256, temperature=1.0, seed=1, mcts=None, tokenizer=None,
-           on_event=None):
+           on_event=None, search_excluded_token_ids=()):
     """Accept prepared prompt IDs; task runners own two-shot prompt augmentation."""
     validate_generation(gen_length=gen_length, steps=steps, block_length=block_length,
                         temperature=temperature, seed=seed)
@@ -49,7 +49,8 @@ def decode(model, prompt_ids, mask_id, *, gen_length=256, steps=256,
     config = resolve_mcts_config(mcts, gen_length=gen_length)
     device = model_device(model)
     search = MCTSSearch(model, prompt_ids, mask_id, gen_length, config,
-                        tokenizer=tokenizer, on_event=on_event, seed=seed)
+                        tokenizer=tokenizer, on_event=on_event, seed=seed,
+                        search_excluded_token_ids=search_excluded_token_ids)
     _sync(device)
     started = perf_counter()
     result = search.run()

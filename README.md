@@ -34,6 +34,30 @@ docs/                       # Structure guide and MCTS walkthrough
 
 Install the package with `python -m pip install --no-deps -e .` after installing a dependency profile. The Colab notebooks do this automatically. See [the structure guide](docs/project_structure.md) for file locations, imports, and commands. Model weights and run artifacts stay outside the source package.
 
+## Experiment 0: fixed-budget GSM8K baseline test
+
+[Experiment 0](docs/experiment_0/README.md) compares greedy confidence, greedy entropy,
+MEDAL completion without search at T=1, and MEDAL search caps of 512, 1024 and
+2048 actual forwards. It uses Lc=5, a shared three-step decomposition prompt
+with the fixed pens/muffins examples, search-only EOS/EOT
+filtering, and fallback completion after budget exhaustion. The original
+candidate-quota mode remains available as a separate matched-depth comparison.
+
+Use the new [development](notebooks/gsm8k/Experiment_0_Baseline_Test_Dev.ipynb),
+[evaluation](notebooks/gsm8k/Experiment_0_Baseline_Test_Evaluation.ipynb), and
+[testing](notebooks/gsm8k/Experiment_0_Baseline_Test_Testing.ipynb) Colab notebooks
+for 5/20 disjoint training questions and 25 held-out test questions, respectively.
+Each loads one model and displays paired accuracy, actual NFEs, runtime, depth,
+fallbacks, and saved answers. Testing can expand to 100 using the same frozen
+ordering. Before these changes are on `adi`, the notebooks also accept the
+delivered `dist/experiment_0_colab_source.zip` through `SOURCE_MODE="upload"`.
+The [implementation README](docs/experiment_0/README.md) explains the exact
+protocol, code interfaces, commands, metrics, saved records, and validation.
+
+```bash
+python scripts/experiment_0_baseline_test.py --stage dev
+```
+
 ## Single-prompt MEDAL demo
 
 Use [MEDAL_MCTS_Demo.ipynb](notebooks/gsm8k/MEDAL_MCTS_Demo.ipynb) to see the current method without running an evaluation. It loads one model from the runtime, Drive, or the pinned Hub checkpoint; shows the inline three-subtask guidance; runs MCTS initialization; and displays the top three partial-state candidates with their unmasked tokens, selection values, and root-to-candidate entropy reductions. Short cells report actual NFE by MCTS phase and synchronized wall-clock time, then complete the selected state.

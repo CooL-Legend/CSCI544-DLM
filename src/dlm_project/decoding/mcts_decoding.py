@@ -165,16 +165,22 @@ def _action_order(action):
     return (-action.confidence_score, action.output_position, action.token_id)
 
 
-def _token_topk(probabilities, k, mask_id):
+def _token_topk(probabilities, k, mask_id, excluded_token_ids=()):
     """Top-k per row, resolving boundary ties by smaller token ID.
 
     Usually only k+1 values per row leave the GPU. Only a tied cutoff needs a
     scan; we avoid sorting the entire LLaDA vocabulary for every position.
     """
     legal = probabilities.clone()
-    legal[:, mask_id] = -torch.inf
-    k = min(k, legal.shape[-1] - 1)
-    count = min(k + 1, legal.shape[-1] - 1)
+    excluded = set(excluded_token_ids) | {mask_id}
+    if any(type(token) is not int or not 0 <= token < legal.shape[-1] for token in excluded):
+        raise ValueError("Excluded search token IDs must be integers within the model vocabulary.")
+    available = legal.shape[-1] - len(excluded)
+    if not available:
+        raise ValueError("Search exclusions leave no legal token.")
+    legal[:, sorted(excluded)] = -torch.inf
+    k = min(k, available)
+    count = min(k + 1, available)
     values, indices = torch.topk(legal, count, dim=-1)
     value_rows, index_rows = values.cpu().tolist(), indices.cpu().tolist()
     result = []
@@ -189,7 +195,8 @@ def _token_topk(probabilities, k, mask_id):
     return result
 
 
-def _distribution(model, state, prompt_len, mask_id, config, *, legacy_entropy=False):
+def _distribution(model, state, prompt_len, mask_id, config, *, legacy_entropy=False,
+                  search_excluded_token_ids=()):
     """One forward; full-vocabulary probabilities stay local to this step."""
     if (state.ndim != 2 or state.shape[0] != 1 or state.dtype != torch.long
             or not 0 <= prompt_len <= state.shape[1]):
@@ -218,7 +225,8 @@ def _distribution(model, state, prompt_len, mask_id, config, *, legacy_entropy=F
     timing = (model.phase("candidate_filtering")
               if isinstance(model, _SearchModel) and model.current_phase == "simulation" else nullcontext())
     with timing:
-        token_rows = _token_topk(probabilities, config.top_k_tokens, mask_id)
+        token_rows = _token_topk(probabilities, config.top_k_tokens, mask_id,
+                                search_excluded_token_ids)
         h_cpu, margins_cpu, factors_cpu = h.cpu(), margins.cpu().tolist(), factors.cpu().tolist()
         entropies[positions] = h_cpu
         actions = []
@@ -233,14 +241,15 @@ def _distribution(model, state, prompt_len, mask_id, config, *, legacy_entropy=F
 
 @torch.inference_mode()
 def analyze_state(model, state, prompt_len, mask_id, config, *, force_forward=False,
-                  legacy_entropy=False):
+                  legacy_entropy=False, search_excluded_token_ids=()):
     """Return compact CPU analysis; completed states need no forward.
 
     force_forward remains accepted for source compatibility, but no longer
     causes unnecessary inference on a completed state.
     """
     return _distribution(model, state, prompt_len, mask_id, config,
-                         legacy_entropy=legacy_entropy)[0]
+                         legacy_entropy=legacy_entropy,
+                         search_excluded_token_ids=search_excluded_token_ids)[0]
 
 
 # 1. SELECTION: choose a frontier node using accumulated search statistics.
@@ -456,11 +465,13 @@ def rollout(model, state, prompt_len, mask_id, config, *, seed, policy="native",
 
 # 3. SIMULATION: evaluate only the immediate child, without further commitments.
 @torch.inference_mode()
-def evaluate_action(model, parent, child, prompt_len, mask_id, config):
+def evaluate_action(model, parent, child, prompt_len, mask_id, config, *,
+                    search_excluded_token_ids=()):
     """Use the cached parent and one child forward to compute the edge reward."""
     if parent.analysis is None or child.analysis is not None:
         raise ValueError("Evaluation requires a cached parent and an unevaluated child.")
-    analysis = analyze_state(model, child.state, prompt_len, mask_id, config)
+    analysis = analyze_state(model, child.state, prompt_len, mask_id, config,
+                             search_excluded_token_ids=search_excluded_token_ids)
     before, after = parent.analysis.total_entropy, analysis.total_entropy
     reward = information_gain(before, after, config.epsilon)
     if not math.isfinite(reward):
@@ -519,12 +530,16 @@ def state_record(state, prompt_len, mask_id, tokenizer=None):
 class MCTSSearch:
     """One resumable tree; step() evaluates immediate children and backs up gains."""
     def __init__(self, model, prompt_ids, mask_id, gen_length, config=None,
-                 tokenizer=None, on_event: Callable[[dict], None] | None = None, *, seed=1):
+                 tokenizer=None, on_event: Callable[[dict], None] | None = None, *, seed=1,
+                 search_excluded_token_ids=()):
         self.config = config if isinstance(config, MCTSConfig) else MCTSConfig(**(config or {}))
         self.config.validate_length(gen_length)
         if prompt_ids.ndim != 2 or prompt_ids.shape[0] != 1 or prompt_ids.dtype != torch.long:
             raise ValueError("prompt_ids must be an int64 tensor with shape [1, P].")
         derive_seed(seed, "validation")
+        if any(type(token) is not int or token < 0 for token in search_excluded_token_ids):
+            raise ValueError("Search exclusions must be nonnegative integer token IDs.")
+        self.search_excluded_token_ids = tuple(sorted(set(search_excluded_token_ids)))
         self.seed = seed
         self.model, self.mask_id, self.tokenizer = model, mask_id, tokenizer
         self.prompt_len = prompt_ids.shape[1]
@@ -586,7 +601,8 @@ class MCTSSearch:
         if self.root.analysis is None:
             with self._counted.phase("tree_analysis"):
                 self.root.analysis = analyze_state(self._counted, self.root.state, self.prompt_len,
-                                                   self.mask_id, self.config)
+                                                   self.mask_id, self.config,
+                                                   search_excluded_token_ids=self.search_excluded_token_ids)
             self._emit("initialization", node_id=0, entropy=self.root.analysis.total_entropy,
                        masked_count=self.root.state.shape[1] - self.prompt_len,
                        mean_token_entropy=self.root.analysis.total_entropy / (self.root.state.shape[1] - self.prompt_len),
@@ -612,6 +628,8 @@ class MCTSSearch:
                    path=[0] + [hop["chosen_id"] for hop in decisions], decisions=decisions)
         parent.expanded = True
         for action in parent.analysis.actions:
+            if action.token_id in self.search_excluded_token_ids:
+                raise RuntimeError("Excluded termination token reached search expansion.")
             with self._counted.phase("expansion"):
                 child = expand_node(parent, action, len(self.nodes), self.prompt_len, self.mask_id, self.config.init_tokens)
                 self.nodes.append(child)
@@ -623,7 +641,7 @@ class MCTSSearch:
             try:
                 with self._counted.phase("simulation"):
                     evaluation = evaluate_action(self._counted, parent, child, self.prompt_len, self.mask_id,
-                                                 self.config)
+                                                 self.config, search_excluded_token_ids=self.search_excluded_token_ids)
             except BudgetExhausted:
                 child.closed = True
                 self._emit("simulation_interrupted", phase="simulation", child_id=child.node_id)
@@ -697,6 +715,15 @@ class MCTSSearch:
                  "candidate_evaluations": [{"node_id": n.node_id, "reward": n.mean_reward,
                      "immediate_gain": n.immediate_reward, "model_calls": 0,
                      **state_record(n.state, self.prompt_len, self.mask_id, self.tokenizer)} for n in candidates]}
+        # Additive metadata: preserve legacy fallback_used (quota shortfall) for
+        # old callers. E0 distinguishes that from actually decoding below Lc.
+        shortlist = sorted(candidates, key=lambda n: (-n.mean_reward, n.node_id))[:self.config.num_candidates]
+        source = "target_depth" if candidates else "deepest_evaluated" if evaluated else "root"
+        stats.update(search_excluded_token_ids=list(self.search_excluded_token_ids),
+                     candidate_shortlist=[{"node_id": n.node_id, "depth": n.depth,
+                                           "reward": n.mean_reward} for n in shortlist],
+                     shortlist_size=len(shortlist), shortlist_underfilled=len(shortlist) < self.config.num_candidates,
+                     selection_source=source, fallback_decode_used=source != "target_depth")
         return SearchResult(selected, candidates, stats, list(self.trace))
 
     def run(self):
