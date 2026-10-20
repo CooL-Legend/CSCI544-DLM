@@ -81,7 +81,7 @@ def test_six_conditions_one_load_real_accounting_and_offline_report(tmp_path, mo
         assert row["prompt"].count("Example 1:") == row["prompt"].count("Example 2:") == 1
         assert "#### 27\n\nExample 2:" in row["prompt"]
         assert "#### 16\n\nNow solve the following question using the same decomposition format." in row["prompt"]
-        assert row["prompt"].endswith(f"Problem: {row['question']}\n\n1.")
+        assert row["prompt"].endswith(f"Problem: {row['question']}")
         assert "\nQuestion:\n" not in row["prompt"]
         assert row["protocol_version"] == "e0_fixed_budget_v2"
     for example in summary["common_example_ids"]:
@@ -150,7 +150,7 @@ def test_config_defaults_and_overrides():
     assert default["decoding"]["mcts"]["stop_mode"] == "budget"
     assert default["evaluation"]["search_budgets"] == [512, 1024, 2048]
     question = "How many items are in {a, b, c}?"
-    assert build_e0_prompt(question, default["prompt"]).endswith(f"Problem: {question}\n\n1.")
+    assert build_e0_prompt(question, default["prompt"]).endswith(f"Problem: {question}")
     assert build_e0_prompt(question, {"instructions": "Solve."}) == f"Solve.\n\nQuestion:\n{question}"
     for invalid_prompt in (
         {"instructions": "Solve."},

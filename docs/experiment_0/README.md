@@ -96,7 +96,7 @@ builder then reads those saved artifacts.
 All conditions in development, evaluation, testing and optional quota runs
 receive the same prompt text and chat-template token IDs. `build_e0_prompt`
 replaces `{GSM8K_question}` literally with the selected question in this exact
-`prompt.template`, preserving the trailing `1.`:
+`prompt.template`, ending with the question:
 
 ```text
 Decompose the question into three steps and solve the math problem following the examples.
@@ -122,8 +122,6 @@ Problem: A bakery makes 48 muffins. It sells half of them in the morning and ano
 Now solve the following question using the same decomposition format.
 
 Problem: {GSM8K_question}
-
-1.
 ```
 
 The model wrapper sends this as one user message through the pinned tokenizer's
@@ -520,7 +518,7 @@ with Hub/dataset network access disabled.
 
 The protocol-v2 prompt update subsequently passed **100 tests, with 1
 CUDA-only skip**, covering E0 and the existing GSM8K benchmark. The checks
-include identical demonstration prompts across conditions, the final `1.`,
+include identical demonstration prompts across conditions, the final question block,
 literal question insertion, legacy prompt rendering, and updated notebook
 receipts.
 

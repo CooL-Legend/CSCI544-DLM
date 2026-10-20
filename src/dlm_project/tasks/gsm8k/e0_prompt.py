@@ -4,7 +4,7 @@ from dlm_project.tasks.gsm8k.dataset import build_prompt as build_legacy_prompt
 
 
 def build_e0_prompt(question, settings):
-    """Insert the question literally; preserve the examples and trailing `1.`."""
+    """Insert the question literally and preserve the supplied examples."""
     if "template" in settings:
         return settings["template"].strip().replace("{GSM8K_question}", question.strip())
     # Saved v1 runs used instructions followed by a Question: block.
