@@ -27,7 +27,7 @@ from dlm_project.tasks.gsm8k.e0_tokens import decode_output, resolve_termination
 from dlm_project.tasks.gsm8k.evaluation import score_answer
 
 
-PROTOCOL_VERSION = "e0_fixed_budget_v2"
+PROTOCOL_VERSION = "e0_fixed_budget_v3"
 DECODERS = {"confidence": confidence.decode, "entropy": entropy.decode,
             "medal_no_search": medal_no_search.decode, "medal": mcts_confidence.decode}
 
@@ -76,6 +76,9 @@ def resolve_settings(source, **overrides):
         raise ValueError("E0 requires steps = block_length = gen_length.")
     decoding = config.setdefault("decoding", {})
     decoding.setdefault("seed", 1)
+    decoding.setdefault("completion_method", "llada")
+    if decoding["completion_method"] not in ("llada", "medal"):
+        raise ValueError("decoding.completion_method must be llada or medal.")
     validate_generation(**generation, temperature=1.0, seed=decoding["seed"])
     options = dict(decoding.get("mcts", {}))
     options.setdefault("init_tokens", 5)
@@ -99,9 +102,10 @@ def resolve_settings(source, **overrides):
     config["conditions"] = [
         {"id": "confidence_t0", "method": "confidence", "temperature": 0.0, "search_budget": None},
         {"id": "entropy_t0", "method": "entropy", "temperature": 0.0, "search_budget": None},
-        {"id": "medal_no_search_t1", "method": "medal_no_search", "temperature": 1.0, "search_budget": None},
+        {"id": "medal_no_search_t1", "method": "medal_no_search", "temperature": 1.0, "search_budget": None,
+         "completion_method": decoding["completion_method"]},
         *[{"id": f"medal_{evaluation['search_mode']}_b{b}", "method": "medal",
-           "temperature": 1.0, "search_budget": b} for b in budgets],
+           "temperature": 1.0, "search_budget": b, "completion_method": decoding["completion_method"]} for b in budgets],
     ]
     return config
 
@@ -230,7 +234,8 @@ def run_experiment(source, *, manifest_path=None, output_dir=None, run_manifest=
                                   f"{counter.calls} actual forwards | {event.get('phase', 'search')}", flush=True)
                     if condition["method"] in ("medal", "medal_no_search"):
                         kwargs.update(mcts={**m, "max_model_calls": condition["search_budget"] or m["max_model_calls"]},
-                                      tokenizer=wrapper.tokenizer, on_event=emit)
+                                      tokenizer=wrapper.tokenizer, on_event=emit,
+                                      completion_method=condition["completion_method"])
                     if condition["method"] == "medal":
                         kwargs["search_excluded_token_ids"] = config["termination"]["token_ids"]
                     _sync(wrapper.device)
@@ -276,6 +281,7 @@ def run_experiment(source, *, manifest_path=None, output_dir=None, run_manifest=
                     setup["scoring_seconds"] += perf_counter() - scoring_started
                     row = {**example, "protocol_version": PROTOCOL_VERSION, "condition": condition["id"],
                            "method": condition["method"], "temperature": condition["temperature"],
+                           "completion_method": condition.get("completion_method"),
                            "status": status, "seed": seed, "prompt": prompt, "prompt_hash": digest(prompt),
                            "prompt_ids_hash": digest(prompt_ids.cpu().tolist()),
                            "model_revision": wrapper.identity["revision"], "dataset_revision": config["data"]["revision"],

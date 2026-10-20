@@ -101,6 +101,9 @@ def load_records(directory, config):
                 or row["total_nfes"] != row["search_nfes"] + row["completion_nfes"]
                 or any(type(row[field]) is not int or row[field] < 0 for field in ("search_nfes", "completion_nfes", "total_nfes"))):
             raise ValueError("E0 identity or NFE accounting mismatch.")
+        expected_completion = condition.get("completion_method", "medal") if condition["method"] in ("medal", "medal_no_search") else None
+        if row.get("completion_method", expected_completion) != expected_completion:
+            raise ValueError("E0 completion decoder identity mismatch.")
         if condition["search_budget"] is None:
             if row["search_nfes"] != 0:
                 raise ValueError("No-search baseline used search NFEs.")
@@ -203,7 +206,8 @@ def generate_report(run_dir):
     for item in summary["gains"]:
         lines.append(f"| {item['condition']} | {item['baseline']} | {number(item['accuracy_gain_pp'])} | "
                      f"{number(item['additional_mean_nfes'])} | {number(item['accuracy_gain_pp_per_additional_nfe'])} |")
-    lines += ["", "The T=1 no-search MEDAL control uses the identical downstream decoder and completion seed. "
+    decoder = config.get("decoding", {}).get("completion_method", "medal")
+    lines += ["", f"MEDAL completion decoder: **{decoder}**. The T=1 no-search MEDAL control uses the identical downstream decoder and completion seed. "
               "Greedy baselines use T=0. Search excludes EOS/EOT; every completion permits them and fills all positions. "
               "Scoring uses only the prefix before the first terminator, with the existing strict #### parser.",
               "", "Fallback outputs count normally. Strict quota failures count as incorrect. Missing/interrupted outcomes "

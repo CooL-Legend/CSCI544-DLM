@@ -1,12 +1,12 @@
 # Experiment 0: Baseline Test — implementation README
 
 E0 measures how effectively MEDAL uses a fixed search budget on GSM8K. It
-compares two greedy decoders and the exact MEDAL completion sampler without
+compares two greedy decoders and the current MEDAL completion decoder without
 search against three independently initialized MEDAL searches. The matched
 no-search MEDAL condition is the primary control for the effect of search
 initialization.
 
-Protocol version: **`e0_fixed_budget_v2`**. Shared MEDAL implementation:
+Protocol version: **`e0_fixed_budget_v3`**. Shared MEDAL implementation:
 **`medal_reconstruction_v2`**. This experiment preserves the repository's
 immediate-information-gain reconstruction; it does not establish parity with
 the authors' implementation.
@@ -17,7 +17,7 @@ the authors' implementation.
 |---|---|---:|---:|
 | `confidence_t0` | Highest-confidence position, argmax token | 0 | None |
 | `entropy_t0` | Lowest-entropy position, argmax token | 0 | None |
-| `medal_no_search_t1` | Existing MEDAL adjusted-score completion sampler | 1 | None |
+| `medal_no_search_t1` | Standard LLaDA Gumbel proposals and low-confidence remasking | 1 | None |
 | `medal_budget_b512` | MEDAL initialization, then the same completion sampler | 1 | 512 |
 | `medal_budget_b1024` | MEDAL initialization, then the same completion sampler | 1 | 1024 |
 | `medal_budget_b2048` | MEDAL initialization, then the same completion sampler | 1 | 2048 |
@@ -35,6 +35,7 @@ the authors' implementation.
 | Gamma / exploration constant / epsilon | `10 / 0.01 / 1e-8` |
 | Search stopping | Actual forward cap or exhausted frontier; no simulation-count cap |
 | Search evaluation | Immediate parent-to-child information gain; no completion rollouts during search |
+| Completion method | `decoding.completion_method: llada`; `medal` opts into the previous adjusted-score sampler |
 | Base seed / dataset sampling seed | `1 / 1` |
 | Prompt decomposition / demonstrations | Shared three-step template with the two fixed pens/muffins examples |
 
@@ -60,7 +61,7 @@ Paths below are relative to the repository root.
 | `src/dlm_project/tasks/gsm8k/e0_tokens.py` | EOS/EOT resolution and post-completion prefix scoring |
 | `src/dlm_project/tasks/gsm8k/e0_report.py` | Offline validation, paired summaries, CSVs and plots |
 | `src/dlm_project/decoding/entropy.py` | Entropy decoder using shared `decode_masked` machinery |
-| `src/dlm_project/decoding/medal_no_search.py` | Adapter around the unchanged `complete_medal` |
+| `src/dlm_project/decoding/medal_no_search.py` | No-search control using the same configured completion method as searched MEDAL |
 | `src/dlm_project/decoding/mcts_confidence.py` | Existing MEDAL adapter; optional search-only token exclusions |
 | `src/dlm_project/decoding/mcts_decoding.py` | Existing search/completion engine; exclusions and additive shortlist metadata |
 | `tests/decoding/test_experiment_0.py` | Decoder, budget, selection and EOS tests |
@@ -83,6 +84,9 @@ no-search adapters return the existing `DecodeResult` contract: `token_ids`,
 `total_nfes`, `details`, and `trace`. The MEDAL adapter and `MCTSSearch` accept
 `search_excluded_token_ids=()`; the empty default preserves existing callers.
 The E0 runner supplies validated termination IDs only to the search path.
+Both MEDAL adapters accept `completion_method="llada"` or `"medal"`; their
+low-level default remains `"medal"` for existing callers. E0 explicitly selects
+`"llada"` for both searched and no-search conditions.
 
 A run resolves configuration and its frozen examples, loads the pinned model
 once, validates termination tokens, and performs one separately counted warm-up
@@ -136,11 +140,11 @@ injection; the explicit decomposition template above is still active. Custom
 questions and the legacy `prompt.instructions` configuration are rejected for
 new E0 runs. Prompt and token-ID hashes verify identical inputs across conditions.
 
-Protocol v2 records this prompt change from v1's plain instructions. Existing
+Protocol v3 changes MEDAL completion to standard LLaDA decoding. Protocol
+v2 introduced this demonstration prompt in place of v1's plain instructions. Existing
 v1 artifacts can still be rebuilt offline using their saved original prompt
-configuration. Keep results from the two prompt protocols separate when
-interpreting experiment comparisons. The generation and search settings are
-unchanged.
+configuration. Keep results from different prompt/completion protocols separate when
+interpreting experiment comparisons. The output length and search settings are unchanged.
 
 | Stage | Source | Frozen pool / default run | Intended use |
 |---|---|---|---|
@@ -230,12 +234,24 @@ target states; `shortlist_size` is at most `C`. The legacy
 E0's fallback rate uses `fallback_decode_used`, so an underfilled target-depth
 shortlist does not inflate that rate.
 
-**Completion.** Both searched and no-search MEDAL call the existing
-`complete_medal`. It takes fresh forwards and samples from the literal
-`softmax(action_score / T)` over all legal masked-position/token actions at
-`T=1`. Completion is not restricted to the search top-K actions and does not
-reuse the final search analysis as a free completion step. It commits one token
-per forward until all positions are filled.
+**Completion.** Both searched and no-search MEDAL now use `complete_llada`,
+a state adapter around the repository's standard LLaDA confidence decoder.
+Each forward proposes a token for every remaining masked position using
+LLaDA's existing Gumbel sampling helper, then commits the position with highest
+native probability for its proposed token (`low_confidence` remasking).
+It does not apply the search entropy/margin score to completion selection.
+
+The shared machinery excludes the mask token, normalizes over eligible tokens,
+and preserves the prompt and all MCTS commitments. Completion uses fresh
+forwards, one per remaining mask, without reusing search logits as a free step.
+E0 keeps T=1 for the matched control and searched conditions. The demo also
+supports T=0 for this decoder. EOS/EOT remain eligible throughout completion.
+
+`decoding.completion_method: medal` selects the previous literal
+`softmax(adjusted_score / T)` sampler, which requires T>0. The original
+`complete_medal` function and legacy CLI/AB defaults retain that behavior.
+Saved configuration and prediction records identify the selected completion
+method; offline reports state which decoder generated the answers.
 
 ## 5. EOS/EOT policy and answer extraction
 
@@ -461,7 +477,7 @@ Key `predictions.jsonl` fields:
 | Group | Fields |
 |---|---|
 | Identity | `example_id`, `row_id`, `source_split`, `stage`, `content_hash`, model/dataset revisions, `protocol_version` |
-| Pairing | `condition`, `method`, `temperature`, `seed`, `prompt`, `prompt_hash`, `prompt_ids_hash` |
+| Pairing | `condition`, `method`, `completion_method`, `temperature`, `seed`, `prompt`, `prompt_hash`, `prompt_ids_hash` |
 | Compute/time | `search_nfes`, `completion_nfes`, `total_nfes`, `requested_search_budget`, `budget_utilization`, `search_seconds`, `completion_seconds`, `decoding_seconds` |
 | Search | `selected_depth`, `max_depth`, `average_search_depth`, `candidate_count`, `shortlist_size`, `shortlist_underfilled`, `selection_source`, `fallback_decode_used`, `stop_reason` |
 | Outputs | `full_output_ids`, `raw_output`, `scoring_output_ids`, `scoring_text`, `first_terminator_position`, `first_terminator_id`, `tokens_after_terminator` |

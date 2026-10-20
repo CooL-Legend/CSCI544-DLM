@@ -56,7 +56,7 @@ def initialize_state(prompt_ids, mask_id, gen_length, device, initial_state=None
 @torch.inference_mode()
 def decode_masked(model, prompt_ids, mask_id, *, selection_rule, gen_length=256,
                   steps=256, block_length=128, temperature=1.0, seed=1,
-                  initial_state=None):
+                  initial_state=None, on_event=None):
     """Sample tokens, then commit the scheduled positions in the active block.
 
     Scores use float32 probabilities over legal tokens. Gumbel sampling uses
@@ -121,6 +121,8 @@ def decode_masked(model, prompt_ids, mask_id, *, selection_rule, gen_length=256,
                           "generation_nfes": calls, "actions": actions,
                           "signal_nfe": calls, "signal_extra_nfes": 0, **signals,
                           "remaining_masks": int((state[0, prompt_len:] == mask_id).sum().item())})
+            if on_event is not None:
+                on_event(trace[-1])
     remaining = int((state[0, prompt_len:] == mask_id).sum().item())
     if remaining:
         raise RuntimeError("The transfer schedule left masked output positions.")

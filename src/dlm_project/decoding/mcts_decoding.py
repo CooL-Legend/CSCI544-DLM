@@ -473,7 +473,11 @@ def evaluate_action(model, parent, child, prompt_len, mask_id, config, *,
     analysis = analyze_state(model, child.state, prompt_len, mask_id, config,
                              search_excluded_token_ids=search_excluded_token_ids)
     before, after = parent.analysis.total_entropy, analysis.total_entropy
+    
+    # Any trajectory Based Method --> For experiment 2
     reward = information_gain(before, after, config.epsilon)
+    
+
     if not math.isfinite(reward):
         raise ValueError("Non-finite child information gain.")
     child.analysis, child.immediate_reward = analysis, reward
@@ -759,6 +763,45 @@ def complete_medal(model, state, prompt_len, mask_id, config=None, *, seed=1,
                      policy="adjusted_softmax", temperature=temperature, tokenizer=tokenizer, on_event=emit)
     result.trace = events
     return result
+
+
+@torch.inference_mode()
+def complete_llada(model, state, prompt_len, mask_id, config=None, *, seed=1,
+                   temperature=1.0, tokenizer=None, on_event=None):
+    """LLaDA Gumbel proposals and low-confidence remasking from a partial state."""
+    from dlm_project.decoding.common import decode_masked
+
+    events = []
+    def emit(event):
+        events.append(event)
+        if on_event is not None:
+            on_event(event)
+    class CountCompletion:
+        calls = 0
+        def __getattr__(self, name):
+            return getattr(model, name)
+        def __call__(self, *args, **kwargs):
+            self.calls += 1
+            try:
+                return model(*args, **kwargs)
+            finally:
+                emit({"stage": "forward", "model_calls": self.calls, "seed": seed})
+    counted = CountCompletion()
+    length = state.shape[1] - prompt_len
+    result = decode_masked(counted, state[:, :prompt_len], mask_id,
+                           selection_rule="token_probability", gen_length=length,
+                           steps=length, block_length=length, initial_state=state,
+                           temperature=temperature, seed=seed,
+                           on_event=lambda event: emit({**event, "model_calls": event["generation_nfes"], "seed": seed}))
+    return CompletionResult(result.token_ids.detach().cpu(), counted.calls, events)
+
+
+def resolve_completion_sampler(method):
+    if method == "llada":
+        return complete_llada
+    if method == "medal":
+        return complete_medal
+    raise ValueError("completion_method must be 'llada' or 'medal'.")
 
 
 @torch.inference_mode()

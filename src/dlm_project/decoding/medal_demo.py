@@ -12,7 +12,7 @@ from time import perf_counter
 import torch
 
 from dlm_project.decoding.mcts_decoding import (
-    MCTSConfig, MCTSSearch, SearchResult, complete_medal, derive_seed,
+    MCTSConfig, MCTSSearch, SearchResult, complete_medal, complete_llada, derive_seed,
     information_gain, model_device,
 )
 from dlm_project.decoding.medal_prompting import get_gsm8k_demonstrations, gsm8k_prompt
@@ -238,9 +238,11 @@ def _resolve_sampler(method):
         return method
     if method == "medal":
         return complete_medal
+    if method == "llada":
+        return complete_llada
     module_name, separator, function_name = method.partition(":")
     if not separator:
-        raise ValueError("decoding method must be 'medal', 'module:function', or a callable.")
+        raise ValueError("decoding method must be 'llada', 'medal', 'module:function', or a callable.")
     return getattr(importlib.import_module(module_name), function_name)
 
 
@@ -273,7 +275,7 @@ def run_completion(initialization, *, method="medal", seed=1, temperature=1.0,
     if (ids[:, search.prompt_len:] == search.mask_id).any():
         raise ValueError("The sampler left masked output positions.")
     remaining = int((initialization.state[:, search.prompt_len:] == search.mask_id).sum().item())
-    if method == "medal" and counted.calls != remaining:
+    if method in ("medal", "llada") and counted.calls != remaining:
         raise RuntimeError("MEDAL completion must use one forward per remaining output mask.")
     decoded = (decode_output(tokenizer or search.tokenizer, ids[0, search.prompt_len:].tolist(),
                              termination_token_ids) if termination_token_ids is not None else None)
@@ -291,6 +293,7 @@ def show_no_search_metrics(result, *, prompt_seconds=0.0, setup_seconds=0.0, sco
     low, high = wilson_interval(accuracy, 1) if accuracy is not None else (None, None)
     report = {
         "method": "medal_no_search", "search_nfes": 0, "completion_nfes": result.total_nfes,
+        "completion_method": details.get("completion_method", "medal"),
         "total_nfes": result.total_nfes, "total_nfe": result.total_nfes,
         "search_seconds": 0.0, "completion_seconds": seconds, "decoding_seconds": seconds,
         "total_wall_seconds": prompt_seconds + seconds, "setup_wall_seconds": setup_seconds,
@@ -306,6 +309,7 @@ def show_no_search_metrics(result, *, prompt_seconds=0.0, setup_seconds=0.0, sco
     }
     if display:
         print("MEDAL completion without search — independent control")
+        print(f"Completion decoder: {report['completion_method']}")
         print(f"Search / completion / total NFEs: 0 / {result.total_nfes} / {result.total_nfes}")
         print(f"Completion / combined decoding: {seconds:.3f}s | "
               f"pipeline including prompt: {report['total_wall_seconds']:.3f}s")
@@ -371,6 +375,7 @@ def show_metrics(initialization, completion=None, *, prompt_seconds=0.0,
     fallback = stats.get("fallback_decode_used", source != "target_depth")
     ci_low, ci_high = wilson_interval(report["accuracy"], 1) if report["accuracy"] is not None else (None, None)
     report.update(
+        completion_method=completion.method if completion is not None else None,
         search_nfes=report["initialization_nfe"], completion_nfes=decoding_nfe, total_nfes=total_nfe,
         search_seconds=initialization.wall_seconds, completion_seconds=decoding_seconds,
         decoding_seconds=initialization.wall_seconds + decoding_seconds,
@@ -539,7 +544,7 @@ def main():
     parser.add_argument("--top-k-actions", type=int, default=5)
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--temperature", type=float, default=1.0)
-    parser.add_argument("--decoding-method", default="medal", help="medal or importable module:function.")
+    parser.add_argument("--decoding-method", default="medal", help="medal (legacy default), llada, or importable module:function.")
     args = parser.parse_args()
     config = MCTSConfig(init_tokens=args.init_tokens, num_candidates=args.num_candidates,
                         top_k_tokens=args.top_k_tokens, top_k_actions=args.top_k_actions)

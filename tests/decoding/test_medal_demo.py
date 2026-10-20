@@ -212,6 +212,7 @@ def test_notebook_action_cells_run_with_one_model(demonstrations_path, tmp_path,
                  load_demo_model=lambda **kw: loads.append(kw) or wrapper)
     exec(next(cell.source for cell in notebook.cells if cell.id == "3e50fa7b"), scope)
     assert scope["SEARCH_BUDGET"] == 512 and scope["MCTS_SETTINGS"].init_tokens == 5
+    assert scope["COMPLETION_METHOD"] == "llada"
     assert scope["MCTS_SETTINGS"].stop_mode == "budget" and scope["MCTS_SETTINGS"].max_simulations is None
     scope.update(MODEL_PATH="/drive/model", QUESTION=question, GEN_LENGTH=8, SEED=7,
                  MCTS_SETTINGS=MCTSConfig(init_tokens=2, num_candidates=3, top_k_tokens=2, top_k_actions=3,
@@ -233,6 +234,7 @@ def test_notebook_action_cells_run_with_one_model(demonstrations_path, tmp_path,
     assert scope["prompt"] == prompts[0] and scope["prompt"].endswith(f"Problem: {question}")
     assert "Example 1:" in scope["prompt"] and "Example 2:" in scope["prompt"]
     assert scope["response"] == scope["completion"].decoded_output["scoring_text"]
+    assert scope["completion"].method == scope["no_search"].details["completion_method"] == "llada"
     assert all(node.action.token_id not in scope["TERMINATION_IDS"] for node in scope["initialization"].search.nodes[1:])
     assert scope["metrics"]["fallback_decode_used"] == (budget == 1)
     if budget == 1:

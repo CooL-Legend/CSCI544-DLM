@@ -37,7 +37,7 @@ Install the package with `python -m pip install --no-deps -e .` after installing
 ## Experiment 0: fixed-budget GSM8K baseline test
 
 [Experiment 0](docs/experiment_0/README.md) compares greedy confidence, greedy entropy,
-MEDAL completion without search at T=1, and MEDAL search caps of 512, 1024 and
+MEDAL with standard LLaDA completion without search at T=1, and MEDAL search caps of 512, 1024 and
 2048 actual forwards. It uses Lc=5, a shared three-step decomposition prompt
 with the fixed pens/muffins examples, search-only EOS/EOT
 filtering, and fallback completion after budget exhaustion. The original
@@ -60,9 +60,9 @@ python scripts/experiment_0_baseline_test.py --stage dev
 
 ## Single-prompt MEDAL demo
 
-Use [MEDAL_MCTS_Demo.ipynb](notebooks/gsm8k/MEDAL_MCTS_Demo.ipynb) for one E0-style MEDAL run. It loads one model from the runtime, Drive, or the pinned Hub checkpoint and uses the fixed pens/muffins prompt. Before MCTS, the no-search block runs the exact MEDAL completion sampler from all masks and displays its independent outputs, NFE/runtime and accuracy metrics. Defaults for searched MEDAL are target depth 5 and a 512-forward search budget; set `SEARCH_BUDGET` to 1024 or 2048 for larger runs. Live counters show actual search NFEs/budget, evaluated depth and candidate count. The existing cells inspect up to three cached candidates or the selected fallback, then complete that state. The control and search share the model, prompt and completion seed; the control's cost is kept separate from searched MEDAL's totals.
+Use [MEDAL_MCTS_Demo.ipynb](notebooks/gsm8k/MEDAL_MCTS_Demo.ipynb) for one E0-style MEDAL run. It loads one model from the runtime, Drive, or the pinned Hub checkpoint and uses the fixed pens/muffins prompt. Before MCTS, the no-search block runs standard LLaDA completion from all masks and displays its independent outputs, NFE/runtime and accuracy metrics. Defaults for searched MEDAL are target depth 5 and a 512-forward search budget; set `SEARCH_BUDGET` to 1024 or 2048 for larger runs. Live counters show actual search NFEs/budget, evaluated depth and candidate count. The existing cells inspect up to three cached candidates or the selected fallback, then complete that state. The control and search share the model, prompt and completion seed; the control's cost is kept separate from searched MEDAL's totals.
 
-The completion cell reuses the same initialization and accepts `method="medal"`, an imported callable, or `"my_sampler:decode"`. Each sampler receives a fresh partial-state copy; the helper counts its actual forwards and checks that it preserves the prompt and initialized tokens. Search excludes EOS/EOT; completion fills all positions and retains full outputs while scoring the prefix before the first terminator. Reports include stage costs, search/completion/total NFEs and runtime, budget utilization, depths, shortlist/fallback status, parse success and reference-based accuracy with a Wilson interval. An optional 10-question batch reuses the model and saves aggregate metrics.
+The completion cell reuses the same initialization and defaults to `method="llada"` (Gumbel token proposals and low-confidence remasking); `"medal"` selects the prior adjusted-score sampler, and custom callables or `"my_sampler:decode"` remain supported. Each sampler receives a fresh partial-state copy; the helper counts its actual forwards and checks that it preserves the prompt and initialized tokens. Search excludes EOS/EOT; completion fills all positions and retains full outputs while scoring the prefix before the first terminator. Reports include stage costs, search/completion/total NFEs and runtime, budget utilization, depths, shortlist/fallback status, parse success and reference-based accuracy with a Wilson interval. An optional 10-question batch reuses the model and saves aggregate metrics.
 
 The separate CLI retains its original prompt, depth-20 quota defaults and sampler interface:
 

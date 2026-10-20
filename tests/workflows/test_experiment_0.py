@@ -83,7 +83,7 @@ def test_six_conditions_one_load_real_accounting_and_offline_report(tmp_path, mo
         assert "#### 16\n\nNow solve the following question using the same decomposition format." in row["prompt"]
         assert row["prompt"].endswith(f"Problem: {row['question']}")
         assert "\nQuestion:\n" not in row["prompt"]
-        assert row["protocol_version"] == "e0_fixed_budget_v2"
+        assert row["protocol_version"] == "e0_fixed_budget_v3"
     for example in summary["common_example_ids"]:
         paired = [row for row in rows if row["example_id"] == example]
         assert len({row["prompt_ids_hash"] for row in paired}) == 1
@@ -149,6 +149,8 @@ def test_config_defaults_and_overrides():
     assert default["decoding"]["mcts"]["init_tokens"] == 5
     assert default["decoding"]["mcts"]["stop_mode"] == "budget"
     assert default["evaluation"]["search_budgets"] == [512, 1024, 2048]
+    assert default["decoding"]["completion_method"] == "llada"
+    assert all(c["completion_method"] == "llada" for c in default["conditions"] if c["method"].startswith("medal"))
     question = "How many items are in {a, b, c}?"
     assert build_e0_prompt(question, default["prompt"]).endswith(f"Problem: {question}")
     assert build_e0_prompt(question, {"instructions": "Solve."}) == f"Solve.\n\nQuestion:\n{question}"

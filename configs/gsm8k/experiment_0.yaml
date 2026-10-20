@@ -43,6 +43,7 @@ generation:
   block_length: 256
 decoding:
   seed: 1
+  completion_method: llada  # Standard LLaDA Gumbel proposals + low-confidence remasking.
   mcts:
     init_tokens: 5
     num_candidates: 3
