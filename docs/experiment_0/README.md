@@ -298,6 +298,15 @@ configuration and run cells. Freeze settings on development/evaluation
 questions before viewing final-test answers; testing remains `Lc=5` unless
 changed beforehand.
 
+For a single interactive MEDAL run, use
+[`MEDAL_MCTS_Demo.ipynb`](../../notebooks/gsm8k/MEDAL_MCTS_Demo.ipynb).
+Its existing cells use this E0 prompt, search and EOS policy, with `Lc=5` and
+one `SEARCH_BUDGET=512` control (alternatives 1024/2048). Live counters show
+budget use, evaluated depth and candidates. The report includes E0's applicable
+MEDAL metrics and separate pipeline/decoding timings; completion reruns reuse
+the initialization. Its optional batch remains disabled by default. The
+standalone `demo_medal.py` CLI retains its legacy defaults.
+
 ### Command line
 
 Install the existing LLaDA profile in an environment with appropriate PyTorch:

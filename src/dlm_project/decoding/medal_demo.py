@@ -5,6 +5,7 @@ from dataclasses import asdict, dataclass
 import importlib
 import json
 from pathlib import Path
+from statistics import mean, median
 from textwrap import fill
 from time import perf_counter
 
@@ -16,7 +17,10 @@ from dlm_project.decoding.mcts_decoding import (
 )
 from dlm_project.decoding.medal_prompting import get_gsm8k_demonstrations, gsm8k_prompt
 from dlm_project.experiments.artifacts import save_json
+from dlm_project.experiments.sweep_report import percentile, wilson_interval
 from dlm_project.tasks.gsm8k.dataset import build_prompt
+from dlm_project.tasks.gsm8k.e0_prompt import build_e0_prompt
+from dlm_project.tasks.gsm8k.e0_tokens import decode_output, resolve_termination_tokens
 from dlm_project.tasks.gsm8k.evaluation import score_answer
 
 
@@ -37,6 +41,7 @@ class InitializationResult:
     search: MCTSSearch
     result: SearchResult
     wall_seconds: float
+    progress_wall_seconds: float = 0.0
 
     @property
     def state(self):
@@ -51,6 +56,7 @@ class DecodingResult:
     wall_seconds: float
     method: str
     trace: list[dict]
+    decoded_output: dict | None = None
 
 
 def _sync(model):
@@ -72,8 +78,12 @@ def load_demo_model(**settings):
 
 
 def prepare_prompt(question, demonstrations_path, *, revision=None, cache_dir=None,
-                   instructions=DEFAULT_INSTRUCTIONS):
+                   instructions=DEFAULT_INSTRUCTIONS, prompt_settings=None):
     """Use the current two-shot prompt without loading a test set or scoring answers."""
+    if prompt_settings is not None:
+        return build_e0_prompt(question, prompt_settings), {
+            "prompt_format": "e0_template", "planning_model_calls": 0, "setup_wall_seconds": 0.0,
+        }
     started = perf_counter()
     path = Path(demonstrations_path).expanduser()
     if revision is None:
@@ -103,7 +113,11 @@ def prepare_demo_prompt(wrapper, question, demonstrations_path, **settings):
     return prompt, prompt_ids, metadata
 
 
-def show_prompt(question):
+def show_prompt(question, *, prompt=None):
+    if prompt is not None:
+        print(f"Full user prompt:\n{prompt}\n")
+        print("Planning NFE: 0; decomposition is generated within the answer.", flush=True)
+        return
     print(f"Prompt:\n{question.strip()}\n")
     print("Inline decomposition template (generated reasoning appears in the final output):")
     print("1. Identify the quantities and the quantity being asked for.")
@@ -114,14 +128,43 @@ def show_prompt(question):
 
 @torch.inference_mode()
 def run_initialization(model, prompt_ids, mask_id, *, gen_length=256, mcts=None,
-                       seed=1, tokenizer=None):
+                       seed=1, tokenizer=None, search_excluded_token_ids=(),
+                       on_event=None, show_progress=False):
     _sync(model)
     started = perf_counter()
+    max_depth, candidates, last_calls, progress_seconds = 0, 0, 0, 0.0
+
+    def emit(event):
+        nonlocal max_depth, candidates, last_calls, progress_seconds
+        if on_event is not None:
+            on_event(event)
+        if not show_progress:
+            return
+        previous_depth = max_depth
+        if event["stage"] == "evaluation":
+            max_depth = max(max_depth, event["depth"])
+        if event["stage"] in ("candidate", "termination"):
+            candidates = event["candidate_count"]
+        calls = event["search_model_calls"]
+        if (event["stage"] in ("initialization", "termination")
+                or (event["stage"] == "evaluation"
+                    and (max_depth > previous_depth or calls // 32 > last_calls // 32))):
+            budget = search.config.max_model_calls
+            utilization = f" ({calls / budget:.1%})" if budget is not None else ""
+            stop = f" | stop: {event['stop_reason']}" if event["stage"] == "termination" else ""
+            display_started = perf_counter()
+            print(f"Search NFEs: {calls}/{budget if budget is not None else 'uncapped'}{utilization} | "
+                  f"evaluated depth: {max_depth}/{search.config.init_tokens} | "
+                  f"candidates: {candidates}{stop}", flush=True)
+            progress_seconds += perf_counter() - display_started
+            last_calls = calls
+
     search = MCTSSearch(model, prompt_ids, mask_id, gen_length, mcts,
-                        tokenizer=tokenizer, seed=seed)
+                        tokenizer=tokenizer, seed=seed, on_event=emit,
+                        search_excluded_token_ids=search_excluded_token_ids)
     result = search.run()
     _sync(model)
-    return InitializationResult(search, result, perf_counter() - started)
+    return InitializationResult(search, result, perf_counter() - started - progress_seconds, progress_seconds)
 
 
 def candidate_summaries(initialization, *, tokenizer=None, limit=3):
@@ -129,7 +172,11 @@ def candidate_summaries(initialization, *, tokenizer=None, limit=3):
     search, result = initialization.search, initialization.result
     tokenizer = tokenizer or search.tokenizer
     root_entropy = search.root.analysis.total_entropy
-    candidates = sorted(result.candidates, key=lambda node: -node.mean_reward)[:limit]
+    candidates = sorted(result.candidates, key=lambda node: (-node.mean_reward, node.node_id))[
+        :min(limit, search.config.num_candidates)]
+    fallback = not candidates and limit > 0
+    if fallback:
+        candidates = [result.selected]
     rows = []
     for rank, node in enumerate(candidates, 1):
         actions, current = [], node
@@ -142,6 +189,7 @@ def candidate_summaries(initialization, *, tokenizer=None, limit=3):
             current = current.parent
         entropy = node.analysis.total_entropy
         rows.append({"rank": rank, "node_id": node.node_id, "selected": node is result.selected,
+                     "is_fallback": fallback,
                      "value": node.mean_reward, "depth": node.depth, "entropy": entropy,
                      "entropy_reduction": root_entropy - entropy,
                      "relative_entropy_reduction": information_gain(root_entropy, entropy, search.config.epsilon),
@@ -151,12 +199,20 @@ def candidate_summaries(initialization, *, tokenizer=None, limit=3):
 
 def show_candidates(initialization, *, tokenizer=None, limit=3):
     rows = candidate_summaries(initialization, tokenizer=tokenizer, limit=limit)
-    print(f"Top {len(rows)} of {len(initialization.result.candidates)} initialization candidates")
-    print("Q = cached selection value (last-edge normalized entropy reduction).")
+    stats = initialization.result.stats
+    target_rows = sum(not row["is_fallback"] for row in rows)
+    print(f"Top {target_rows} of {len(initialization.result.candidates)} initialization candidates")
+    print("Q = cached mean tree reward; target-depth leaves use last-edge normalized entropy reduction.")
+    if rows and rows[0]["is_fallback"]:
+        source = stats.get("selection_source", "root" if rows[0]["depth"] == 0 else "deepest_evaluated")
+        print(f"No target-depth candidates. Selected {source} fallback at depth {rows[0]['depth']}.")
+    elif len(initialization.result.candidates) < initialization.search.config.num_candidates:
+        print("Shortlist underfilled; completing the best available target-depth state.")
     print("Tokens: zero-based output position, decoded value, adjusted confidence s.")
     for row in rows:
         marker = " [selected]" if row["selected"] else ""
-        print(f"\nC{row['rank']}{marker}: Q={row['value']:+.6f} | {row['depth']} unmasked tokens")
+        label = "Fallback" if row["is_fallback"] else f"C{row['rank']}"
+        print(f"\n{label}{marker}: Q={row['value']:+.6f} | {row['depth']} unmasked tokens")
         tokens = "; ".join(f"{a['position']}:{a['token']!r} (s={a['confidence']:.4g})"
                            for a in row["tokens"])
         print(fill(tokens, width=110, initial_indent="  ", subsequent_indent="  "))
@@ -190,7 +246,7 @@ def _resolve_sampler(method):
 
 @torch.inference_mode()
 def run_completion(initialization, *, method="medal", seed=1, temperature=1.0,
-                   tokenizer=None):
+                   tokenizer=None, termination_token_ids=None):
     """Run a sampler on a fresh copy; changing method never reruns initialization.
 
     A custom module:function accepts the complete_medal signature (without
@@ -216,8 +272,13 @@ def run_completion(initialization, *, method="medal", seed=1, temperature=1.0,
         raise ValueError("The sampler changed the prompt or an MCTS commitment.")
     if (ids[:, search.prompt_len:] == search.mask_id).any():
         raise ValueError("The sampler left masked output positions.")
+    remaining = int((initialization.state[:, search.prompt_len:] == search.mask_id).sum().item())
+    if method == "medal" and counted.calls != remaining:
+        raise RuntimeError("MEDAL completion must use one forward per remaining output mask.")
+    decoded = (decode_output(tokenizer or search.tokenizer, ids[0, search.prompt_len:].tolist(),
+                             termination_token_ids) if termination_token_ids is not None else None)
     name = method if isinstance(method, str) else method.__name__
-    return DecodingResult(ids, counted.calls, seconds, name, getattr(output, "trace", []))
+    return DecodingResult(ids, counted.calls, seconds, name, getattr(output, "trace", []), decoded)
 
 
 def show_metrics(initialization, completion=None, *, prompt_seconds=0.0,
@@ -265,12 +326,41 @@ def show_metrics(initialization, completion=None, *, prompt_seconds=0.0,
               "accuracy": float(score["exact_match"]) if score and score["exact_match"] is not None else None,
               "prompt_token_count": initialization.search.prompt_len,
               "timing_mode": "CUDA-synchronized" if model_device(initialization.search.model).type == "cuda" else "CPU"}
+    budget = initialization.search.config.max_model_calls
+    shortlist_size = stats.get("shortlist_size", min(tree["candidate_count"], tree["candidate_target"]))
+    source = stats.get("selection_source", "target_depth" if tree["candidate_count"] else
+                       "deepest_evaluated" if tree["selected_depth"] else "root")
+    fallback = stats.get("fallback_decode_used", source != "target_depth")
+    ci_low, ci_high = wilson_interval(report["accuracy"], 1) if report["accuracy"] is not None else (None, None)
+    report.update(
+        search_nfes=report["initialization_nfe"], completion_nfes=decoding_nfe, total_nfes=total_nfe,
+        search_seconds=initialization.wall_seconds, completion_seconds=decoding_seconds,
+        decoding_seconds=initialization.wall_seconds + decoding_seconds,
+        progress_wall_seconds=initialization.progress_wall_seconds,
+        requested_search_budget=budget, budget_utilization=stats["search_model_calls"] / budget if budget else None,
+        selected_depth=tree["selected_depth"], max_depth=tree["max_evaluated_depth"],
+        average_search_depth=tree["average_search_depth"], candidate_count=tree["candidate_count"],
+        shortlist_size=shortlist_size, shortlist_underfilled=stats.get("shortlist_underfilled", shortlist_size < tree["candidate_target"]),
+        selection_source=source, fallback_decode_used=fallback,
+        fallback_rate=float(fallback) if completion is not None else None, stop_reason=tree["stop_reason"],
+        parse_success=score["parse_success"] if score is not None else None,
+        parse_rate=float(score["parse_success"]) if score is not None else None,
+        exact_match=score["exact_match"] if score is not None else None,
+        accuracy_percent=100 * report["accuracy"] if report["accuracy"] is not None else None,
+        accuracy_ci95_low=ci_low, accuracy_ci95_high=ci_high,
+    )
     if display:
         print(f"{'Stage':<16} {'Substage':<35} {'NFE':>6} {'Seconds':>10}")
         for row in rows:
             print(f"{row['stage']:<16} {row['substage']:<35} {row['nfe']:>6} {row['wall_seconds']:>10.6f}")
         print(f"Initialization total: {report['initialization_nfe']} NFE | {initialization.wall_seconds:.3f}s")
         print(f"Total NFE: {total_nfe} | pipeline wall clock: {report['total_wall_seconds']:.3f}s")
+        print(f"Search / completion / total NFEs: {report['search_nfes']} / {decoding_nfe} / {total_nfe} | "
+              f"combined decoding: {report['decoding_seconds']:.3f}s")
+        utilization = f"{report['budget_utilization']:.1%}" if budget else "unavailable (uncapped)"
+        print(f"Search budget: {budget if budget else 'uncapped'} | utilization: {utilization}")
+        print(f"Shortlist: {shortlist_size}/{tree['candidate_target']} | "
+              f"underfilled: {report['shortlist_underfilled']} | selection: {source} | fallback: {fallback}")
         print(f"Demonstration setup/cache: {setup_seconds:.3f}s (separate; model loading reported above)")
         print(f"Expanded parents: {tree['expanded_parents']} | evaluated children: {tree['evaluated_children']} | "
               f"unique states: {tree['unique_tree_states']} | model evaluations: {total_nfe} (batch size 1)")
@@ -281,11 +371,15 @@ def show_metrics(initialization, completion=None, *, prompt_seconds=0.0,
         if score is not None:
             accuracy = f"{report['accuracy']:.0%} (n=1)" if report["accuracy"] is not None else "unavailable (no reference)"
             print(f"Task accuracy: {accuracy} | parsed answer: {score['predicted_answer']}", flush=True)
+            interval = f"{ci_low:.1%}–{ci_high:.1%}" if ci_low is not None else "unavailable (no reference)"
+            print(f"Wilson 95% interval: {interval} | parsed: {score['parse_success']} | "
+                  f"correct: {score['exact_match']}", flush=True)
     return report
 
 
 def run_demo_batch(wrapper, demonstrations_path, manifest_path, output_dir, *, num_samples=10,
-                   gen_length=256, mcts=None, seed=1, temperature=1.0, method="medal", cache_dir=None):
+                   gen_length=256, mcts=None, seed=1, temperature=1.0, method="medal", cache_dir=None,
+                   prompt_settings=None, termination_token_ids=None, show_progress=False):
     """Optional ordered GSM8K test subset, reusing the demo's model and helpers."""
     from dlm_project.experiments.paths import create_run_directory
     from dlm_project.tasks.gsm8k.benchmark import example_seed
@@ -295,7 +389,9 @@ def run_demo_batch(wrapper, demonstrations_path, manifest_path, output_dir, *, n
     config.validate_length(gen_length)
     started = perf_counter()
     path = Path(demonstrations_path).expanduser()
-    revision = json.loads(path.read_text())["dataset"]["revision"] if path.is_file() else None
+    revision = json.loads(path.read_text())["dataset"]["revision"] if path.is_file() and prompt_settings is None else None
+    if prompt_settings is not None and termination_token_ids is None:
+        termination_token_ids = resolve_termination_tokens(wrapper.tokenizer, wrapper.model, wrapper.mask_id)["token_ids"]
     manifest = get_manifest(manifest_path, cache_dir=cache_dir, revision=revision)
     examples = select_examples(manifest, "smoke", num_samples)
     setup_seconds = perf_counter() - started
@@ -303,6 +399,7 @@ def run_demo_batch(wrapper, demonstrations_path, manifest_path, output_dir, *, n
     save_json(directory / "config.json", {"mcts": asdict(config), "gen_length": gen_length,
               "seed": seed, "temperature": temperature, "method": method if isinstance(method, str) else method.__name__,
               "dataset": manifest["dataset"], "model": getattr(wrapper, "identity", {}),
+              "prompt": prompt_settings, "termination_token_ids": termination_token_ids,
               "example_ids": [row["example_id"] for row in examples]})
     records = []
 
@@ -327,6 +424,22 @@ def run_demo_batch(wrapper, demonstrations_path, manifest_path, output_dir, *, n
                                              "average_search_depth", "realized_branching_factor")},
                    "max_evaluated_depth": max((row["tree"]["max_evaluated_depth"] for row in metrics), default=0),
                    "error": error}
+        ci_low, ci_high = wilson_interval(correct, count)
+        summary.update(accuracy_percent=100 * correct / count if count else None,
+                       accuracy_ci95_low=ci_low, accuracy_ci95_high=ci_high,
+                       parse_rate=mean(row["parse_success"] for row in metrics) if count else None,
+                       fallback_rate=mean(row["fallback_decode_used"] for row in metrics) if count else None,
+                       shortlist_underfilled_rate=mean(row["shortlist_underfilled"] for row in metrics) if count else None,
+                       median_decoding_seconds=median(row["decoding_seconds"] for row in metrics) if count else None,
+                       p95_decoding_seconds=percentile([row["decoding_seconds"] for row in metrics], .95),
+                       stop_reasons={reason: sum(row["stop_reason"] == reason for row in metrics)
+                                     for reason in sorted({row["stop_reason"] for row in metrics})})
+        for field in ("search_nfes", "completion_nfes", "total_nfes", "search_seconds", "completion_seconds", "decoding_seconds"):
+            summary[field] = sum(row[field] for row in metrics)
+        for field in ("search_nfes", "completion_nfes", "total_nfes", "search_seconds", "completion_seconds", "decoding_seconds",
+                      "budget_utilization", "selected_depth", "max_depth", "average_search_depth", "candidate_count", "shortlist_size"):
+            values = [row[field] for row in metrics if row[field] is not None]
+            summary["mean_" + field] = mean(values) if values else None
         save_json(directory / "summary.json", summary)
         return summary
 
@@ -336,18 +449,24 @@ def run_demo_batch(wrapper, demonstrations_path, manifest_path, output_dir, *, n
         with (directory / "predictions.jsonl").open("a", encoding="utf-8") as predictions:
             for example in examples:
                 prompt, prompt_ids, metadata = prepare_demo_prompt(
-                    wrapper, example["question"], path, revision=manifest["dataset"]["revision"], cache_dir=cache_dir)
+                    wrapper, example["question"], path, revision=manifest["dataset"]["revision"], cache_dir=cache_dir,
+                    prompt_settings=prompt_settings)
                 current_seed = example_seed(seed, example["row_id"])
                 initial = run_initialization(wrapper.model, prompt_ids, wrapper.mask_id, gen_length=gen_length,
-                                             mcts=config, seed=current_seed, tokenizer=wrapper.tokenizer)
+                                             mcts=config, seed=current_seed, tokenizer=wrapper.tokenizer,
+                                             search_excluded_token_ids=termination_token_ids or (), show_progress=show_progress)
                 completion = run_completion(initial, method=method, seed=current_seed,
-                                            temperature=temperature, tokenizer=wrapper.tokenizer)
-                text = wrapper.tokenizer.decode(completion.token_ids[0, prompt_ids.shape[1]:].tolist(), skip_special_tokens=True)
+                                            temperature=temperature, tokenizer=wrapper.tokenizer,
+                                            termination_token_ids=termination_token_ids)
+                decoded = completion.decoded_output
+                text = (decoded["scoring_text"] if decoded is not None else
+                        wrapper.tokenizer.decode(completion.token_ids[0, prompt_ids.shape[1]:].tolist(), skip_special_tokens=True))
                 metrics = show_metrics(initial, completion, prompt_seconds=metadata["prompt_wall_seconds"],
                                        setup_seconds=metadata["setup_wall_seconds"],
                                        score=score_answer(text, example["reference_solution"]), display=False)
                 record = {"example_id": example["example_id"], "seed": current_seed,
-                          "question": example["question"], "raw_output": text, "metrics": metrics}
+                          "question": example["question"], "raw_output": text, "metrics": metrics,
+                          "prompt": prompt, **(decoded or {})}
                 predictions.write(json.dumps(record, allow_nan=False) + "\n")
                 predictions.flush()
                 records.append(record)

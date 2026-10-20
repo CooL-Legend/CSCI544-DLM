@@ -10,8 +10,12 @@ import torch
 
 from dlm_project.decoding import medal_demo as demo
 from dlm_project.decoding.mcts_decoding import MCTSConfig
+from dlm_project.experiments.config import load_config
 from dlm_project.experiments.manifests import digest
+from dlm_project.models.profiles import get_profile
+from dlm_project.tasks.gsm8k.e0_tokens import resolve_termination_tokens
 from tests.decoding.helpers import FakeModel, FakeTokenizer, MASK, PROMPT
+from tests.tasks.test_e0_dataset import Tokenizer as E0Tokenizer
 
 
 @pytest.fixture
@@ -170,37 +174,57 @@ def test_cli_runs_one_question_without_an_evaluation(demonstrations_path, tmp_pa
 
 
 @pytest.mark.parametrize("question", ["A custom question?", demo.DEFAULT_QUESTION])
-def test_notebook_action_cells_run_with_one_model(demonstrations_path, tmp_path, question):
+@pytest.mark.parametrize("budget", [1, 12])
+def test_notebook_action_cells_run_with_one_model(demonstrations_path, tmp_path, question, budget):
     root = Path(__file__).resolve().parents[2]
     notebook = nbformat.read(root / "notebooks/gsm8k/MEDAL_MCTS_Demo.ipynb", as_version=4)
     nbformat.validate(notebook)
+    assert [cell.id for cell in notebook.cells] == [
+        "0fb94d89", "5a532510", "05cd374e", "2bda1f2f", "b0cdc487", "422b92ec", "9b56c23c",
+        "3e50fa7b", "8e2fb8a6", "1a98942a", "cc6e8808", "46d5d403", "292fe0aa", "ec0e6744",
+        "5a5fdb7d", "02b7b325", "f0d6e2ee", "9faf852b", "e71f242e", "2b576fd9", "score-answer",
+        "7741b4d8", "3ae77c20", "runtime-explanation", "runtime-costs", "batch-description",
+        "batch-settings", "run-batch", "batch-summary",
+    ]
     for index, cell in enumerate(notebook.cells):
         if cell.cell_type == "code":
             assert cell.outputs == [] and cell.execution_count is None
             compile(cell.source, f"cell-{index}", "exec")
     # Execute the actual action cells with a controlled model, not copied orchestration.
-    model, tokenizer = FakeModel(), FakeTokenizer()
+    model, tokenizer = FakeModel(lambda _: [0, .45, .35, .1, .06, .04]), E0Tokenizer()
+    prompts = []
     wrapper = SimpleNamespace(model=model, tokenizer=tokenizer, mask_id=MASK,
-                              encode_prompt=lambda text: tokenizer(text).input_ids)
+                              encode_prompt=lambda text: prompts.append(text) or PROMPT.clone())
     loads = []
     scope = {name: getattr(demo, name) for name in (
         "prepare_demo_prompt", "show_prompt", "run_initialization", "show_candidates", "show_metrics", "run_completion",
         "score_answer")}
-    scope.update(Path=Path, MODEL_PATH="/drive/model", QUESTION=question, PROMPT_FILE=None,
-                 DEFAULT_QUESTION=demo.DEFAULT_QUESTION, REFERENCE_SOLUTION=None, DRIVE_ROOT=tmp_path,
+    scope.update(Path=Path, REPO_DIR=root, get_profile=get_profile, load_config=load_config,
+                 MCTSConfig=MCTSConfig, DEFAULT_QUESTION=demo.DEFAULT_QUESTION, DRIVE_ROOT=tmp_path,
                  run_demo_batch=lambda *a, **kw: pytest.fail("Disabled batch must not run"),
                  DEMONSTRATIONS_PATH=demonstrations_path, os=SimpleNamespace(environ={"HF_DATASETS_CACHE": "cache"}),
-                 GEN_LENGTH=4, SEED=7, TEMPERATURE=1.0,
-                 MCTS_SETTINGS=MCTSConfig(init_tokens=2, num_candidates=3, top_k_tokens=2, top_k_actions=2),
+                 resolve_termination_tokens=resolve_termination_tokens,
                  load_demo_model=lambda **kw: loads.append(kw) or wrapper)
+    exec(next(cell.source for cell in notebook.cells if cell.id == "3e50fa7b"), scope)
+    assert scope["SEARCH_BUDGET"] == 512 and scope["MCTS_SETTINGS"].init_tokens == 5
+    assert scope["MCTS_SETTINGS"].stop_mode == "budget" and scope["MCTS_SETTINGS"].max_simulations is None
+    scope.update(MODEL_PATH="/drive/model", QUESTION=question, GEN_LENGTH=8, SEED=7,
+                 MCTS_SETTINGS=MCTSConfig(init_tokens=2, num_candidates=3, top_k_tokens=2, top_k_actions=3,
+                                          stop_mode="budget", max_model_calls=budget))
     start = next(i for i, cell in enumerate(notebook.cells) if cell.source.startswith("llada = load_demo_model"))
     for cell in notebook.cells[start:]:
         if cell.cell_type == "code":
             assert len(cell.source.splitlines()) <= 5
             exec(cell.source, scope)
-    assert len(loads) == 1 and len(model.seen) == 9
-    assert scope["completion"].model_calls == 2
-    assert scope["metrics"]["total_nfe"] == 9
+    assert len(loads) == 1
+    assert len(model.seen) == scope["metrics"]["total_nfe"] == scope["metrics"]["total_nfes"]
+    assert scope["initialization"].result.stats["search_model_calls"] == budget
+    assert scope["completion"].model_calls == 8 - scope["metrics"]["selected_depth"]
+    assert scope["prompt"] == prompts[0] and scope["prompt"].endswith(f"Problem: {question}")
+    assert "Example 1:" in scope["prompt"] and "Example 2:" in scope["prompt"]
+    assert scope["response"] == scope["completion"].decoded_output["scoring_text"]
+    assert all(node.action.token_id not in scope["TERMINATION_IDS"] for node in scope["initialization"].search.nodes[1:])
+    assert scope["metrics"]["fallback_decode_used"] == (budget == 1)
     assert scope["score"]["reference_answer"] == ("27" if question == demo.DEFAULT_QUESTION else None)
     assert scope["RUN_BATCH"] is False
 

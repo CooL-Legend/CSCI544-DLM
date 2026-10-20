@@ -60,11 +60,11 @@ python scripts/experiment_0_baseline_test.py --stage dev
 
 ## Single-prompt MEDAL demo
 
-Use [MEDAL_MCTS_Demo.ipynb](notebooks/gsm8k/MEDAL_MCTS_Demo.ipynb) to see the current method without running an evaluation. It loads one model from the runtime, Drive, or the pinned Hub checkpoint; shows the inline three-subtask guidance; runs MCTS initialization; and displays the top three partial-state candidates with their unmasked tokens, selection values, and root-to-candidate entropy reductions. Short cells report actual NFE by MCTS phase and synchronized wall-clock time, then complete the selected state.
+Use [MEDAL_MCTS_Demo.ipynb](notebooks/gsm8k/MEDAL_MCTS_Demo.ipynb) for one E0-style MEDAL run. It loads one model from the runtime, Drive, or the pinned Hub checkpoint and uses the fixed pens/muffins prompt. Defaults are target depth 5 and a 512-forward search budget; set `SEARCH_BUDGET` to 1024 or 2048 for larger runs. Live counters show actual search NFEs/budget, evaluated depth and candidate count. The existing cells inspect up to three cached candidates or the selected fallback, then complete that state.
 
-The completion cell reuses the same initialization and accepts `method="medal"`, an imported callable, or `"my_sampler:decode"`. Copy that cell to try a sampler implemented in your own Python module. Each sampler receives a fresh partial-state copy; the helper counts its actual forwards and checks that it preserves the prompt and initialized tokens. Setup and validation stay outside the main action cells. Decomposition is inline prompting, so its generated reasoning appears in the final response and adds no separate planning NFE.
+The completion cell reuses the same initialization and accepts `method="medal"`, an imported callable, or `"my_sampler:decode"`. Each sampler receives a fresh partial-state copy; the helper counts its actual forwards and checks that it preserves the prompt and initialized tokens. Search excludes EOS/EOT; completion fills all positions and retains full outputs while scoring the prefix before the first terminator. Reports include stage costs, search/completion/total NFEs and runtime, budget utilization, depths, shortlist/fallback status, parse success and reference-based accuracy with a Wilson interval. An optional 10-question batch reuses the model and saves aggregate metrics.
 
-The same flow is available as a script after installing the LLaDA dependencies and package:
+The separate CLI retains its original prompt, depth-20 quota defaults and sampler interface:
 
 ```bash
 python scripts/demo_medal.py --model-path /path/to/LLaDA-8B-Instruct --local-files-only \
