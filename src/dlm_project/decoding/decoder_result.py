@@ -7,7 +7,7 @@ import torch
 
 @dataclass
 class DecodeResult:
-    """Completed IDs [1, prompt+output], actual model calls, and compact events."""
+    """Completed IDs [batch, prompt+output], actual model calls, and compact events."""
 
     token_ids: torch.Tensor
     generation_nfes: int

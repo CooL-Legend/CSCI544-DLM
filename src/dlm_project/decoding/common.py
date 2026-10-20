@@ -24,26 +24,30 @@ def validate_generation(*, gen_length, steps, block_length, temperature, seed=1)
         raise ValueError("seed must be an integer in [0, 2**63).")
 
 
-def validate_prompt(prompt_ids, mask_id):
+def validate_prompt(prompt_ids, mask_id, *, allow_batch=False):
     if (not isinstance(prompt_ids, torch.Tensor) or prompt_ids.ndim != 2
-            or prompt_ids.shape[0] != 1 or prompt_ids.dtype != torch.long):
-        raise ValueError("prompt_ids must be int64 with shape [1, P].")
+            or prompt_ids.shape[0] < 1 or (not allow_batch and prompt_ids.shape[0] != 1)
+            or prompt_ids.dtype != torch.long):
+        shape = "[B, P] with B >= 1" if allow_batch else "[1, P]"
+        raise ValueError(f"prompt_ids must be int64 with shape {shape}.")
     if type(mask_id) is not int or mask_id < 0:
         raise ValueError("mask_id must be a nonnegative integer.")
 
 
-def initialize_state(prompt_ids, mask_id, gen_length, device, initial_state=None):
+def initialize_state(prompt_ids, mask_id, gen_length, device, initial_state=None, *,
+                     allow_batch=False):
     """Create an output of masks or clone a validated prompt-plus-output state."""
-    validate_prompt(prompt_ids, mask_id)
+    validate_prompt(prompt_ids, mask_id, allow_batch=allow_batch)
     prompt_len = prompt_ids.shape[1]
-    shape = (1, prompt_len + gen_length)
+    shape = (prompt_ids.shape[0], prompt_len + gen_length)
     if initial_state is None:
         state = torch.full(shape, mask_id, dtype=torch.long, device=device)
         state[:, :prompt_len] = prompt_ids.to(device)
         return state
     if (not isinstance(initial_state, torch.Tensor) or initial_state.dtype != torch.long
             or tuple(initial_state.shape) != shape):
-        raise ValueError("initial_state must be int64 with shape [1, P + gen_length].")
+        batch = "B" if allow_batch else "1"
+        raise ValueError(f"initial_state must be int64 with shape [{batch}, P + gen_length].")
     if not torch.equal(initial_state[:, :prompt_len].to(prompt_ids.device), prompt_ids):
         raise ValueError("initial_state must preserve the supplied prompt tokens.")
     return initial_state.detach().to(device).clone()

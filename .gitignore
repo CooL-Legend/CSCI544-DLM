@@ -30,3 +30,6 @@ dist/
 *.arrow
 *.parquet
 *.excalidraw
+
+*.pdf
+*.pptx

@@ -12,7 +12,7 @@ from time import perf_counter
 
 import torch
 
-from dlm_project.decoding import best_of_5, confidence, mcts_confidence, random_mdm, top_k_margin
+from dlm_project.decoding import best_of_5, confidence, eb_sampler, mcts_confidence, random_mdm, top_k_margin
 from dlm_project.decoding.common import validate_generation
 from dlm_project.decoding.medal_prompting import get_gsm8k_demonstrations, gsm8k_prompt
 from dlm_project.decoding.mcts_decoding import IMPLEMENTATION_VERSION
@@ -31,13 +31,13 @@ from dlm_project.tasks.gsm8k.evaluation import extract_answer, score_answer
 
 DECODERS = {"random_mdm": random_mdm.decode, "top_k_margin": top_k_margin.decode,
             "confidence": confidence.decode, "best_of_5": best_of_5.decode,
-            "mcts_confidence": mcts_confidence.decode}
+            "mcts_confidence": mcts_confidence.decode, "eb_sampler": eb_sampler.decode}
 MODEL_FAMILIES = ("llada", "illada")
 
 
 def resolve_settings(method, source, *, profile=None, num_samples=None, seed=None,
                      temperature=None, model_path=None, local_files_only=None,
-                     expected_family=None):
+                     expected_family=None, gamma=None, error_proxy=None):
     """Resolve CLI overrides without changing the caller's configuration."""
     if method not in DECODERS:
         raise ValueError(f"Unknown decoder: {method}")
@@ -77,7 +77,8 @@ def resolve_settings(method, source, *, profile=None, num_samples=None, seed=Non
     if local_files_only is not None:
         model["local_files_only"] = local_files_only
     generation = config.setdefault("generation", {})
-    for key, value in (("gen_length", 256), ("steps", 256), ("block_length", 128), ("temperature", 1.0)):
+    for key, value in (("gen_length", 256), ("steps", 256), ("block_length", 128),
+                       ("temperature", 0.0 if method == "eb_sampler" else 1.0)):
         generation.setdefault(key, value)
     # Position selection belongs to the entrypoint, not the legacy dispatcher.
     generation.pop("remasking", None)
@@ -86,6 +87,22 @@ def resolve_settings(method, source, *, profile=None, num_samples=None, seed=Non
     config["decoding"] = {"method": method, "seed": decoding_seed}
     if temperature is not None:
         generation["temperature"] = temperature
+    if method == "eb_sampler":
+        options = copy.deepcopy(decoding_source.get("eb_sampler", {}))
+        if not isinstance(options, dict):
+            raise ValueError("decoding.eb_sampler must be a mapping.")
+        if gamma is not None:
+            options["gamma"] = gamma
+        if error_proxy is not None:
+            options["error_proxy"] = error_proxy
+        config["decoding"]["eb_sampler"] = eb_sampler.resolve_config(options)
+        for key in ("steps", "block_length"):
+            value = generation[key]
+            if value is not None and (type(value) is not int or value < 1):
+                raise ValueError(f"generation.{key} must be a positive integer or None.")
+        # Record the effective global extent and natural iteration upper bound.
+        # These compatibility fields never schedule or truncate EB decoding.
+        generation["steps"] = generation["block_length"] = generation["gen_length"]
     validate_generation(**generation, seed=decoding_seed)
     if method == "mcts_confidence":
         if generation["steps"] != generation["gen_length"] or generation["block_length"] != generation["gen_length"] or generation["temperature"] <= 0:
@@ -168,6 +185,11 @@ def _metrics(config, state, records):
             metrics[f"total_{phase}_latency_seconds"] = sum(row.get(f"{phase}_latency_seconds", 0) for row in records)
         metrics["active_prediction_model_calls"] = state.get("active_prediction_model_calls", 0)
     metrics.update(summarize_primary(records))
+    if config["decoding"]["method"] == "eb_sampler":
+        iterations = sum(row["decoding_steps"] for row in records)
+        tokens = sum(sum(row["tokens_unmasked_per_iteration"]) for row in records)
+        metrics.update(total_decoding_iterations=iterations,
+                       average_tokens_unmasked_per_iteration=tokens / iterations if iterations else None)
     return metrics
 
 
@@ -187,6 +209,10 @@ def run_evaluation(method, source, *, manifest_path=None, output_dir=None, model
     generation = config["generation"]
     name = (f"gen{generation['gen_length']}-steps{generation['steps']}-blk{generation['block_length']}-"
             f"temp{generation['temperature']:g}-seed{config['decoding']['seed']}")
+    if method == "eb_sampler":
+        eb = config["decoding"]["eb_sampler"]
+        name = (f"gen{generation['gen_length']}-eb-global-temp{generation['temperature']:g}-"
+                f"seed{config['decoding']['seed']}-gamma{float(eb['gamma']):g}-proxy-{eb['error_proxy']}")
     if method == "mcts_confidence":
         m = config["decoding"]["mcts"]
         name += (f"-medal-v2-lc{m['init_tokens']}-c{m['num_candidates']}-k1_{m['top_k_tokens']}"
@@ -256,6 +282,9 @@ def run_evaluation(method, source, *, manifest_path=None, output_dir=None, model
                 kwargs = {**generation, "seed": seed}
                 if method == "best_of_5":
                     kwargs.update(tokenizer=wrapper.tokenizer, answer_extractor=extract_answer)
+                elif method == "eb_sampler":
+                    eb = config["decoding"]["eb_sampler"]
+                    kwargs.update(gamma=float(eb["gamma"]), error_proxy=eb["error_proxy"])
                 elif method == "mcts_confidence":
                     kwargs.update(mcts=config["decoding"]["mcts"], tokenizer=wrapper.tokenizer)
                 trace_file = f"traces/test_{example['row_id']:04d}.jsonl"
@@ -333,23 +362,29 @@ def run_evaluation(method, source, *, manifest_path=None, output_dir=None, model
 def main(method, *, default_config=None, expected_family="llada"):
     label = get_profile(expected_family)["label"]
     parser = argparse.ArgumentParser(description=f"{label} GSM8K accuracy with {method} decoding.")
+    config_name = "eb_sampler.yaml" if method == "eb_sampler" else "decoding.yaml"
     parser.add_argument("--config", type=Path,
-                        default=default_config or PROJECT_ROOT / "configs/gsm8k/decoding.yaml")
+                        default=default_config or PROJECT_ROOT / "configs/gsm8k" / config_name)
     parser.add_argument("--profile", choices=tuple(PROFILE_SIZES))
     parser.add_argument("--num-samples", type=int, help="Override the profile's question count")
     parser.add_argument("--seed", type=int)
     parser.add_argument("--temperature", type=float)
+    if method == "eb_sampler":
+        parser.add_argument("--gamma", type=float, help="Entropy bound in nats (accepts inf)")
+        parser.add_argument("--error-proxy", choices=eb_sampler.ERROR_PROXIES)
     parser.add_argument("--model-path", type=str)
     parser.add_argument("--local-files-only", action="store_true", default=None)
     parser.add_argument("--manifest", type=Path, help="Shared pinned GSM8K test manifest")
     parser.add_argument("--output-dir", type=Path, help="Artifact parent; adds method/profile/settings/timestamp")
     parser.add_argument("--run-manifest", type=Path, help="Write the exact completed run directory to a JSON receipt")
     args = parser.parse_args()
+    eb_overrides = ({"gamma": args.gamma, "error_proxy": args.error_proxy}
+                    if method == "eb_sampler" else {})
     try:
         config = resolve_settings(method, load_config(args.config), profile=args.profile,
                                   num_samples=args.num_samples, seed=args.seed, temperature=args.temperature,
                                   model_path=args.model_path, local_files_only=args.local_files_only,
-                                  expected_family=expected_family)
+                                  expected_family=expected_family, **eb_overrides)
     except (ValueError, TypeError, KeyError) as error:
         parser.error(str(error))
     directory, metrics = run_evaluation(method, config, manifest_path=args.manifest, output_dir=args.output_dir)

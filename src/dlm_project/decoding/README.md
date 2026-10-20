@@ -3,7 +3,7 @@
 Four decoder modules evaluate the pinned `GSAI-ML/LLaDA-8B-Instruct` and
 `GSAI-ML/iLLaDA-8B-Instruct` checkpoints on GSM8K. They share fixed-length masked sampling, block scheduling,
 chat formatting, and strict final-answer scoring. A fifth LLaDA method adds MCTS
-initialization with immediate-child information gain, cached candidate ranking, and adjusted-score softmax completion. These
+initialization with immediate-child information gain, cached candidate ranking, and adjusted-score softmax completion. EB-Sampler adds global, adaptive entropy-bounded unmasking. These
 methods perform inference without training.
 
 ## Algorithms
@@ -14,6 +14,7 @@ methods perform inference without training.
 | [Top-K Margin](top_k_margin.py) | Fill positions with the largest difference between their top two token probabilities. | 256 |
 | [Confidence](confidence.py) | Fill positions whose sampled tokens have the largest model probabilities. | 256 |
 | [Best-of-5](best_of_5.py) | Generate five confidence-decoded candidates and select the most frequent normalized final answer. | 1,280 |
+| [EB-Sampler](eb_sampler.py) | Rank all remaining masks by error and commit the largest prefix satisfying the entropy bound. | Adaptive, at most 256 |
 | [MCTS + Confidence](mcts_confidence.py) | MEDAL reconstruction: immediate-child search, cached candidate ranking, adjusted-score sampling. | Search calls + 256 − selected depth |
 
 All four default to **temperature 1.0**, **256 output positions**, **256 denoising
@@ -44,6 +45,67 @@ with that answer. If all five candidates fail parsing, the first raw output is
 retained and the question scores as incorrect. Voting uses no reference answer
 and adds no model forwards. Temperature zero is supported but can make all five
 confidence candidates identical despite their distinct seeds.
+
+### EB-Sampler
+
+[EB-Sampler](https://arxiv.org/html/2505.24857) follows Section 4, Figure 4,
+and Algorithm 1. Each iteration uses one model forward, ranks all remaining
+output masks by increasing error, and selects the largest ranked prefix U with
+`sum(H_i for i in U) - max(H_i for i in U) <= gamma`. Cumulative sums and maxima
+compute this bound; selections are independent per batch row and commit together.
+
+Defaults are **gamma 0.1 nats**, **confidence ranking**, **temperature 0**,
+256 output positions, and seed 1. Entropy and rankings use unscaled probabilities
+with the mask token excluded. Confidence is `-max(p)`, entropy is `H(p)`, and
+margin is `-(p(top1) - p(top2))`; ties prefer earlier output positions.
+Temperature affects token sampling only, so greedy tokens retain native model
+uncertainty for selection. Zero gamma allows any prefix permitted by the bound,
+including multiple zero-entropy positions. Infinite gamma selects all remaining
+targets in one iteration. Every unfinished row selects at least one position.
+
+```python
+from dlm_project.decoding import eb_sampler
+
+result = eb_sampler.decode(
+    wrapper.model, ids, wrapper.mask_id,
+    gamma=0.1, error_proxy="confidence", temperature=0.0,
+)
+print(result.generation_nfes, result.details["decoding_steps"])
+print(result.details["tokens_unmasked_per_iteration"])
+print(result.details["average_tokens_unmasked_per_iteration"])
+```
+
+The API accepts prompts `[B, P]`, optional `initial_state` `[B, P + gen_length]`,
+and optional binary prompt `attention_mask` `[B, P]`. Initial states are cloned;
+prompt tokens and prior commitments stay fixed. `steps` and `block_length`
+accept positive compatibility values but neither schedule nor cap EB decoding.
+All targets are filled without EOS stopping. The model receives the full batch
+on every iteration; completed rows receive no further commitments.
+
+`generation_nfes` counts batch forward calls; `state_evaluations` is batch size
+times that count. Aggregate token histories count commitments across the batch.
+`tokens_unmasked_per_iteration_per_sample` has shape `[B, iterations]`, with zeros
+after each sample completes. Its corresponding average uses that sample's active
+iterations; a completed initial state has zero calls and zero averages.
+Each trace records batch-indexed actions, their EB entropies, and per-sample
+entropy bounds. Standard diagnostic entropy/margin signals retain their native
+full-vocabulary convention and add no forwards. Infinite gamma is logged as
+`"inf"` for strict JSON compatibility.
+
+```bash
+python scripts/eval_gsm8k_eb_sampler.py --profile smoke --num-samples 2
+python scripts/eval_gsm8k_eb_sampler.py --gamma 0.1 --error-proxy entropy --temperature 0
+python scripts/eval_gsm8k_eb_sampler.py --gamma inf
+```
+
+The dedicated configuration is `configs/gsm8k/eb_sampler.yaml`, with options
+under `decoding.eb_sampler`. Resolved generation metadata records a global block
+and the natural `gen_length` iteration upper bound; actual iterations are saved
+separately. Gamma and proxy appear in the artifact directory label. Predictions
+and compact traces save token histories, averages, and actual iterations;
+`metrics.json` also reports total iterations and aggregate tokens per iteration.
+The LLaDA GSM8K notebook runs EB after Best-of-5 and before the optional MCTS
+sections. `RUN_MCTS = False` disables MCTS and its comparison by default.
 
 ### MEDAL paper reconstruction
 
@@ -106,7 +168,7 @@ launching. Start with two examples and `[4]` for the smallest immediate-child se
 
 ## Python API
 
-Each module exposes `decode(model, prompt_ids, mask_id, *, gen_length, steps,
+The scheduled baseline modules expose `decode(model, prompt_ids, mask_id, *, gen_length, steps,
 block_length, temperature, seed)` with the defaults above. Input IDs have shape
 `[1, prompt_length]`; the returned `DecodeResult.token_ids` contains the prompt
 and completed output. `generation_nfes` counts actual model forwards, `details`

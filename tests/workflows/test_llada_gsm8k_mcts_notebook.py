@@ -50,13 +50,11 @@ def configuration_scope(cells, tmp_path, **kwargs):
 
 
 def run_definitions(cells, scope):
-    source = cells["run-mcts-confidence"].text.removesuffix("run_mcts_confidence()\n")
-    exec(source, scope)
+    exec(cells["run-mcts-confidence"].text, scope)  # RUN_MCTS defaults to False.
 
 
 def preview_definitions(cells, scope):
-    source = cells["preview-mcts-confidence"].text.removesuffix("show_mcts_answers()\n")
-    exec(source, scope)
+    exec(cells["preview-mcts-confidence"].text, scope)
 
 
 def test_appended_cells_are_valid_cleared_and_preserve_existing_workflow(cells):
@@ -106,7 +104,8 @@ def test_configuration_preserves_active_benchmark(cells, tmp_path, profile, coun
     assert scope["MCTS_RUN_DIR"] is None
 
 
-def mock_process(scope, tmp_path, *, returncode=0, family="llada", interrupt=False):
+def mock_process(scope, tmp_path, *, returncode=0, family="llada", interrupt=False,
+                 method="mcts_confidence"):
     calls, processes = [], []
 
     def popen(command, **kwargs):
@@ -127,8 +126,8 @@ def mock_process(scope, tmp_path, *, returncode=0, family="llada", interrupt=Fal
         if returncode == 0 and not interrupt:
             receipt = Path(command[command.index("--run-manifest") + 1])
             receipt.write_text(json.dumps({"run_dir": str(tmp_path / "exact-run"),
-                "status": "completed", "model_family": family, "method": "mcts_confidence",
-                "profile": scope["mcts_cfg"]["evaluation"]["profile"]}))
+                "status": "completed", "model_family": family, "method": method,
+                "profile": scope["eb_cfg" if method == "eb_sampler" else "mcts_cfg"]["evaluation"]["profile"]}))
         return process
 
     scope["subprocess"] = SimpleNamespace(Popen=popen, PIPE=subprocess.PIPE, STDOUT=subprocess.STDOUT,
@@ -200,3 +199,111 @@ def test_random_previews_show_saved_answers_initialization_and_costs(cells, tmp_
     assert "Initialization depth: 4/20" in output and "Fallback: True" in output
     assert "search=512, completion=252, total=764" in output and "fallback_count" in output
     assert len(scope["show_mcts_answers"](count=10)) == 6
+
+
+def eb_configuration_scope(cells, tmp_path, **kwargs):
+    scope = scope_for(tmp_path, **kwargs)
+    exec(cells["eb-sampler-config"].text.replace("from pathlib import Path\n", ""), scope)
+    return scope
+
+
+def test_eb_cells_follow_baselines_precede_mcts_and_have_no_outputs(cells):
+    raw = json.loads((ROOT / "notebooks/gsm8k/LLaDA_GSM8K_Colab.ipynb").read_text())
+    ids = [cell.get("id") for cell in raw["cells"]]
+    start = ids.index("eb-sampler-intro")
+    expected = ["eb-sampler-intro", "eb-sampler-config", "run-eb-sampler", "preview-eb-sampler"]
+    assert ids[start:start + 4] == expected
+    assert ids[start + 4] == "mcts-confidence-intro"
+    before = "\n".join("".join(c["source"]) for c in raw["cells"][:start])
+    assert 'METHOD = "best_of_5"' in before
+    for cell_id in expected:
+        cell = cells[cell_id]
+        if cell.cell_type == "code":
+            assert cell.outputs == [] and cell.execution_count is None
+            compile(cell.text, cell_id, "exec")
+
+
+@pytest.mark.parametrize("profile,count,expected", [("smoke", 2, 2), ("smoke", None, 20),
+                                                      ("initial", None, 100), ("full", None, 1319)])
+def test_eb_configuration_inherits_benchmark_with_greedy_global_defaults(cells, tmp_path,
+                                                                       profile, count, expected):
+    scope = scope_for(tmp_path, profile=profile, count=count)
+    original = copy.deepcopy(scope["cfg"])
+    exec(cells["eb-sampler-config"].text.replace("from pathlib import Path\n", ""), scope)
+    config = yaml.safe_load(scope["EB_CONFIG"].read_text())
+    assert scope["cfg"] == original
+    for section in ("model", "data", "prompt", "evaluation"):
+        assert config[section] == original[section]
+    assert config["generation"]["temperature"] == 0
+    assert config["generation"]["block_length"] == config["generation"]["gen_length"]
+    assert config["decoding"] == {"method": "eb_sampler", "seed": 1,
+                                   "eb_sampler": {"gamma": .1, "error_proxy": "confidence"}}
+    assert scope["eb_resolved"]["data"]["num_samples"] == expected
+    assert scope["EB_MANIFEST"] == tmp_path / "drive/manifests/gsm8k_test.json"
+    assert scope["EB_RUN_DIR"] is None
+
+
+def test_eb_run_streams_and_selects_exact_receipt(cells, tmp_path, capsys):
+    scope = eb_configuration_scope(cells, tmp_path, profile="initial", count=None)
+    exec(cells["run-eb-sampler"].text.removesuffix("run_eb_sampler()\n"), scope)
+    calls, processes = mock_process(scope, tmp_path, method="eb_sampler")
+    directory = scope["run_eb_sampler"]()
+    command, options = calls[0]
+    assert command[2] == str(ROOT / "scripts/eval_gsm8k_eb_sampler.py")
+    assert command[command.index("--config") + 1] == str(scope["EB_CONFIG"])
+    assert command[command.index("--profile") + 1] == "initial"
+    assert command[command.index("--manifest") + 1] == str(scope["EB_MANIFEST"])
+    assert directory == scope["EB_RUN_DIR"] == tmp_path / "exact-run"
+    assert "actual traceback" in capsys.readouterr().out and processes[0].stdout.closed
+    assert options["stderr"] == subprocess.STDOUT
+    scope["run_eb_sampler"]()
+    assert calls[0][0][-1] != calls[1][0][-1]
+
+
+@pytest.mark.parametrize("failure", ["exit", "receipt", "interrupt"])
+def test_eb_failed_or_interrupted_run_clears_receipt_selection(cells, tmp_path, failure):
+    scope = eb_configuration_scope(cells, tmp_path)
+    exec(cells["run-eb-sampler"].text.removesuffix("run_eb_sampler()\n"), scope)
+    exec(cells["preview-eb-sampler"].text.removesuffix("show_eb_answers()\n"), scope)
+    scope["EB_RUN_DIR"] = tmp_path / "old-run"
+    _, processes = mock_process(scope, tmp_path, method="eb_sampler", returncode=1 if failure == "exit" else 0,
+                                family="illada" if failure == "receipt" else "llada",
+                                interrupt=failure == "interrupt")
+    expected = {"exit": subprocess.CalledProcessError, "receipt": RuntimeError,
+                "interrupt": KeyboardInterrupt}[failure]
+    with pytest.raises(expected):
+        scope["run_eb_sampler"]()
+    assert scope["EB_RUN_DIR"] is None and processes[0].stdout.closed
+    if failure == "interrupt":
+        assert processes[0].terminated
+    with pytest.raises(RuntimeError, match="Complete the EB"):
+        scope["show_eb_answers"]()
+
+
+def test_eb_preview_reports_saved_adaptive_statistics(cells, tmp_path, capsys):
+    scope = eb_configuration_scope(cells, tmp_path)
+    exec(cells["preview-eb-sampler"].text.removesuffix("show_eb_answers()\n"), scope)
+    directory = tmp_path / "eb-run"
+    directory.mkdir()
+    scope["EB_RUN_DIR"] = directory
+    row = {"example_id": "test:0", "prompt": "instructions\n\nQuestion:\nOne plus one?",
+           "raw_output": "1 + 1 = 2.\n#### 2", "predicted_answer": "2", "reference_answer": "2",
+           "exact_match": True, "gamma": .1, "error_proxy": "confidence", "temperature": 0,
+           "generation_nfes": 2, "decoding_steps": 2, "tokens_unmasked_per_iteration": [3, 1],
+           "average_tokens_unmasked_per_iteration": 2.0}
+    (directory / "metrics.json").write_text(json.dumps({"processed": 1, "accuracy": 1}))
+    (directory / "predictions.jsonl").write_text(json.dumps(row) + "\n")
+    assert scope["show_eb_answers"]() == [row]
+    output = capsys.readouterr().out
+    for value in ("One plus one?", "#### 2", "NFEs: 2 | Iterations: 2", "[3, 1]", "Average tokens per iteration: 2.0"):
+        assert value in output
+
+
+def test_mcts_run_all_is_safe_and_performs_no_search_by_default(cells, tmp_path, monkeypatch):
+    scope = configuration_scope(cells, tmp_path)
+    assert scope["RUN_MCTS"] is False
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: pytest.fail("Disabled MCTS launched a process"))
+    for cell_id in ("run-mcts-confidence", "preview-mcts-confidence", "primary-metrics-config",
+                    "run-primary-metrics", "primary-metrics-report", "primary-metrics-signals"):
+        exec(cells[cell_id].text.replace("from pathlib import Path\n", ""), scope)
+    assert scope["MCTS_RUN_DIR"] is None and scope["METRICS_COMPARISON_DIR"] is None

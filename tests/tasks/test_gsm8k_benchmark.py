@@ -318,6 +318,56 @@ def test_cli_applies_overrides_without_loading_model(tmp_path, monkeypatch):
     assert kwargs["manifest_path"] == tmp_path / "manifest.json"
 
 
+@pytest.mark.parametrize("gamma,expected_calls", [(0, 4), (.1, 4), (float("inf"), 1)])
+def test_eb_benchmark_saves_adaptive_counts_and_json_safe_gamma(tmp_path, monkeypatch, gamma, expected_calls):
+    monkeypatch.setattr(benchmark, "get_manifest", lambda *a, **k: manifest())
+    instance, _ = wrapper()
+    config = config_for(tmp_path)
+    config["generation"].update(steps=1, block_length=3, temperature=0)
+    config["decoding"]["eb_sampler"] = {"gamma": gamma, "error_proxy": "entropy"}
+    directory, metrics = benchmark.run_evaluation("eb_sampler", config, model_factory=lambda _: instance)
+    assert metrics["total_model_calls"] == len(instance.model.seen) == expected_calls * 2
+    assert metrics["total_decoding_iterations"] == expected_calls * 2
+    assert metrics["average_tokens_unmasked_per_iteration"] == 4 / expected_calls
+    saved = json.loads((directory / "config.json").read_text())
+    assert saved["generation"]["steps"] == saved["generation"]["block_length"] == 4
+    assert saved["decoding"]["eb_sampler"]["gamma"] == ("inf" if gamma == float("inf") else gamma)
+    assert f"gamma{gamma:g}-proxy-entropy" in directory.parent.name
+    records = [json.loads(line) for line in (directory / "predictions.jsonl").read_text().splitlines()]
+    for row in records:
+        assert row["generation_nfes"] == row["decoding_steps"] == expected_calls
+        assert sum(row["tokens_unmasked_per_iteration"]) == 4
+        assert row["average_tokens_unmasked_per_iteration"] == 4 / expected_calls
+        assert len((directory / row["trace_file"]).read_text().splitlines()) == expected_calls
+    json.dumps(saved, allow_nan=False)
+    json.dumps(records, allow_nan=False)
+    json.dumps(metrics, allow_nan=False)
+
+
+def test_eb_cli_defaults_and_overrides(tmp_path, monkeypatch):
+    captured = []
+    monkeypatch.setattr(benchmark, "run_evaluation",
+                        lambda method, config, **kw: (captured.append(config) or (tmp_path, {"status": "completed"})))
+    monkeypatch.setattr(sys, "argv", ["script"])
+    runpy.run_path(str(ROOT / "scripts/eval_gsm8k_eb_sampler.py"), run_name="__main__")
+    assert captured[-1]["generation"]["temperature"] == 0
+    assert captured[-1]["decoding"]["eb_sampler"] == {"gamma": .1, "error_proxy": "confidence"}
+    monkeypatch.setattr(sys, "argv", ["script", "--gamma", "inf", "--error-proxy", "margin", "--temperature", ".7"])
+    benchmark.main("eb_sampler")
+    assert captured[-1]["generation"]["temperature"] == .7
+    assert captured[-1]["decoding"]["eb_sampler"] == {"gamma": "inf", "error_proxy": "margin"}
+
+
+@pytest.mark.parametrize("options", [{"gamma": -1}, {"gamma": float("nan")}, {"gamma": True},
+                                     {"gamma": "unexpected"}, {"error_proxy": "random"},
+                                     {"gammma": .1}, []])
+def test_eb_invalid_config_is_rejected_before_loading(tmp_path, options):
+    source = config_for(tmp_path)
+    source["decoding"]["eb_sampler"] = options
+    with pytest.raises(ValueError):
+        benchmark.resolve_settings("eb_sampler", source)
+
+
 @pytest.mark.parametrize("family", benchmark.MODEL_FAMILIES)
 @pytest.mark.parametrize("method", tuple(benchmark.DECODERS))
 def test_cli_defaults_and_run_receipt(tmp_path, monkeypatch, family, method):
