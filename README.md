@@ -37,8 +37,9 @@ Install the package with `python -m pip install --no-deps -e .` after installing
 ## Experiment 0: fixed-budget GSM8K baseline test
 
 [Experiment 0](docs/experiment_0/README.md) compares greedy confidence, greedy entropy,
-MEDAL with standard LLaDA completion without search at T=1, and MEDAL search caps of 512, 1024 and
-2048 actual forwards. It uses Lc=5, a shared three-step decomposition prompt
+MEDAL with standard LLaDA completion without search, and fixed-budget MEDAL.
+All E0 conditions use T=0. Evaluation and testing use search caps of 256, 512 and
+1024 actual forwards. It uses Lc=5, a shared three-step decomposition prompt
 with the fixed pens/muffins examples, search-only EOS/EOT
 filtering, and fallback completion after budget exhaustion. The original
 candidate-quota mode remains available as a separate matched-depth comparison.

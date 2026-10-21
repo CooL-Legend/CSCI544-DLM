@@ -44,6 +44,7 @@ generation:
 decoding:
   seed: 1
   completion_method: llada  # Standard LLaDA Gumbel proposals + low-confidence remasking.
+  completion_temperature: 0.0  # All E0 conditions use T=0; argmax proposals without Gumbel noise.
   mcts:
     init_tokens: 5
     num_candidates: 3

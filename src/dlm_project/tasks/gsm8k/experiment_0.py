@@ -27,7 +27,7 @@ from dlm_project.tasks.gsm8k.e0_tokens import decode_output, resolve_termination
 from dlm_project.tasks.gsm8k.evaluation import score_answer
 
 
-PROTOCOL_VERSION = "e0_fixed_budget_v3"
+PROTOCOL_VERSION = "e0_fixed_budget_v4"
 DECODERS = {"confidence": confidence.decode, "entropy": entropy.decode,
             "medal_no_search": medal_no_search.decode, "medal": mcts_confidence.decode}
 
@@ -35,11 +35,13 @@ DECODERS = {"confidence": confidence.decode, "entropy": entropy.decode,
 def resolve_settings(source, **overrides):
     config = copy.deepcopy(source)
     evaluation = config.setdefault("evaluation", {})
-    for key, default in (("stage", "dev"), ("search_mode", "budget"),
+    for key, default in (("stage", "dev"), ("search_mode", "budget"), ("run_order", "example"),
                          ("search_budgets", [512, 1024, 2048])):
         evaluation[key] = overrides.get(key) if overrides.get(key) is not None else evaluation.get(key, default)
     if evaluation["stage"] not in STAGE_COUNTS or evaluation["search_mode"] not in ("budget", "candidates"):
         raise ValueError("E0 requires stage dev/evaluation/test and search_mode budget/candidates.")
+    if evaluation["run_order"] not in ("example", "condition"):
+        raise ValueError("E0 run_order must be example or condition.")
     budgets = evaluation["search_budgets"]
     if (not isinstance(budgets, (list, tuple)) or not budgets
             or any(type(b) is not int or b < 1 for b in budgets) or len(set(budgets)) != len(budgets)):
@@ -71,15 +73,18 @@ def resolve_settings(source, **overrides):
     generation.setdefault("steps", length)
     generation.setdefault("block_length", length)
     if set(generation) != {"gen_length", "steps", "block_length"}:
-        raise ValueError("E0 generation contains only gen_length, steps, block_length; temperatures are fixed per condition.")
+        raise ValueError("E0 generation contains only gen_length, steps, block_length; use decoding.completion_temperature for MEDAL.")
     if generation["steps"] != length or generation["block_length"] != length:
         raise ValueError("E0 requires steps = block_length = gen_length.")
     decoding = config.setdefault("decoding", {})
     decoding.setdefault("seed", 1)
     decoding.setdefault("completion_method", "llada")
+    temperature = decoding.setdefault("completion_temperature", 0.0)
     if decoding["completion_method"] not in ("llada", "medal"):
         raise ValueError("decoding.completion_method must be llada or medal.")
-    validate_generation(**generation, temperature=1.0, seed=decoding["seed"])
+    validate_generation(**generation, temperature=temperature, seed=decoding["seed"])
+    if decoding["completion_method"] == "medal" and temperature <= 0:
+        raise ValueError("The adjusted-score MEDAL sampler requires positive completion_temperature; use llada at T=0.")
     options = dict(decoding.get("mcts", {}))
     options.setdefault("init_tokens", 5)
     if overrides.get("init_tokens") is not None:
@@ -102,10 +107,10 @@ def resolve_settings(source, **overrides):
     config["conditions"] = [
         {"id": "confidence_t0", "method": "confidence", "temperature": 0.0, "search_budget": None},
         {"id": "entropy_t0", "method": "entropy", "temperature": 0.0, "search_budget": None},
-        {"id": "medal_no_search_t1", "method": "medal_no_search", "temperature": 1.0, "search_budget": None,
+        {"id": f"medal_no_search_t{temperature:g}", "method": "medal_no_search", "temperature": temperature, "search_budget": None,
          "completion_method": decoding["completion_method"]},
         *[{"id": f"medal_{evaluation['search_mode']}_b{b}", "method": "medal",
-           "temperature": 1.0, "search_budget": b, "completion_method": decoding["completion_method"]} for b in budgets],
+           "temperature": temperature, "search_budget": b, "completion_method": decoding["completion_method"]} for b in budgets],
     ]
     return config
 
@@ -178,13 +183,17 @@ def run_experiment(source, *, manifest_path=None, output_dir=None, run_manifest=
     def progress():
         started = perf_counter()
         save_json(directory / "setup.json", setup)
-        save_json(directory / "summary.json", summarize(config, setup, records))
+        summary = summarize(config, setup, records)
+        save_json(directory / "summary.json", summary)
         if receipt:
             save_json(receipt, {"run_dir": str(directory), "status": setup["status"],
                                "protocol_version": PROTOCOL_VERSION,
                                "stage": config["evaluation"]["stage"], "search_mode": m["stop_mode"],
+                               "run_order": config["evaluation"]["run_order"],
+                               "condition_ids": [condition["id"] for condition in config["conditions"]],
                                "model_family": "llada"})
         setup["artifact_writing_seconds"] += perf_counter() - started
+        return summary
 
     progress()
     print(f"E0 artifacts: {directory}", flush=True)
@@ -211,105 +220,126 @@ def run_experiment(source, *, manifest_path=None, output_dir=None, run_manifest=
         _sync(wrapper.device)
         setup.update(warmup_nfes=1, warmup_seconds=perf_counter() - started)
         progress()
+        conditions = config["conditions"]
+        if config["evaluation"]["run_order"] == "condition":
+            schedule = ((example, condition) for condition in conditions for example in examples)
+        else:
+            schedule = ((example, condition) for example in examples for condition in conditions)
+        prompt_cache, completed_counts = {}, {condition["id"]: 0 for condition in conditions}
+        print("E0 execution order:", config["evaluation"]["run_order"],
+              "→".join(condition["id"] for condition in conditions), flush=True)
         with (directory / "predictions.jsonl").open("a") as output:
-            for example in examples:
-                started = perf_counter()
-                prompt = build_e0_prompt(example["question"], config["prompt"])
-                prompt_ids = wrapper.encode_prompt(prompt)
-                _sync(wrapper.device)
-                setup["tokenization_seconds"] += perf_counter() - started
-                seed = (config["decoding"]["seed"] + 5 * example["row_id"]) % 2**63
-                for condition in config["conditions"]:
-                    counter = CountingModel(wrapper.model)
-                    events = []
-                    trace_file = f"traces/{example['example_id'].replace(':', '_')}_{condition['id']}.jsonl"
-                    setup.update(active_example_id=example["example_id"], active_condition=condition["id"],
-                                 active_total_nfes=0, active_trace_file=trace_file)
-                    progress()
-                    kwargs = {**config["generation"], "temperature": condition["temperature"], "seed": seed}
-                    def emit(event):
-                        events.append(_compact_event(event))
-                        if event["stage"] == "forward" and counter.calls % 128 == 0:
-                            print(f"{example['example_id']} | {condition['id']} | "
-                                  f"{counter.calls} actual forwards | {event.get('phase', 'search')}", flush=True)
-                    if condition["method"] in ("medal", "medal_no_search"):
-                        kwargs.update(mcts={**m, "max_model_calls": condition["search_budget"] or m["max_model_calls"]},
-                                      tokenizer=wrapper.tokenizer, on_event=emit,
-                                      completion_method=condition["completion_method"])
-                    if condition["method"] == "medal":
-                        kwargs["search_excluded_token_ids"] = config["termination"]["token_ids"]
-                    _sync(wrapper.device)
+            for example, condition in schedule:
+                if example["example_id"] not in prompt_cache:
                     started = perf_counter()
-                    result, details, status = None, {}, "completed"
-                    try:
-                        result = DECODERS[condition["method"]](counter, prompt_ids.clone(), wrapper.mask_id, **kwargs)
-                        details = result.details
-                        if condition["method"] in ("confidence", "entropy"):
-                            events.extend(_compact_event(event) for event in result.trace)
-                    except SearchIncompleteError as error:
-                        if m["stop_mode"] != "candidates":
-                            raise
-                        details, status = error.stats, "search_incomplete"
-                    finally:
-                        _sync(wrapper.device)
-                        elapsed = perf_counter() - started
-                        setup["active_total_nfes"] = counter.calls
-                        setup["active_decoding_seconds"] = elapsed
-                        write_started = perf_counter()
-                        with (directory / trace_file).open("w") as trace:
-                            for event in events:
-                                trace.write(json.dumps(event, allow_nan=False) + "\n")
-                        setup["artifact_writing_seconds"] += perf_counter() - write_started
-                    search_nfes = details.get("search_model_calls", 0)
-                    completion_nfes = counter.calls - search_nfes
-                    if (search_nfes < 0 or completion_nfes < 0
-                            or (condition["search_budget"] is not None and search_nfes > condition["search_budget"])
-                            or (result is not None and result.total_nfes != counter.calls)):
-                        raise RuntimeError("E0 observed model forwards do not reconcile.")
-                    depth = details.get("selected_depth", 0)
-                    if result is not None:
-                        if completion_nfes != config["generation"]["gen_length"] - depth:
-                            raise RuntimeError("Completion must fill one remaining mask per forward.")
-                        if (not torch.equal(result.token_ids[:, :prompt_ids.shape[1]].to(prompt_ids.device), prompt_ids)
-                                or (result.token_ids[:, prompt_ids.shape[1]:] == wrapper.mask_id).any()):
-                            raise RuntimeError("Decoder changed the prompt or left output masks.")
-                    scoring_started = perf_counter()
-                    decoded = decode_output(wrapper.tokenizer,
-                        [] if result is None else result.token_ids[0, prompt_ids.shape[1]:].tolist(),
-                        config["termination"]["token_ids"])
-                    score = score_answer(decoded["scoring_text"], example["reference_solution"])
-                    setup["scoring_seconds"] += perf_counter() - scoring_started
-                    row = {**example, "protocol_version": PROTOCOL_VERSION, "condition": condition["id"],
-                           "method": condition["method"], "temperature": condition["temperature"],
-                           "completion_method": condition.get("completion_method"),
-                           "status": status, "seed": seed, "prompt": prompt, "prompt_hash": digest(prompt),
-                           "prompt_ids_hash": digest(prompt_ids.cpu().tolist()),
-                           "model_revision": wrapper.identity["revision"], "dataset_revision": config["data"]["revision"],
-                           "generation_length": config["generation"]["gen_length"], "requested_search_budget": condition["search_budget"],
-                           "search_nfes": search_nfes, "completion_nfes": completion_nfes, "total_nfes": counter.calls,
-                           "budget_utilization": search_nfes / condition["search_budget"] if condition["search_budget"] else None,
-                           "decoding_seconds": elapsed, "search_seconds": details.get("search_latency_seconds", elapsed if status == "search_incomplete" else 0.0),
-                           "completion_seconds": details.get("completion_latency_seconds", elapsed if not search_nfes else 0.0),
-                           "selected_depth": depth, "max_depth": details.get("max_depth", 0),
-                           "average_search_depth": details.get("average_search_depth", 0.0),
-                           "candidate_count": details.get("candidate_count", 0),
-                           "shortlist_size": details.get("shortlist_size", 0),
-                           "shortlist_underfilled": details.get("shortlist_underfilled", False),
-                           "selection_source": details.get("selection_source", "no_search"),
-                           "fallback_decode_used": status == "completed" and details.get("fallback_decode_used", False),
-                           "stop_reason": details.get("stop_reason", "all_masks_filled"),
-                           "trace_file": trace_file, "details": details, **decoded, **score}
+                    prompt = build_e0_prompt(example["question"], config["prompt"])
+                    prompt_ids = wrapper.encode_prompt(prompt)
+                    _sync(wrapper.device)
+                    setup["tokenization_seconds"] += perf_counter() - started
+                    seed = (config["decoding"]["seed"] + 5 * example["row_id"]) % 2**63
+                    prompt_cache[example["example_id"]] = prompt, prompt_ids, seed
+                prompt, prompt_ids, seed = prompt_cache[example["example_id"]]
+                if completed_counts[condition["id"]] == 0:
+                    print(f"Starting {condition['id']} on {len(examples)} questions", flush=True)
+                counter = CountingModel(wrapper.model)
+                events = []
+                trace_file = f"traces/{example['example_id'].replace(':', '_')}_{condition['id']}.jsonl"
+                setup.update(active_example_id=example["example_id"], active_condition=condition["id"],
+                             active_total_nfes=0, active_trace_file=trace_file)
+                progress()
+                kwargs = {**config["generation"], "temperature": condition["temperature"], "seed": seed}
+                def emit(event):
+                    events.append(_compact_event(event))
+                    if event["stage"] == "forward" and counter.calls % 128 == 0:
+                        print(f"{example['example_id']} | {condition['id']} | "
+                              f"{counter.calls} actual forwards | {event.get('phase', 'search')}", flush=True)
+                if condition["method"] in ("medal", "medal_no_search"):
+                    kwargs.update(mcts={**m, "max_model_calls": condition["search_budget"] or m["max_model_calls"]},
+                                  tokenizer=wrapper.tokenizer, on_event=emit,
+                                  completion_method=condition["completion_method"])
+                if condition["method"] == "medal":
+                    kwargs["search_excluded_token_ids"] = config["termination"]["token_ids"]
+                _sync(wrapper.device)
+                started = perf_counter()
+                result, details, status = None, {}, "completed"
+                try:
+                    result = DECODERS[condition["method"]](counter, prompt_ids.clone(), wrapper.mask_id, **kwargs)
+                    details = result.details
+                    if condition["method"] in ("confidence", "entropy"):
+                        events.extend(_compact_event(event) for event in result.trace)
+                except SearchIncompleteError as error:
+                    if m["stop_mode"] != "candidates":
+                        raise
+                    details, status = error.stats, "search_incomplete"
+                finally:
+                    _sync(wrapper.device)
+                    elapsed = perf_counter() - started
+                    setup["active_total_nfes"] = counter.calls
+                    setup["active_decoding_seconds"] = elapsed
                     write_started = perf_counter()
-                    output.write(json.dumps(row, allow_nan=False) + "\n")
-                    output.flush()
-                    records.append(row)
+                    with (directory / trace_file).open("w") as trace:
+                        for event in events:
+                            trace.write(json.dumps(event, allow_nan=False) + "\n")
                     setup["artifact_writing_seconds"] += perf_counter() - write_started
-                    setup.update(active_example_id=None, active_condition=None, active_total_nfes=0,
-                                 active_decoding_seconds=0.0)
-                    progress()
-                    print(f"{row['example_id']} | {row['condition']} | {status} | correct={row['exact_match']} "
-                          f"| search={search_nfes}, completion={completion_nfes}, total={counter.calls} NFEs "
-                          f"| depth={depth} | {elapsed:.2f}s", flush=True)
+                search_nfes = details.get("search_model_calls", 0)
+                completion_nfes = counter.calls - search_nfes
+                if (search_nfes < 0 or completion_nfes < 0
+                        or (condition["search_budget"] is not None and search_nfes > condition["search_budget"])
+                        or (result is not None and result.total_nfes != counter.calls)):
+                    raise RuntimeError("E0 observed model forwards do not reconcile.")
+                depth = details.get("selected_depth", 0)
+                if result is not None:
+                    if completion_nfes != config["generation"]["gen_length"] - depth:
+                        raise RuntimeError("Completion must fill one remaining mask per forward.")
+                    if (not torch.equal(result.token_ids[:, :prompt_ids.shape[1]].to(prompt_ids.device), prompt_ids)
+                            or (result.token_ids[:, prompt_ids.shape[1]:] == wrapper.mask_id).any()):
+                        raise RuntimeError("Decoder changed the prompt or left output masks.")
+                scoring_started = perf_counter()
+                decoded = decode_output(wrapper.tokenizer,
+                    [] if result is None else result.token_ids[0, prompt_ids.shape[1]:].tolist(),
+                    config["termination"]["token_ids"])
+                score = score_answer(decoded["scoring_text"], example["reference_solution"])
+                setup["scoring_seconds"] += perf_counter() - scoring_started
+                row = {**example, "protocol_version": PROTOCOL_VERSION, "condition": condition["id"],
+                       "method": condition["method"], "temperature": condition["temperature"],
+                       "completion_method": condition.get("completion_method"),
+                       "status": status, "seed": seed, "prompt": prompt, "prompt_hash": digest(prompt),
+                       "prompt_ids_hash": digest(prompt_ids.cpu().tolist()),
+                       "model_revision": wrapper.identity["revision"], "dataset_revision": config["data"]["revision"],
+                       "generation_length": config["generation"]["gen_length"], "requested_search_budget": condition["search_budget"],
+                       "search_nfes": search_nfes, "completion_nfes": completion_nfes, "total_nfes": counter.calls,
+                       "budget_utilization": search_nfes / condition["search_budget"] if condition["search_budget"] else None,
+                       "decoding_seconds": elapsed, "search_seconds": details.get("search_latency_seconds", elapsed if status == "search_incomplete" else 0.0),
+                       "completion_seconds": details.get("completion_latency_seconds", elapsed if not search_nfes else 0.0),
+                       "selected_depth": depth, "max_depth": details.get("max_depth", 0),
+                       "average_search_depth": details.get("average_search_depth", 0.0),
+                       "candidate_count": details.get("candidate_count", 0),
+                       "shortlist_size": details.get("shortlist_size", 0),
+                       "shortlist_underfilled": details.get("shortlist_underfilled", False),
+                       "selection_source": details.get("selection_source", "no_search"),
+                       "fallback_decode_used": status == "completed" and details.get("fallback_decode_used", False),
+                       "stop_reason": details.get("stop_reason", "all_masks_filled"),
+                       "trace_file": trace_file, "details": details, **decoded, **score}
+                write_started = perf_counter()
+                output.write(json.dumps(row, allow_nan=False) + "\n")
+                output.flush()
+                records.append(row)
+                setup["artifact_writing_seconds"] += perf_counter() - write_started
+                setup.update(active_example_id=None, active_condition=None, active_total_nfes=0,
+                             active_decoding_seconds=0.0)
+                current_summary = progress()
+                print(f"{row['example_id']} | {row['condition']} | {status} | correct={row['exact_match']} "
+                      f"| search={search_nfes}, completion={completion_nfes}, total={counter.calls} NFEs "
+                      f"| depth={depth} | {elapsed:.2f}s", flush=True)
+                completed_counts[condition["id"]] += 1
+                if completed_counts[condition["id"]] == len(examples):
+                    metrics = next(item for item in current_summary["observed_conditions"]
+                                   if item["id"] == condition["id"])
+                    print(f"Finished {condition['id']} | n={metrics['n']} | "
+                          f"accuracy={metrics['accuracy_percent']:.2f}% | "
+                          f"parse={100 * metrics['parse_rate']:.2f}% | "
+                          f"mean total NFEs={metrics['mean_total_nfes']:.2f} | "
+                          f"mean decode={metrics['mean_decoding_seconds']:.2f}s", flush=True)
         setup["status"] = "completed"
     except BaseException as error:
         setup.update(status="interrupted" if isinstance(error, KeyboardInterrupt) else "failed",
@@ -337,6 +367,8 @@ def main():
     parser.add_argument("--init-tokens", type=int)
     parser.add_argument("--search-mode", choices=("budget", "candidates"))
     parser.add_argument("--search-budgets", type=int, nargs="+")
+    parser.add_argument("--run-order", choices=("example", "condition"),
+                        help="Finish all conditions per example, or all examples per condition.")
     parser.add_argument("--model-path", type=Path)
     parser.add_argument("--local-files-only", action="store_true", default=None)
     parser.add_argument("--cache-dir", type=Path)

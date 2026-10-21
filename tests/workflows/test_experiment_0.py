@@ -54,9 +54,12 @@ def prepared(monkeypatch):
     return wrapper()
 
 
-def test_six_conditions_one_load_real_accounting_and_offline_report(tmp_path, monkeypatch, prepared):
+@pytest.mark.parametrize("run_order", ["example", "condition"])
+def test_six_conditions_one_load_real_accounting_and_offline_report(tmp_path, monkeypatch, prepared,
+                                                                  capsys, run_order):
     instance, prompts = prepared
     source = config(tmp_path)
+    source["evaluation"]["run_order"] = run_order
     original = copy.deepcopy(source)
     loads = []
     def factory(config):
@@ -69,6 +72,19 @@ def test_six_conditions_one_load_real_accounting_and_offline_report(tmp_path, mo
     assert len(summary["conditions"]) == 6 and len(summary["gains"]) == 9
     rows = [json.loads(line) for line in (directory / "predictions.jsonl").read_text().splitlines()]
     assert len(rows) == 12
+    examples = json.loads((directory / "selection.json").read_text())
+    condition_ids = [condition["id"] for condition in loads[0]["conditions"]]
+    expected = ([(example["example_id"], condition) for condition in condition_ids for example in examples]
+                if run_order == "condition" else
+                [(example["example_id"], condition) for example in examples for condition in condition_ids])
+    assert [(row["example_id"], row["condition"]) for row in rows] == expected
+    saved_receipt = json.loads(receipt.read_text())
+    assert summary["run_order"] == saved_receipt["run_order"] == run_order
+    assert saved_receipt["condition_ids"] == condition_ids
+    streamed = capsys.readouterr().out
+    if run_order == "condition":
+        for previous, following in zip(condition_ids, condition_ids[1:]):
+            assert streamed.index(f"Finished {previous} | n=2") < streamed.index(f"Starting {following} on 2 questions")
     assert len(instance.model.seen) == sum(row["total_nfes"] for row in rows) + 1
     assert json.loads(receipt.read_text())["run_dir"] == str(directory)
     assert all("REFERENCE_ONLY" not in prompt for prompt in prompts)
@@ -83,18 +99,26 @@ def test_six_conditions_one_load_real_accounting_and_offline_report(tmp_path, mo
         assert "#### 16\n\nNow solve the following question using the same decomposition format." in row["prompt"]
         assert row["prompt"].endswith(f"Problem: {row['question']}")
         assert "\nQuestion:\n" not in row["prompt"]
-        assert row["protocol_version"] == "e0_fixed_budget_v3"
+        assert row["protocol_version"] == "e0_fixed_budget_v4"
+        assert row["temperature"] == 0.0
+        if row["method"].startswith("medal"):
+            assert row["details"]["temperature"] == 0.0
     for example in summary["common_example_ids"]:
         paired = [row for row in rows if row["example_id"] == example]
         assert len({row["prompt_ids_hash"] for row in paired}) == 1
         assert len({row["prompt_hash"] for row in paired}) == 1
         root = next(row for row in paired if row["condition"] == "medal_budget_b1")
         control = next(row for row in paired if row["method"] == "medal_no_search")
+        greedy = next(row for row in paired if row["method"] == "confidence")
+        assert control["condition"] == "medal_no_search_t0"
+        assert control["full_output_ids"] == greedy["full_output_ids"]
         assert root["full_output_ids"] == control["full_output_ids"]
         assert root["total_nfes"] == control["total_nfes"] + 1
         assert root["fallback_decode_used"] and root["status"] == "completed"
     saved = json.loads((directory / "config.json").read_text())
     assert saved["prompt"]["medal_decomposition"] is False
+    assert saved["decoding"]["completion_temperature"] == 0.0
+    assert "The T=0 no-search MEDAL control" in (directory / "report/report.md").read_text()
     for stem in ("accuracy_vs_total_nfes", "accuracy_vs_runtime"):
         for extension in ("png", "pdf"):
             assert (directory / f"report/plots/{stem}.{extension}").stat().st_size > 100
@@ -122,7 +146,8 @@ def test_quota_failures_record_answers_as_incorrect_and_continue(tmp_path, prepa
 
 
 @pytest.mark.parametrize("failure", [RuntimeError("controlled error"), KeyboardInterrupt()])
-def test_errors_keep_partial_records_actual_cost_and_receipt(tmp_path, monkeypatch, prepared, failure):
+@pytest.mark.parametrize("run_order", ["example", "condition"])
+def test_errors_keep_partial_records_actual_cost_and_receipt(tmp_path, monkeypatch, prepared, failure, run_order):
     instance, _ = prepared
     def fail(model, ids, *args, **kwargs):
         with torch.inference_mode():
@@ -130,16 +155,20 @@ def test_errors_keep_partial_records_actual_cost_and_receipt(tmp_path, monkeypat
         raise failure
     monkeypatch.setitem(e0.DECODERS, "entropy", fail)
     receipt = tmp_path / "receipt.json"
+    source = config(tmp_path)
+    source["evaluation"]["run_order"] = run_order
     with pytest.raises(type(failure)):
-        e0.run_experiment(config(tmp_path), model_factory=lambda _: instance, run_manifest=receipt)
+        e0.run_experiment(source, model_factory=lambda _: instance, run_manifest=receipt)
     saved = json.loads(receipt.read_text())
     assert saved["status"] == ("interrupted" if isinstance(failure, KeyboardInterrupt) else "failed")
     directory = Path(saved["run_dir"])
     summary = json.loads((directory / "report/summary.json").read_text())
     assert not summary["complete"] and summary["common_n"] == 0
     assert summary["unfinished_attempt_nfes"] == 1
-    assert summary["terminal_predictions"] == 1
-    assert summary["observed_conditions"][0]["n"] == 1
+    finished = 2 if run_order == "condition" else 1
+    assert summary["terminal_predictions"] == finished
+    assert summary["observed_conditions"][0]["n"] == finished
+    assert all(item["n"] == 0 for item in summary["observed_conditions"][1:])
 
 
 def test_config_defaults_and_overrides():
@@ -149,7 +178,10 @@ def test_config_defaults_and_overrides():
     assert default["decoding"]["mcts"]["init_tokens"] == 5
     assert default["decoding"]["mcts"]["stop_mode"] == "budget"
     assert default["evaluation"]["search_budgets"] == [512, 1024, 2048]
+    assert default["evaluation"]["run_order"] == "example"
     assert default["decoding"]["completion_method"] == "llada"
+    assert default["decoding"]["completion_temperature"] == 0.0
+    assert all(condition["temperature"] == 0.0 for condition in default["conditions"])
     assert all(c["completion_method"] == "llada" for c in default["conditions"] if c["method"].startswith("medal"))
     question = "How many items are in {a, b, c}?"
     assert build_e0_prompt(question, default["prompt"]).endswith(f"Problem: {question}")
@@ -163,13 +195,30 @@ def test_config_defaults_and_overrides():
         invalid["prompt"] = invalid_prompt
         with pytest.raises(ValueError, match="prompt.template"):
             e0.resolve_settings(invalid)
-    extended = e0.resolve_settings(source, stage="evaluation", init_tokens=7)
+    extended = e0.resolve_settings(source, stage="evaluation", init_tokens=7,
+                                   search_budgets=[256, 512, 1024], run_order="condition")
     assert extended["data"]["num_samples"] == 20
     assert extended["decoding"]["mcts"]["init_tokens"] == 7
+    assert extended["evaluation"]["run_order"] == "condition"
+    assert [condition["id"] for condition in extended["conditions"]] == [
+        "confidence_t0", "entropy_t0", "medal_no_search_t0",
+        "medal_budget_b256", "medal_budget_b512", "medal_budget_b1024"]
     assert e0.resolve_settings(source, stage="test")["data"]["num_samples"] == 25
-    for override in ({"search_budgets": [1, 1]}, {"search_budgets": [0]}, {"init_tokens": 256}):
+    for override in ({"search_budgets": [1, 1]}, {"search_budgets": [0]}, {"init_tokens": 256},
+                     {"run_order": "unknown"}):
         with pytest.raises(ValueError):
             e0.resolve_settings(source, **override)
+    legacy = copy.deepcopy(source)
+    legacy["decoding"]["completion_method"] = "medal"
+    with pytest.raises(ValueError, match="positive completion_temperature"):
+        e0.resolve_settings(legacy)
+    legacy["decoding"]["completion_temperature"] = 1.0
+    assert e0.resolve_settings(legacy)["conditions"][2]["id"] == "medal_no_search_t1"
+    for invalid_temperature in (-1, float("nan"), True):
+        invalid = copy.deepcopy(source)
+        invalid["decoding"]["completion_temperature"] = invalid_temperature
+        with pytest.raises(ValueError, match="temperature"):
+            e0.resolve_settings(invalid)
     source["prompt"]["medal_decomposition"] = True
     with pytest.raises(ValueError, match="decomposition"):
         e0.resolve_settings(source)
@@ -186,13 +235,15 @@ def test_cli_sigterm_flushes_current_forward_count(tmp_path, monkeypatch, prepar
             model(ids)
         signal.raise_signal(signal.SIGTERM)
     monkeypatch.setitem(e0.DECODERS, "entropy", terminate)
-    monkeypatch.setattr(sys, "argv", ["e0", "--config", str(source), "--run-manifest", str(receipt)])
+    monkeypatch.setattr(sys, "argv", ["e0", "--config", str(source), "--run-manifest", str(receipt),
+                                     "--run-order", "condition"])
     previous = signal.getsignal(signal.SIGTERM)
     with pytest.raises(KeyboardInterrupt):
         e0.main()
     assert signal.getsignal(signal.SIGTERM) == previous
     saved = json.loads(receipt.read_text())
     assert saved["status"] == "interrupted"
+    assert saved["run_order"] == "condition"
     setup = json.loads((Path(saved["run_dir"]) / "setup.json").read_text())
     assert setup["active_total_nfes"] == 1
 
@@ -222,20 +273,33 @@ def test_notebooks_valid_controls_and_exact_subprocess_receipts(tmp_path, monkey
     exec(cells["e0-config"], scope)
     assert scope["STAGE"] == stage and scope["NUM_SAMPLES"] == count
     assert scope["INIT_TOKENS"] == 5 and scope["RUN_QUOTA_COMPARISON"] is False
-    assert scope["SEARCH_BUDGETS"] == [512, 1024, 2048]
+    assert scope["TEMPERATURE"] == scope["cfg"]["decoding"]["completion_temperature"] == 0.0
+    assert all(condition["temperature"] == 0.0 for condition in e0.resolve_settings(scope["cfg"])["conditions"])
+    expected_budgets = [512, 1024, 2048] if label == "Dev" else [256, 512, 1024]
+    expected_order = "example" if label == "Dev" else "condition"
+    assert scope["SEARCH_BUDGETS"] == expected_budgets
+    assert scope["cfg"]["evaluation"].get("run_order", "example") == expected_order
     calls = []
     def launch(command, **kwargs):
         calls.append(command)
         receipt = Path(command[command.index("--run-manifest") + 1])
         mode = command[command.index("--search-mode") + 1]
         receipt.write_text(json.dumps({"run_dir": str(tmp_path / f"exact-{mode}-run"), "status": "completed",
-                                      "stage": stage, "search_mode": mode, "protocol_version": e0.PROTOCOL_VERSION}))
+                                      "stage": stage, "search_mode": mode, "protocol_version": e0.PROTOCOL_VERSION,
+                                      "run_order": expected_order,
+                                      "condition_ids": ["confidence_t0", "entropy_t0", "medal_no_search_t0",
+                                                        *[f"medal_{mode}_b{b}" for b in expected_budgets]]}))
         return SimpleNamespace(stdout=io.StringIO("streamed progress\n"), wait=lambda: 0)
     monkeypatch.setattr(subprocess, "Popen", launch)
     exec(cells["e0-run"], scope)
     assert scope["E0_RUN_DIR"] == tmp_path / "exact-budget-run"
     assert calls[0][calls[0].index("--init-tokens") + 1] == "5"
     assert calls[0][calls[0].index("--num-samples") + 1] == str(count)
+    budget_start = calls[0].index("--search-budgets") + 1
+    assert calls[0][budget_start:budget_start + 3] == list(map(str, expected_budgets))
+    if label != "Dev":
+        assert calls[0][calls[0].index("--run-order") + 1] == "condition"
+        assert "2048" not in cells["e0-config"]
     assert "rglob" not in cells["e0-report"] and "--report-only" in cells["e0-report"]
     assert scope["run_e0"]("candidates") == tmp_path / "exact-candidates-run"
     assert calls[-1][calls[-1].index("--init-tokens") + 1] == "5"

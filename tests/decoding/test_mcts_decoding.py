@@ -69,6 +69,56 @@ def test_simulations_preserve_partial_tree_states_and_prompt_masks(monkeypatch):
     assert not any(event['stage']=='rollout_step' for event in tree.trace)
 
 
+def test_expansion_uses_each_states_cached_actions_not_parent_or_sibling_actions():
+    def policy(output):
+        rows = [[0, 0, 0, .25, .25, .25, .25] for _ in range(4)]
+        if (output == MASK).all():
+            rows[0] = [0, 0, 0, .6, .3, .07, .03]
+        elif output[0].item() == 3:
+            rows[1] = [0, 0, 0, .02, .02, .94, .02]
+        elif output[0].item() == 4:
+            rows[1] = [0, 0, 0, .02, .02, .02, .94]
+        return rows
+
+    config = settings(init_tokens=3, stop_mode='budget', max_model_calls=31)
+    model = FakeModel(policy)
+    tree = md.MCTSSearch(model, PROMPT, MASK, 4, config, search_excluded_token_ids=(1, 2))
+    tree.step()
+    assert len(model.seen) == tree.model_calls == 3  # Root plus the two immediate children.
+    left, right = tree.root.children
+    assert [(n.action.output_position, n.action.token_id) for n in (left, right)] == [(0, 3), (0, 4)]
+    assert left.analysis.actions[0].token_id == 5
+    assert right.analysis.actions[0].token_id == 6
+    cached = [(node, node.state.clone(), node.analysis) for node in (tree.root, left, right)]
+
+    def reject_reanalysis(output):
+        if (output != MASK).sum().item() <= 1:
+            pytest.fail('Expansion recomputed the root or an already evaluated parent distribution')
+        return policy(output)
+    model.policy = reject_reanalysis
+    tree.step()
+    assert len(model.seen) == tree.model_calls == 5  # Only the two new grandchildren require forwards.
+    result = tree.run()
+    assert result.stats['stop_reason'] == 'frontier_exhausted'
+    assert left.children[0].action.token_id == 5
+    assert right.children[0].action.token_id == 6
+    for node, state, analysis in cached:
+        assert torch.equal(node.state, state) and node.analysis is analysis
+
+    reference_model = FakeModel(policy)
+    search_calls = len(model.seen)
+    for node in tree.nodes:
+        assert node.analysis.state_key == tuple(node.state[0].tolist())
+        fresh = md.analyze_state(reference_model, node.state, 2, MASK, config,
+                                 search_excluded_token_ids=(1, 2))
+        assert node.analysis.actions == fresh.actions
+        assert torch.equal(node.analysis.entropies, fresh.entropies)
+        if node.children:
+            assert [child.action for child in node.children] == list(node.analysis.actions)
+    assert len(model.seen) == search_calls == 1 + result.stats['evaluated_children']
+    assert result.stats['candidate_evaluation_model_calls'] == 0
+
+
 def test_reward_depends_only_on_immediate_child_not_later_trajectory():
     def policy(output):
         if (output!=MASK).sum() < 2:

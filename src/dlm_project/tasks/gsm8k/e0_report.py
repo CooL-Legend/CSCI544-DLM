@@ -54,6 +54,7 @@ def summarize(config, setup, records):
                           "accuracy_gain_pp_per_additional_nfe": gain / extra if extra is not None and extra > 0 else None})
     expected = len(requested) * len(conditions)
     return {"protocol_version": config["protocol_version"], "stage": config["evaluation"]["stage"],
+            "run_order": config["evaluation"].get("run_order", "example"),
             "search_mode": config["evaluation"]["search_mode"], "init_tokens": config["decoding"]["mcts"]["init_tokens"],
             "status": setup["status"], "complete": setup["status"] == "completed" and len(terminal) == expected,
             "requested_n": len(requested), "common_n": len(common), "common_example_ids": common,
@@ -183,6 +184,7 @@ def generate_report(run_dir):
     lines = ["# Experiment 0: Baseline Test", "",
              f"Stage: **{summary['stage']}** · mode: **{summary['search_mode']}** · Lc={summary['init_tokens']} · "
              f"status: **{summary['status']}** · paired questions: **{summary['common_n']}/{summary['requested_n']}**.", "",
+             f"Execution order: **{summary['run_order']}** (condition means all selected questions per method).", "",
              "| Condition | Accuracy % (Wilson 95% CI) | Search NFEs | Completion NFEs | Total NFEs | Decode seconds | Fallback rate |",
              "|---|---:|---:|---:|---:|---:|---:|"]
     for item in summary["conditions"]:
@@ -207,7 +209,9 @@ def generate_report(run_dir):
         lines.append(f"| {item['condition']} | {item['baseline']} | {number(item['accuracy_gain_pp'])} | "
                      f"{number(item['additional_mean_nfes'])} | {number(item['accuracy_gain_pp_per_additional_nfe'])} |")
     decoder = config.get("decoding", {}).get("completion_method", "medal")
-    lines += ["", f"MEDAL completion decoder: **{decoder}**. The T=1 no-search MEDAL control uses the identical downstream decoder and completion seed. "
+    temperature = next(condition["temperature"] for condition in config["conditions"]
+                       if condition["method"] == "medal_no_search")
+    lines += ["", f"MEDAL completion decoder: **{decoder}**. The T={temperature:g} no-search MEDAL control uses the identical downstream decoder, temperature and completion seed as searched MEDAL. "
               "Greedy baselines use T=0. Search excludes EOS/EOT; every completion permits them and fills all positions. "
               "Scoring uses only the prefix before the first terminator, with the existing strict #### parser.",
               "", "Fallback outputs count normally. Strict quota failures count as incorrect. Missing/interrupted outcomes "
