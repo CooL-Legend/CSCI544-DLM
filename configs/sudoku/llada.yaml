@@ -1,4 +1,4 @@
-# Custom defaults from the adi notebook; use --num-samples 1 for a smoke run.
+# Custom defaults from the chong notebook; use --num-samples 1 for a smoke run.
 data:
   num_samples: 3
   cache_dir: null

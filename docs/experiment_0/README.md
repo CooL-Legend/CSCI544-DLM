@@ -302,7 +302,7 @@ and the editable package, mount Drive, configure E0, and cache/stage the pinned
 model. They use one fresh comparison subprocess, stream progress, and display
 the exact run's reports, raw/scored outputs, termination boundaries and traces.
 
-`SOURCE_MODE="github"` checks out `adi` and displays its commit. The checked-out
+`SOURCE_MODE="github"` checks out `chong` and displays its commit. The checked-out
 branch must contain E0. Before publication, use `SOURCE_MODE="upload"` and upload
 the delivered `dist/experiment_0_colab_source.zip`; extraction uses an isolated
 runtime directory. The bundle contains source, configs, tests, documentation

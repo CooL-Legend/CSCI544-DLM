@@ -267,7 +267,7 @@ These scripts default to [the iLLaDA configuration](../../../configs/gsm8k/illad
 and require `model.family: illada`; the original entrypoints require `llada`.
 The shared runner verifies the selected family's pinned checkpoint revision.
 The [iLLaDA Colab notebook](../../../notebooks/gsm8k/iLLaDA_GSM8K_Colab.ipynb)
-downloads from `adi`, caches the model, streams all four runs, and displays five
+downloads from `chong`, caches the model, streams all four runs, and displays five
 randomly selected saved answers after each method.
 
 Every command supports the same profiles:

@@ -176,7 +176,7 @@ def test_gsm8k_notebook_keeps_four_decoders_and_adds_mcts_confidence():
             # This reference notebook contains the user's saved Colab results.
             # Validate its sources without changing or rejecting those outputs.
             compile(c.source, c.id, "exec")
-    assert 'BRANCH = "adi"' in cells["checkout"]
+    assert 'BRANCH = "chong"' in cells["checkout"]
     assert "LLaDA_GSM8K_Colab.ipynb" in cells["colab-badge"]
     code = "\n".join(c.source for c in notebook.cells if c.cell_type == "code")
     assert "from_pretrained(" not in code and "LLaDA(" not in code

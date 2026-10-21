@@ -4,15 +4,15 @@ Evaluate **LLaDA-8B-Instruct**, **iLLaDA-8B-Instruct**, and **LLaDA-8B-BGPO-sudo
 
 The **LLaDA and iLLaDA GSM8K notebooks** evaluate four shared decoding methods and display accuracy, inference cost, and randomly selected saved answers. LLaDA also includes the documented MEDAL reconstruction with immediate-child information gain, cached candidate ranking, and adjusted-score sampling.
 
-| Model | Notebook on `adi` | Dependency profile |
+| Model | Notebook on `chong` | Dependency profile |
 | --- | --- | --- |
-| LLaDA | [Open LLaDA in Colab](https://colab.research.google.com/github/CooL-Legend/CSCI544-DLM/blob/adi/notebooks/sudoku/LLaDA_Sudoku_Colab.ipynb) | Transformers 4.38.2 |
-| iLLaDA | [Open iLLaDA in Colab](https://colab.research.google.com/github/CooL-Legend/CSCI544-DLM/blob/adi/notebooks/sudoku/iLLaDA_Sudoku_Colab.ipynb) | Transformers 4.57.1, Tokenizers 0.22.2, Hugging Face Hub 0.36.2 |
-| Original LLaDA vs BGPO — 4×4 Sudoku | [Open comparison in Colab](https://colab.research.google.com/github/CooL-Legend/CSCI544-DLM/blob/adi/notebooks/sudoku/LLaDA_BGPO_Sudoku_Colab.ipynb) | Transformers 4.53.2 |
-| LLaDA — GSM8K decoders | [Open LLaDA GSM8K in Colab](https://colab.research.google.com/github/CooL-Legend/CSCI544-DLM/blob/adi/notebooks/gsm8k/LLaDA_GSM8K_Colab.ipynb) | Transformers 4.38.2 |
-| iLLaDA — GSM8K decoders | [Open iLLaDA GSM8K in Colab](https://colab.research.google.com/github/CooL-Legend/CSCI544-DLM/blob/adi/notebooks/gsm8k/iLLaDA_GSM8K_Colab.ipynb) | Transformers 4.57.1, Tokenizers 0.22.2, Hugging Face Hub 0.36.2 |
+| LLaDA | [Open LLaDA in Colab](https://colab.research.google.com/github/CooL-Legend/CSCI544-DLM/blob/chong/notebooks/sudoku/LLaDA_Sudoku_Colab.ipynb) | Transformers 4.38.2 |
+| iLLaDA | [Open iLLaDA in Colab](https://colab.research.google.com/github/CooL-Legend/CSCI544-DLM/blob/chong/notebooks/sudoku/iLLaDA_Sudoku_Colab.ipynb) | Transformers 4.57.1, Tokenizers 0.22.2, Hugging Face Hub 0.36.2 |
+| Original LLaDA vs BGPO — 4×4 Sudoku | [Open comparison in Colab](https://colab.research.google.com/github/CooL-Legend/CSCI544-DLM/blob/chong/notebooks/sudoku/LLaDA_BGPO_Sudoku_Colab.ipynb) | Transformers 4.53.2 |
+| LLaDA — GSM8K decoders | [Open LLaDA GSM8K in Colab](https://colab.research.google.com/github/CooL-Legend/CSCI544-DLM/blob/chong/notebooks/gsm8k/LLaDA_GSM8K_Colab.ipynb) | Transformers 4.38.2 |
+| iLLaDA — GSM8K decoders | [Open iLLaDA GSM8K in Colab](https://colab.research.google.com/github/CooL-Legend/CSCI544-DLM/blob/chong/notebooks/gsm8k/iLLaDA_GSM8K_Colab.ipynb) | Transformers 4.57.1, Tokenizers 0.22.2, Hugging Face Hub 0.36.2 |
 
-This repository is private. Authorize Colab to read it through GitHub, or download the desired notebook and use **File → Upload notebook**. An older notebook copy saved in Drive does not automatically receive repository changes. Both GSM8K notebooks check out `adi` and display its commit before running.
+This repository is private. Authorize Colab to read it through GitHub, or download the desired notebook and use **File → Upload notebook**. An older notebook copy saved in Drive does not automatically receive repository changes. Both GSM8K notebooks check out `chong` and display its commit before running.
 
 ## Repository structure
 
@@ -49,7 +49,7 @@ Use the new [development](notebooks/gsm8k/Experiment_0_Baseline_Test_Dev.ipynb),
 for 5/20 disjoint training questions and 25 held-out test questions, respectively.
 Each loads one model and displays paired accuracy, actual NFEs, runtime, depth,
 fallbacks, and saved answers. Testing can expand to 100 using the same frozen
-ordering. Before these changes are on `adi`, the notebooks also accept the
+ordering. Before these changes are on `chong`, the notebooks also accept the
 delivered `dist/experiment_0_colab_source.zip` through `SOURCE_MODE="upload"`.
 The [implementation README](docs/experiment_0/README.md) explains the exact
 protocol, code interfaces, commands, metrics, saved records, and validation.
@@ -126,7 +126,7 @@ The comparison validates puzzle IDs, prompts, decoding settings/seeds, and check
 
 1. Open the notebook for the model you want. Select **Runtime → Change runtime type → GPU → L4 or A100**, subject to availability. The notebooks check BF16 support and GPU memory before loading unquantized weights.
 2. Give the clone cell read access to the private repository: use a fine-grained GitHub token with **Contents: read** access, stored in Colab **Secrets** as `GITHUB_TOKEN`, or use the hidden prompt. Do not paste tokens into notebook source or Git URLs.
-3. Run steps **1–5** to get `adi`, install the selected model's dependencies, mount Drive, load the base configuration, and download/stage the model. A clean checkout can switch to `adi`; local modifications or divergent commits stop the update without discarding work.
+3. Run steps **1–5** to get `chong`, install the selected model's dependencies, mount Drive, load the base configuration, and download/stage the model. A clean checkout can switch to `chong`; local modifications or divergent commits stop the update without discarding work.
 4. In **Config Updater**, use `NUM_SAMPLES = 1` for the first verification. LLaDA now starts with the MCTS walkthrough: **256 output positions, steps, and block length**, temperature **1**, `Lc=20`, `C=3`, and `K1=3`, `K2=5`, with no default cap. The iLLaDA notebook retains its baseline defaults (three puzzles and 128-token blocks). The first dataset preparation can process the million-row CSV before selecting your slice.
 5. In the LLaDA notebook, run **Inspect one expansion**, then **Inspect initialization**. Change `CYCLE_TO_VIEW` to inspect saved selection, expansion, evaluation and backpropagation tables without another model load. These inspection commands do not complete the output.
 6. Run **step 6** for full generation, then inspect predictions, traces, GPU artifact checks and plots in **step 7**. `status: completed` means inference and artifact saving finished, not that the puzzles were solved. After verification, increase `NUM_SAMPLES` and rerun Config Updater and steps 6–7.
@@ -169,7 +169,7 @@ python scripts/eval_illada_gsm8k_confidence.py --profile smoke
 python scripts/eval_illada_gsm8k_best_of_5.py --profile smoke
 ```
 
-Each iLLaDA entrypoint defaults to `configs/gsm8k/illada_decoding.yaml` and rejects configurations for other model families. Add `--run-manifest /path/to/receipt.json` to save its exact completed run directory. See [the decoding README](src/dlm_project/decoding/README.md) for all CLI options and metrics. New notebooks and scripts must be available on `adi` before the Colab checkout can use them.
+Each iLLaDA entrypoint defaults to `configs/gsm8k/illada_decoding.yaml` and rejects configurations for other model families. Add `--run-manifest /path/to/receipt.json` to save its exact completed run directory. See [the decoding README](src/dlm_project/decoding/README.md) for all CLI options and metrics. New notebooks and scripts must be available on `chong` before the Colab checkout can use them.
 
 The single-question LLaDA walkthrough remains available through its original CLI. To preview without GPU weights:
 

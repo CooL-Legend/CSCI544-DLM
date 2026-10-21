@@ -104,7 +104,7 @@ def checkout_function(repo_dir, remote):
     notebook = json.loads((ROOT / "notebooks/sudoku/LLaDA_Sudoku_Colab.ipynb").read_text())
     code = cell_source(notebook, "checkout")
     function = next(node for node in ast.parse(code).body if isinstance(node, ast.FunctionDef) and node.name == "ensure_checkout")
-    scope = {"REPO_DIR": repo_dir, "REPO_URL": str(remote), "BRANCH": "adi", "subprocess": subprocess,
+    scope = {"REPO_DIR": repo_dir, "REPO_URL": str(remote), "BRANCH": "chong", "subprocess": subprocess,
              "remote_git": lambda args: subprocess.run(["git", *args], check=True, capture_output=True)}
     exec(compile(ast.Module(body=[function], type_ignores=[]), "checkout-cell", "exec"), scope)
     return scope["ensure_checkout"]
@@ -114,24 +114,24 @@ def git(directory, *args):
     return subprocess.check_output(["git", "-C", str(directory), *args], text=True, stderr=subprocess.DEVNULL).strip()
 
 
-def test_notebook_switches_clean_main_to_adi_and_preserves_dirty_checkout(tmp_path):
+def test_notebook_switches_clean_main_to_chong_and_preserves_dirty_checkout(tmp_path):
     remote, seed, checkout = tmp_path / "origin.git", tmp_path / "seed", tmp_path / "checkout"
     subprocess.run(["git", "init", "--bare", str(remote)], check=True, capture_output=True)
     subprocess.run(["git", "init", "-b", "main", str(seed)], check=True, capture_output=True)
     (seed / "file.txt").write_text("main")
     git(seed, "add", "file.txt")
     git(seed, "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "main")
-    git(seed, "switch", "-c", "adi")
-    (seed / "file.txt").write_text("adi")
+    git(seed, "switch", "-c", "chong")
+    (seed / "file.txt").write_text("chong")
     git(seed, "add", "file.txt")
-    git(seed, "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "adi")
+    git(seed, "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "chong")
     git(seed, "remote", "add", "origin", str(remote))
-    git(seed, "push", "origin", "main", "adi")
+    git(seed, "push", "origin", "main", "chong")
     subprocess.run(["git", "clone", "--branch", "main", "--single-branch", str(remote), str(checkout)], check=True, capture_output=True)
     ensure = checkout_function(checkout, remote)
     ensure()
-    assert git(checkout, "branch", "--show-current") == "adi"
-    assert (checkout / "file.txt").read_text() == "adi"
+    assert git(checkout, "branch", "--show-current") == "chong"
+    assert (checkout / "file.txt").read_text() == "chong"
     (checkout / "file.txt").write_text("my unsaved edits")
     with pytest.raises(RuntimeError, match="local changes"):
         ensure()
@@ -141,6 +141,6 @@ def test_notebook_switches_clean_main_to_adi_and_preserves_dirty_checkout(tmp_pa
     git(checkout, "add", "file.txt")
     git(checkout, "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "local")
     local_head = git(checkout, "rev-parse", "HEAD")
-    with pytest.raises(RuntimeError, match="differs from origin/adi"):
+    with pytest.raises(RuntimeError, match="differs from origin/chong"):
         ensure()
     assert git(checkout, "rev-parse", "HEAD") == local_head

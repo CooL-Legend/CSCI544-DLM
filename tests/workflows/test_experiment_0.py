@@ -209,7 +209,7 @@ def test_notebooks_valid_controls_and_exact_subprocess_receipts(tmp_path, monkey
             assert cell.outputs == [] and cell.execution_count is None
             compile(cell.source, cell.id, "exec")
             assert "from_pretrained(" not in cell.source
-    assert 'BRANCH = "adi"' in cells["e0-source"] and 'SOURCE_MODE = "github"' in cells["e0-source"]
+    assert 'BRANCH = "chong"' in cells["e0-source"] and 'SOURCE_MODE = "github"' in cells["e0-source"]
     assert 'SOURCE_MODE == "upload"' in cells["e0-source"]
     assert "requirements/llada-colab.txt" in cells["e0-dependencies"]
     monkeypatch.setenv("HF_DATASETS_CACHE", str(tmp_path / "data"))

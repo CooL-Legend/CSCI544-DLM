@@ -47,7 +47,7 @@ def notebook_scope(tmp_path):
 
 def test_notebook_structure_and_empty_outputs(cells):
     assert "iLLaDA_GSM8K_Colab.ipynb" in cells["colab-badge"].source
-    assert 'BRANCH = "adi"' in cells["checkout"].source
+    assert 'BRANCH = "chong"' in cells["checkout"].source
     assert "requirements/illada-colab.txt" in cells["dependencies"].source
     assert 'MODEL_FAMILY = "illada"' in cells["drive-setup"].source
     code = "\n".join(cell.source for cell in cells.values() if cell.cell_type == "code")

@@ -82,7 +82,7 @@ def test_appended_cells_are_valid_cleared_and_preserve_existing_workflow(cells):
     old_code = "\n".join(cell.source for cell in notebook.cells[:mcts_index] if cell.cell_type == "code")
     for method in ("confidence", "random_mdm", "top_k_margin", "best_of_5"):
         assert f'METHOD = "{method}"' in old_code
-    assert "NUM_SAMPLES = 2" in old_code and 'BRANCH = "adi"' in old_code
+    assert "NUM_SAMPLES = 2" in old_code and 'BRANCH = "chong"' in old_code
 
 
 @pytest.mark.parametrize("profile,count,expected", [("smoke", 2, 2), ("smoke", None, 20),
