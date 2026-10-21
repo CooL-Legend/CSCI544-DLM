@@ -470,21 +470,37 @@ def evaluate_action(model, parent, child, prompt_len, mask_id, config, *,
     """Use the cached parent and one child forward to compute the edge reward."""
     if parent.analysis is None or child.analysis is not None:
         raise ValueError("Evaluation requires a cached parent and an unevaluated child.")
-    analysis = analyze_state(model, child.state, prompt_len, mask_id, config,
-                             search_excluded_token_ids=search_excluded_token_ids)
+    analysis, _, probabilities, _ = _distribution(
+        model, child.state, prompt_len, mask_id, config,
+        search_excluded_token_ids=search_excluded_token_ids)
     before, after = parent.analysis.total_entropy, analysis.total_entropy
-    
+
     # Any trajectory Based Method --> For experiment 2
-    reward = information_gain(before, after, config.epsilon)
-    
+    # AdaLook-inspired score with R=1, not adaptive multi-step rollout.
+    # Reuse the child forward; its state and native probabilities stay unchanged.
+    alpha = 0.1
+    confidence_threshold = 0.8  # Local experiment setting, not a paper default.
+    confidence_mass = 0.0
+    if probabilities is not None:
+        confidence, proposed_tokens = probabilities.max(dim=-1)
+        eligible = (confidence >= confidence_threshold) & (proposed_tokens != mask_id)
+        for token_id in search_excluded_token_ids:
+            eligible &= proposed_tokens != token_id
+        confidence_mass = confidence[eligible].double().sum().item()
+    reward = (alpha * math.log(max(child.action.probability, config.epsilon))
+              + math.log(max(confidence_mass, config.epsilon)))
 
     if not math.isfinite(reward):
-        raise ValueError("Non-finite child information gain.")
+        raise ValueError("Non-finite child reward.")
     child.analysis, child.immediate_reward = analysis, reward
     remaining = int((child.state[0, prompt_len:] == mask_id).sum().item())
     removed = parent.analysis.entropies[child.action.output_position].item()
     return {"entropy_before": before, "entropy_after": after,
-            "immediate_gain": reward, "reward": reward, "evaluation_model_calls": int(remaining > 0),
+            "immediate_gain": information_gain(before, after, config.epsilon),
+            "reward": reward, "reward_method": "adalook_one_step",
+            "reward_alpha": alpha, "reward_confidence_threshold": confidence_threshold,
+            "reward_confidence_mass": confidence_mass,
+            "evaluation_model_calls": int(remaining > 0),
             "masked_count": remaining, "mean_token_entropy": after / remaining if remaining else 0.0,
             "mean_confidence_margin": analysis.mean_margin,
             "signal_nfe": getattr(model, "calls", None), "signal_extra_nfes": 0,
