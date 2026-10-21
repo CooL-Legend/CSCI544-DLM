@@ -11,6 +11,7 @@ The **LLaDA and iLLaDA GSM8K notebooks** evaluate four shared decoding methods a
 | Original LLaDA vs BGPO — 4×4 Sudoku | [Open comparison in Colab](https://colab.research.google.com/github/CooL-Legend/CSCI544-DLM/blob/chong/notebooks/sudoku/LLaDA_BGPO_Sudoku_Colab.ipynb) | Transformers 4.53.2 |
 | LLaDA — GSM8K decoders | [Open LLaDA GSM8K in Colab](https://colab.research.google.com/github/CooL-Legend/CSCI544-DLM/blob/chong/notebooks/gsm8k/LLaDA_GSM8K_Colab.ipynb) | Transformers 4.38.2 |
 | iLLaDA — GSM8K decoders | [Open iLLaDA GSM8K in Colab](https://colab.research.google.com/github/CooL-Legend/CSCI544-DLM/blob/chong/notebooks/gsm8k/iLLaDA_GSM8K_Colab.ipynb) | Transformers 4.57.1, Tokenizers 0.22.2, Hugging Face Hub 0.36.2 |
+| LLaDA — MEDAL MCTS Demo | [Open MEDAL MCTS Demo in Colab](https://colab.research.google.com/github/CooL-Legend/CSCI544-DLM/blob/chong/notebooks/gsm8k/MEDAL_MCTS_Demo.ipynb) | Transformers 4.38.2 |
 
 This repository is private. Authorize Colab to read it through GitHub, or download the desired notebook and use **File → Upload notebook**. An older notebook copy saved in Drive does not automatically receive repository changes. Both GSM8K notebooks check out `chong` and display its commit before running.
 
