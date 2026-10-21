@@ -1,4 +1,4 @@
-# Same frozen LLaDA checkpoint for every condition. Current one-step MCTS variant.
+# MEDAL paper reconstruction; interpretations are saved in every run.
 model:
   family: llada
   model_path: GSAI-ML/LLaDA-8B-Instruct
@@ -6,35 +6,38 @@ model:
   dtype: bfloat16
   local_files_only: false
 data:
-  num_samples: null  # smoke: 3; milestone: 50; override with --num-samples
+  num_samples: null
   cache_dir: null
-  revision: null  # Resolve once into the reusable manifest, or supply a commit SHA.
+  revision: null
 prompt:
-  instructions: |-
-    Solve the following math word problem. Explain your solution briefly.
-    End your response with a line in this exact format: #### <number>
+  instructions: 'Solve the following math word problem. Explain your solution briefly.
+
+    End your response with a line in this exact format: #### <number>'
 generation:
   gen_length: 256
   steps: 256
   block_length: 256
-  temperature: 0.0
+  temperature: 1.0
   remasking: low_confidence
 decoding:
   method: mcts_entropy
   seed: 1
   mcts:
     init_tokens: 20
-    num_candidates: 3  # Inactive in budget-stop mode; retained for compatibility.
+    num_candidates: 3
     top_k_tokens: 3
     top_k_actions: 5
     margin_gamma: 10.0
     exploration_c: 0.01
-    epsilon: 1.0e-8
+    epsilon: 1.0e-08
     stop_mode: budget
 sweep:
   profile: smoke
   sample_seed: 1
-  budgets: [128, 256, 512]
+  budgets:
+  - 128
+  - 256
+  - 512
   warmup: true
 experiment_root: results
 experiment_timezone: America/Los_Angeles

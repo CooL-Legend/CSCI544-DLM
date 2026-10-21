@@ -1,0 +1,28 @@
+# iLLaDA uses the same decoders, prompts, and ordered test manifest as LLaDA.
+model:
+  family: illada
+  model_path: GSAI-ML/iLLaDA-8B-Instruct
+  device: cuda
+  dtype: bfloat16
+  local_files_only: false
+data:
+  num_samples: null  # smoke: 20; initial: 100; full: 1,319
+  cache_dir: null
+  revision: null  # Resolved once in the shared GSM8K test manifest.
+prompt:
+  instructions: |-
+    Solve this math problem in English.
+    Use at most three short calculation lines.
+    End with a final line containing exactly #### followed by a plain number.
+    Do not include units, %, LaTeX, or any text after that number.
+generation:
+  gen_length: 256
+  steps: 256
+  block_length: 128
+  temperature: 1.0
+decoding:
+  seed: 1
+evaluation:
+  profile: smoke
+experiment_root: results
+experiment_timezone: America/Los_Angeles

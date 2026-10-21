@@ -2,16 +2,17 @@
 
 Evaluate **LLaDA-8B-Instruct**, **iLLaDA-8B-Instruct**, and **LLaDA-8B-BGPO-sudoku** on Sudoku for CSCI 544 Applied NLP. Develop locally, run inference on **Google Colab Pro**, and keep model weights and experiment artifacts in **Google Drive**.
 
-For a simpler look at prompting, the **LLaDA GSM8K notebook** starts with one math word problem and shows the user message, HF chat formatting, token IDs, generated response and answer comparison.
+The **LLaDA and iLLaDA GSM8K notebooks** evaluate four shared decoding methods and display accuracy, inference cost, and randomly selected saved answers. LLaDA also includes the documented MEDAL reconstruction with immediate-child information gain, cached candidate ranking, and adjusted-score sampling.
 
 | Model | Notebook on `adi` | Dependency profile |
 | --- | --- | --- |
 | LLaDA | [Open LLaDA in Colab](https://colab.research.google.com/github/CooL-Legend/CSCI544-DLM/blob/adi/notebooks/sudoku/LLaDA_Sudoku_Colab.ipynb) | Transformers 4.38.2 |
 | iLLaDA | [Open iLLaDA in Colab](https://colab.research.google.com/github/CooL-Legend/CSCI544-DLM/blob/adi/notebooks/sudoku/iLLaDA_Sudoku_Colab.ipynb) | Transformers 4.57.1, Tokenizers 0.22.2, Hugging Face Hub 0.36.2 |
 | Original LLaDA vs BGPO — 4×4 Sudoku | [Open comparison in Colab](https://colab.research.google.com/github/CooL-Legend/CSCI544-DLM/blob/adi/notebooks/sudoku/LLaDA_BGPO_Sudoku_Colab.ipynb) | Transformers 4.53.2 |
-| LLaDA — GSM8K prompt walkthrough | [Open GSM8K in Colab](https://colab.research.google.com/github/CooL-Legend/CSCI544-DLM/blob/adi/notebooks/gsm8k/LLaDA_GSM8K_Colab.ipynb) | Transformers 4.38.2 |
+| LLaDA — GSM8K decoders | [Open LLaDA GSM8K in Colab](https://colab.research.google.com/github/CooL-Legend/CSCI544-DLM/blob/adi/notebooks/gsm8k/LLaDA_GSM8K_Colab.ipynb) | Transformers 4.38.2 |
+| iLLaDA — GSM8K decoders | [Open iLLaDA GSM8K in Colab](https://colab.research.google.com/github/CooL-Legend/CSCI544-DLM/blob/adi/notebooks/gsm8k/iLLaDA_GSM8K_Colab.ipynb) | Transformers 4.57.1, Tokenizers 0.22.2, Hugging Face Hub 0.36.2 |
 
-This repository is private. Authorize Colab to read it through GitHub, or download the desired notebook and use **File → Upload notebook**. An older notebook copy saved in Drive does not automatically receive repository changes. All notebooks check out `adi` and display its commit before running.
+This repository is private. Authorize Colab to read it through GitHub, or download the desired notebook and use **File → Upload notebook**. An older notebook copy saved in Drive does not automatically receive repository changes. Both GSM8K notebooks check out `adi` and display its commit before running.
 
 ## Repository structure
 
@@ -33,9 +34,57 @@ docs/                       # Structure guide and MCTS walkthrough
 
 Install the package with `python -m pip install --no-deps -e .` after installing a dependency profile. The Colab notebooks do this automatically. See [the structure guide](docs/project_structure.md) for file locations, imports, and commands. Model weights and run artifacts stay outside the source package.
 
+## Experiment 0: fixed-budget GSM8K baseline test
+
+[Experiment 0](docs/experiment_0/README.md) compares greedy confidence, greedy entropy,
+MEDAL with standard LLaDA completion without search, and fixed-budget MEDAL.
+All E0 conditions use T=0. Evaluation and testing use search caps of 256, 512 and
+1024 actual forwards. It uses Lc=5, a shared three-step decomposition prompt
+with the fixed pens/muffins examples, search-only EOS/EOT
+filtering, and fallback completion after budget exhaustion. The original
+candidate-quota mode remains available as a separate matched-depth comparison.
+
+Use the new [development](notebooks/gsm8k/Experiment_0_Baseline_Test_Dev.ipynb),
+[evaluation](notebooks/gsm8k/Experiment_0_Baseline_Test_Evaluation.ipynb), and
+[testing](notebooks/gsm8k/Experiment_0_Baseline_Test_Testing.ipynb) Colab notebooks
+for 5/20 disjoint training questions and 25 held-out test questions, respectively.
+Each loads one model and displays paired accuracy, actual NFEs, runtime, depth,
+fallbacks, and saved answers. Testing can expand to 100 using the same frozen
+ordering. Before these changes are on `adi`, the notebooks also accept the
+delivered `dist/experiment_0_colab_source.zip` through `SOURCE_MODE="upload"`.
+The [implementation README](docs/experiment_0/README.md) explains the exact
+protocol, code interfaces, commands, metrics, saved records, and validation.
+
+```bash
+python scripts/experiment_0_baseline_test.py --stage dev
+```
+
+## Single-prompt MEDAL demo
+
+Use [MEDAL_MCTS_Demo.ipynb](notebooks/gsm8k/MEDAL_MCTS_Demo.ipynb) for one E0-style MEDAL run. It loads one model from the runtime, Drive, or the pinned Hub checkpoint and uses the fixed pens/muffins prompt. Before MCTS, the no-search block runs standard LLaDA completion from all masks and displays its independent outputs, NFE/runtime and accuracy metrics. Defaults for searched MEDAL are target depth 5 and a 512-forward search budget; set `SEARCH_BUDGET` to 1024 or 2048 for larger runs. Live counters show actual search NFEs/budget, evaluated depth and candidate count. The existing cells inspect up to three cached candidates or the selected fallback, then complete that state. The control and search share the model, prompt and completion seed; the control's cost is kept separate from searched MEDAL's totals.
+
+The completion cell reuses the same initialization and defaults to `method="llada"` (Gumbel token proposals and low-confidence remasking); `"medal"` selects the prior adjusted-score sampler, and custom callables or `"my_sampler:decode"` remain supported. Each sampler receives a fresh partial-state copy; the helper counts its actual forwards and checks that it preserves the prompt and initialized tokens. Search excludes EOS/EOT; completion fills all positions and retains full outputs while scoring the prefix before the first terminator. Reports include stage costs, search/completion/total NFEs and runtime, budget utilization, depths, shortlist/fallback status, parse success and reference-based accuracy with a Wilson interval. An optional 10-question batch reuses the model and saves aggregate metrics.
+
+The separate CLI retains its original prompt, depth-20 quota defaults and sampler interface:
+
+```bash
+python scripts/demo_medal.py --model-path /path/to/LLaDA-8B-Instruct --local-files-only \
+  --prompt-file /path/to/question.txt
+```
+
+Omit `--model-path` to load the pinned Hub model, or use `--question "..."` instead of a file. `--demonstrations-path` can point to the existing Drive `manifests/gsm8k_decomposition_train.json`; otherwise the demo caches the two training examples separately. No test dataset, accuracy calculation, or evaluation artifacts are produced. See `--help` for initialization settings and `--decoding-method my_sampler:decode`.
+
 ## Milestone 1 decoder sweeps
 
-The [milestone sweep guide](docs/milestone1_sweeps.md) provides two scripts using the **same pinned original LLaDA** model: GSM8K and BGPO's **4×4 dataset**. Each compares baseline, confidence-only, and fixed-branching MCTS with search caps of **128, 256 and 512 forwards**, using the current **one-step entropy evaluator**. It saves frozen manifests, per-example traces/scores/compute, paired summaries, Wilson intervals, and PNG/PDF reports.
+Four separate search-free GSM8K decoders and their evaluation commands are in the
+[decoding methods README](src/dlm_project/decoding/README.md): random MDM,
+Top-K Margin, token-probability confidence decoding, and majority-vote Best-of-5.
+Both LLaDA and iLLaDA use their pinned checkpoints and the same frozen GSM8K examples; the guide defines
+their accuracy, NFE, runtime and method-specific metrics.
+
+The LLaDA GSM8K notebook now has an **Accuracy, compute, and MCTS simulation comparison** section. It loads one model in a subprocess for all four baselines and MCTS caps of 4, 8, 16, 32, and 64 completed simulations. It uses shared MEDAL prompting and generation settings, saves uncertainty signals without additional forwards, and displays a paired metric table plus accuracy-versus-simulations/NFEs/time plots. The [metric definitions and commands](src/dlm_project/decoding/README.md#accuracy-compute-and-search-metrics) explain decoding-step counts, immediate-child evaluation cost, and fallback behavior. Start with two examples; simulation caps are distinct from NFE caps.
+
+The [milestone sweep guide](docs/milestone1_sweeps.md) provides two scripts using the **same pinned original LLaDA** model: GSM8K and BGPO's **4×4 dataset**. Each compares baseline, confidence-only, and fixed-branching MCTS with search caps of **128, 256 and 512 forwards**, using **immediate parent-to-child information gain** as explicit budget-limited MEDAL ablations. It saves frozen manifests, per-example traces/scores/compute, paired summaries, Wilson intervals, and PNG/PDF reports.
 
 ```bash
 python scripts/run_gsm8k_sweep.py --profile smoke
@@ -79,7 +128,7 @@ The comparison validates puzzle IDs, prompts, decoding settings/seeds, and check
 1. Open the notebook for the model you want. Select **Runtime → Change runtime type → GPU → L4 or A100**, subject to availability. The notebooks check BF16 support and GPU memory before loading unquantized weights.
 2. Give the clone cell read access to the private repository: use a fine-grained GitHub token with **Contents: read** access, stored in Colab **Secrets** as `GITHUB_TOKEN`, or use the hidden prompt. Do not paste tokens into notebook source or Git URLs.
 3. Run steps **1–5** to get `adi`, install the selected model's dependencies, mount Drive, load the base configuration, and download/stage the model. A clean checkout can switch to `adi`; local modifications or divergent commits stop the update without discarding work.
-4. In **Config Updater**, use `NUM_SAMPLES = 1` for the first verification. LLaDA now starts with the MCTS walkthrough: **256 output positions, steps, and block length**, temperature **0**, `Lc=2`, `C=3`, and `K1=K2=2`. The iLLaDA notebook retains its baseline defaults (three puzzles and 128-token blocks). The first dataset preparation can process the million-row CSV before selecting your slice.
+4. In **Config Updater**, use `NUM_SAMPLES = 1` for the first verification. LLaDA now starts with the MCTS walkthrough: **256 output positions, steps, and block length**, temperature **1**, `Lc=20`, `C=3`, and `K1=3`, `K2=5`, with no default cap. The iLLaDA notebook retains its baseline defaults (three puzzles and 128-token blocks). The first dataset preparation can process the million-row CSV before selecting your slice.
 5. In the LLaDA notebook, run **Inspect one expansion**, then **Inspect initialization**. Change `CYCLE_TO_VIEW` to inspect saved selection, expansion, evaluation and backpropagation tables without another model load. These inspection commands do not complete the output.
 6. Run **step 6** for full generation, then inspect predictions, traces, GPU artifact checks and plots in **step 7**. `status: completed` means inference and artifact saving finished, not that the puzzles were solved. After verification, increase `NUM_SAMPLES` and rerun Config Updater and steps 6–7.
 7. Check cache reuse by rerunning **step 5** and then evaluation. Unchanged weight files are reused; each evaluation creates a new experiment timestamp. Inspect Sudoku validity and clue preservation before increasing to 10 or 100 puzzles.
@@ -90,21 +139,46 @@ Each evaluation uses a fresh Python process and loads the model once. If you swi
 
 The LLaDA Sudoku notebook includes **Check the search on CUDA before loading LLaDA** after dependency installation. It runs three tiny controlled-model tests on the GPU, then the later inspection/generation cells verify the actual HF model reports a CUDA device. Forward passes, softmax, entropy and confidence factors use the GPU; compact tree states and trace bookkeeping remain on CPU to conserve GPU memory. Saved statistics distinguish `model_device` from `search_state_device`.
 
-## GSM8K: start with one prompt
+## GSM8K decoder evaluations
 
-[`notebooks/gsm8k/LLaDA_GSM8K_Colab.ipynb`](notebooks/gsm8k/LLaDA_GSM8K_Colab.ipynb) follows the same checkout → dependencies → Drive → configuration → model cache → generation → inspection flow. It reuses the existing LLaDA model snapshot and starts with **baseline decoding**, one question, and `configs/gsm8k/llada.yaml`.
+The [LLaDA notebook](notebooks/gsm8k/LLaDA_GSM8K_Colab.ipynb) and [iLLaDA notebook](notebooks/gsm8k/iLLaDA_GSM8K_Colab.ipynb) follow the same checkout → dependencies → Drive → configuration → model cache → four decoding methods → answer inspection flow. Run setup steps 1–5, configure the benchmark, and run the methods you want. The iLLaDA notebook installs `requirements/illada-colab.txt` and caches its own pinned snapshot with mask token **5**.
 
-In Config Updater, change `QUESTION_INDEX`, `PROMPT_INSTRUCTIONS`, or `CUSTOM_QUESTION`. The default is the first question from [`openai/gsm8k`, `main`, `test`](https://huggingface.co/datasets/openai/gsm8k). Prompt preview runs without loading weights. Generation loads one model in a fresh CUDA subprocess and saves both the raw user prompt and its chat-token view. The reference solution is used only after generation; custom questions have no reference score.
+The iLLaDA configuration controls default to temperature **1.0**, 256 output positions and steps, 128-token blocks, and seed 1. Set `PROFILE` to `smoke` (20 questions), `initial` (100), or `full` (1,319); `NUM_SAMPLES = None` uses that profile's count. Both models reuse the ordered `openai/gsm8k`, `main`, `test` manifest on Drive. References enter only post-generation scoring, using the strict final `#### <number>` line parser.
 
-After generation, inspect the visible chat control tokens, input token IDs, output mask count, raw response, extracted final answer, and GPU statistics. Answer comparison requires a final `#### <number>` line and normalizes numeric formatting. A missing marker is reported as a parse failure; the scorer does not guess from intermediate calculations. This is a single-example walkthrough, not a benchmark evaluation.
+Each iLLaDA method streams its subprocess output, writes a unique run receipt, and saves artifacts under `iLLaDA/GSM8K/<method>/<profile>/<settings>/<timestamp>/`. Preview cells display metrics and five randomly selected responses from that exact run; rerunning a preview performs no inference. All five Best-of-5 candidates count toward inference cost. The original LLaDA notebook and its saved responses are retained.
 
-Artifacts are saved under `LLaDA/GSM8K/<generation-config>/<timestamp>/`: `config.json`, `prompt.json`, `response.txt`, `predictions.jsonl`, `metrics.json`, and `trace.jsonl`. To preview locally without GPU weights:
+The LLaDA notebook appends **MCTS initialization + confidence decoding** as a fifth method. Run its configuration, execution, and preview cells after the shared setup and benchmark configuration. It inherits the active prompt, model/cache paths, generation controls, profile, seed, and current `NUM_SAMPLES = 2` override; set that override to `None` for profile counts. Its run streams errors and selects previews through a unique receipt, displaying accuracy, random saved answers, initialization depth, fallback status, and search/completion costs.
+
+MCTS now uses the [MEDAL paper reconstruction](docs/mcts_walkthrough.md) across GSM8K, Sudoku, inspection, and sweeps. Defaults are Lc=20, C=3, K1=3, K2=5, temperature 1.0, 256 output tokens/steps/global block length, seed 1, and **no forward cap**. Each simulation evaluates one immediate child and backs up its normalized entropy reduction. Cached candidate rewards select the partial state, and literal adjusted-score softmax fills its remaining masks. Inline three-subtask prompting uses disjoint training/synthetic demonstrations. Gamma 10 and exploration constant 0.01 remain repository defaults, not verified author settings. Author-code parity is unverified.
+
+Search costs one root forward plus one forward per evaluated child; candidate ranking adds no forwards. Final completion costs 236 forwards at depth 20. A direct-path example costs **335 forwards**, with more possible under broader exploration. Strict candidate mode fails instead of silently falling back. Explicit finite-budget sweeps remain labeled ablations, retaining only completed simulation rewards. New artifact labels include `medal-v2`; historical runs and the four standalone decoding sections are preserved.
+
+On a configured CUDA machine with the LLaDA dependency profile installed:
+
+```bash
+python scripts/eval_gsm8k_mcts_confidence.py --profile smoke --num-samples 2
+```
+
+The new CLI defaults to [`configs/gsm8k/mcts_confidence.yaml`](configs/gsm8k/mcts_confidence.yaml), requires `model.family: llada`, and supports the same benchmark overrides and run receipts as the other methods. Edit `decoding.mcts` in YAML or `MCTS_SETTINGS` in the notebook to change the search settings. Results go to `LLaDA/GSM8K/mcts_confidence/<profile>/<generation-and-search-settings>/<timestamp>/`, sharing the frozen test manifest and strict scorer. The four original notebook sections and all their saved outputs remain unchanged.
+
+On a configured CUDA machine with the iLLaDA dependency profile installed:
+
+```bash
+python scripts/eval_illada_gsm8k_random_mdm.py --profile smoke
+python scripts/eval_illada_gsm8k_top_k_margin.py --profile smoke
+python scripts/eval_illada_gsm8k_confidence.py --profile smoke
+python scripts/eval_illada_gsm8k_best_of_5.py --profile smoke
+```
+
+Each iLLaDA entrypoint defaults to `configs/gsm8k/illada_decoding.yaml` and rejects configurations for other model families. Add `--run-manifest /path/to/receipt.json` to save its exact completed run directory. See [the decoding README](src/dlm_project/decoding/README.md) for all CLI options and metrics. New notebooks and scripts must be available on `adi` before the Colab checkout can use them.
+
+The single-question LLaDA walkthrough remains available through its original CLI. To preview without GPU weights:
 
 ```bash
 python scripts/run_gsm8k.py --config configs/gsm8k/llada.yaml --prompt-only
 ```
 
-Run the same command without `--prompt-only` on a configured CUDA machine for generation. Set the model path/cache settings in the notebook's configuration as usual. New notebook and runner files must be available on `adi` before using the Colab repository checkout.
+Run the same command without `--prompt-only` on a configured CUDA machine for generation and prompt-token inspection.
 
 ## Drive layout and artifacts
 
@@ -172,11 +246,11 @@ All search components live in [`src/dlm_project/decoding/mcts_decoding.py`](src/
 
 - `baseline`: the existing sampler, unchanged by default.
 - `confidence`: greedy confidence-adjusted decoding from an entirely masked output.
-- `mcts_entropy`: one-token entropy evaluations initialize the output; greedy confidence decoding then completes the selected partial state.
+- `mcts_entropy`: MCTS with immediate-child information gain and cached candidate ranking initializes the output; literal adjusted-score sampling completes it.
 
-This is a MEDAL-inspired **one-step entropy variant**. It does not implement full DLM rollout evaluation or search over completed Sudoku answers. Each action fills one token position, and its child evaluation performs one additional model forward. Rewards can be negative. Reference solutions never enter search or completion.
+This is a versioned paper-based MEDAL reconstruction, with explicit choices for immediate entropy-change rewards, cached candidate ranking, and completion sampling. Each action fixes one output token; evaluation performs one forward on that child and leaves its remaining masks in place. Rewards can be negative; references and Sudoku validators never guide search. See the [function flowchart, definitions, and cost accounting](docs/mcts_walkthrough.md).
 
-The default search budget is **32 forwards**, including the root and all evaluated children. Its first cycle uses **3 forwards**. Final completion is counted separately and reuses the selected node's cached analysis. `predict_with_stats(...)` returns a dictionary containing `text`, `stats`, and `trace`; statistics include selected depth, candidate count, fallback/termination details, separate search and completion forwards and latency, and peak allocated GPU memory (bytes, including weights; `null` on CPU). Timings exclude model loading and include trace work. `metrics.json` aggregates calls and latency and reports the largest per-puzzle memory peak.
+`predict_with_stats(...)` returns text, stats, and streamed trace events. It reuses one model for every branch, candidate, and final completion. Metrics separate tree analysis, simulation, candidate evaluation, and completion forwards and latency, plus peak allocated GPU memory. Failure preserves completed records and partial traces. Inline prompting is prepared by task runners; the standalone greedy confidence baseline retains its behavior.
 
 On a configured CUDA machine, run each inspection in a fresh process:
 
@@ -253,7 +327,7 @@ Run in each dependency environment:
 python -m pytest -q
 ```
 
-GitHub Actions tests all three dependency profiles on CPU. Checks cover string data loading, 4×4 and 9×9 scoring, incomplete/invalid plots, model and mask selection, snapshot files, warm staging, experiment names and timezones, same-second collisions, partial artifact persistence, safe branch checkout, and all four notebooks' structure and cleared outputs. Paired-comparison tests cover prompt/ID/seed alignment, separate checkpoint identities, sequential subprocesses, failed comparisons, and the notebook's shared settings. Controlled fake-model tests additionally cover confidence filtering, negative/near-zero entropy rewards, UCB and backups, independent states, fixed commitments, deduplication, exhausted branches, hard call budgets, fallback ranking, trace accounting, and equivalence of `step()` and `run()`.
+GitHub Actions tests all three dependency profiles on CPU. Checks cover string data loading, 4×4 and 9×9 scoring, incomplete/invalid plots, model and mask selection, snapshot files, warm staging, experiment names and timezones, same-second collisions, partial artifact persistence, safe branch checkout, and notebook structure. The new iLLaDA GSM8K notebook has cleared outputs; the supplied LLaDA GSM8K reference retains its saved responses. GSM8K checks cover both model families, the four shared decoders, MCTS-to-confidence state handoff, exact run receipts, shared manifests, streamed errors, and previews without inference. Paired-comparison tests cover prompt/ID/seed alignment, separate checkpoint identities, sequential subprocesses, failed comparisons, and the notebook's shared settings. Controlled fake-model tests additionally cover confidence filtering, negative/near-zero entropy rewards, UCB and backups, independent states, fixed commitments, deduplication, exhausted branches, hard call budgets, fallback ranking, trace accounting, and equivalence of `step()` and `run()`.
 
 CPU tests do not establish 8B model quality or GPU behavior. Verify each notebook's one-puzzle run, three-puzzle run, warm-cache rerun, and saved Drive artifacts on Colab Pro.
 

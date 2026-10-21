@@ -88,7 +88,7 @@ def _breakdown(data):
     labels = data["condition_ids"]
     search = [item["mean_search_nfes"] for item in data["conditions"]]
     completion = [item["mean_completion_nfes"] for item in data["conditions"]]
-    ax.bar(labels, search, label="Search (root + evaluated children)", color="#7c3aed")
+    ax.bar(labels, search, label="Search (all initialization forwards)", color="#7c3aed")
     ax.bar(labels, completion, bottom=search, label="Completion", color="#0f766e")
     ax.set_ylabel("Mean actual NFEs per example")
     ax.tick_params(axis="x", labelrotation=20)
@@ -244,4 +244,4 @@ def save_plots(directory, config, manifest, rows, summary):
             target = directory / "inspection" / f"example_{record['manifest_position']:04d}_{record['condition']}"
             target.parent.mkdir(parents=True, exist_ok=True)
             save_json(target.with_suffix(".json"), inspection)
-            _save(_trace_figure(inspection, f"{example_id} • {record['condition']} • one-step entropy evaluator"), target)
+            _save(_trace_figure(inspection, f"{example_id} • {record['condition']} • {record.get('implementation_version') or 'historical one-step entropy'}"), target)

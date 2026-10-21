@@ -1,149 +1,73 @@
-# Reading and running the MCTS decoder
+# MEDAL reconstruction walkthrough
 
-Start with `src/dlm_project/decoding/mcts_decoding.py`. `MCTSSearch.step()` calls the four named stages in execution order. `run()` repeatedly calls `step()` on the **same tree**. Initialization is lazy: the first `step()` analyzes the root, then executes the first cycle.
+The shared implementation is [mcts_decoding.py](../src/dlm_project/decoding/mcts_decoding.py). All MCTS callers evaluate the immediate parent-to-child entropy change. The reference is [MEDAL, Algorithms 1–2 and Sections 3.1–3.3](https://aclanthology.org/2026.findings-eacl.180.pdf). This is a documented paper reconstruction, version `medal_reconstruction_v2`; author-code parity is unverified. Version 1 used full sampled search and candidate rollouts; version 2 removes them.
 
-This implementation adapts the confidence score and normalized entropy reward from *Diffusion Language Model Inference with Monte Carlo Tree Search* (MEDAL). It evaluates one committed token with one additional forward, then uses greedy completion after initialization. It is not a reproduction of full-rollout MEDAL evaluation. There are no training updates or reference answers in the search.
+## Definitions and reconstruction choices
 
-## States, actions and cached analysis
+A tree state contains fixed prompt tokens and partially filled output positions. Each action is `(output_position, token_id)`. Positions are relative to the output. The mask token cannot be committed. Expansion clones the parent's CPU state and fixes exactly one output token; evaluation leaves that partial state unchanged.
 
-A node owns CPU token IDs of shape `[1, prompt_length + gen_length]`. Its depth is the number of output tokens committed along the path. An action is `(output_position, token_id)`; positions start at zero **after the prompt**. Tokens need not correspond one-to-one with Sudoku digits or cells. Prompt tokens and earlier output commitments stay fixed.
+Compute full-vocabulary probabilities, `H = -sum(p * log(p + epsilon))`, the top-two probability gap, and `s = p * exp(-H) * sigmoid(gamma * gap)`. Keep K1 tokens per position and K2 actions globally. UCB uses mean completed-simulation reward plus `c * sqrt(log(parent_visits) / child_visits)`; unvisited nodes rank first. Ties use adjusted score, position, token ID, then node ID.
 
-On Colab, the model already runs on CUDA. Forward passes, softmax, per-position entropy, top-token filtering and confidence factors run on the GPU. Only compact action statistics return to the CPU for global ordering, UCB, backups and display. Keeping tree states and traces on the CPU avoids retaining each branch in GPU memory. `model_device` in the saved inspection/prediction statistics reports the loaded model's device; `search_state_device` reports the tree storage separately.
+Simulation performs one forward on the immediate child and caches its masked-position entropies and top actions. The parent analysis is already cached. It generates no additional tokens and performs no completion rollout.
 
-`analyze_state()` transfers one state to the model's device and computes the full-vocabulary distribution at each remaining mask. The compact cache contains per-position entropy, retained actions, and a state fingerprint, all on CPU. Full logits and probabilities are released after analysis. Children are evaluated sequentially, using the same frozen model.
+The reward is `g = (S_parent - S_child) / S_parent`, using only the expansion's immediate transition. S sums predictive entropy over currently masked output positions. A denominator at or below epsilon gives zero gain; finite negative gains remain unchanged. Backpropagation updates the child and its ancestors once per evaluated child. UCB averages these backed-up edge rewards.
 
-With natural logarithms, define:
+Collect the first C distinct depth-Lc states, stopping immediately at the quota. Rank them using cached mean tree rewards, with ties choosing the earliest collected candidate. These leaves are each evaluated once, so their mean reward equals their immediate parent-to-child gain. Candidate ranking adds no forwards or visits. The winner remains a partial state, and final completion samples fresh actions using literal `softmax(s / temperature)` across all legal masked position-token pairs. This is the only phase that fills all remaining masks. Completion uses no top-K filtering and starts with a fresh forward.
 
-```text
-H_i = -sum_v p_i(v) log p_i(v)
-E(state) = sum_{masked output i} H_i
-confidence(i,v) = p_i(v) exp(-H_i) sigmoid(gamma * (p_i(top1) - p_i(top2)))
+Inline prompting uses three subtasks and two disjoint demonstrations. GSM8K demonstrations are training rows 0/1 pinned to the test manifest revision. The paper's illustrated demonstrations overlap test rows 0/1, so they are deliberately not copied. Sudoku uses synthetic examples. No evaluated reference, answer parser, or Sudoku validator supplies rewards. Decomposition generates within the answer sequence and adds no separate planning forwards.
+
+The reward, candidate ranking, and completion choices above are exported in `RECONSTRUCTION_ASSUMPTIONS`. Gamma 10 and exploration constant 0.01 are repository defaults, not verified author settings.
+
+## Function flowchart
+
+Each box is a function, listing its inputs, responsibility, and output. Arrows represent calls or the next function in the orchestration.
+
+```mermaid
+flowchart TD
+    P["gsm8k_prompt / sudoku_prompt<br/>IN: base task prompt, disjoint demos<br/>DO: add inline three-subtask guidance<br/>OUT: effective prompt, provenance"]
+    D["decode<br/>IN: model, prepared prompt IDs, settings, seed<br/>DO: reuse one model for search and completion<br/>OUT: DecodeResult"]
+    R["MCTSSearch.run<br/>IN: existing tree<br/>DO: repeatedly call step<br/>OUT: SearchResult"]
+    S["MCTSSearch.step<br/>IN: tree, model, budget<br/>DO: one selection/expansion/simulation/backup cycle<br/>OUT: ordered trace events"]
+    A["analyze_state<br/>IN: state, model, score settings<br/>DO: one root forward and confidence filtering<br/>OUT: compact entropies and top actions"]
+    U["select_node<br/>IN: root, exploration constant<br/>DO: traverse eligible children with UCB<br/>OUT: frontier node and decisions"]
+    E["expand_node<br/>IN: parent, action<br/>DO: clone and commit one output token<br/>OUT: partial child"]
+    V["evaluate_action<br/>IN: cached parent analysis, partial child<br/>DO: one child forward and entropy comparison<br/>OUT: immediate gain, cached child analysis"]
+    L["rollout<br/>IN: cloned state, policy, seed<br/>DO: sample until no masks remain<br/>OUT: RolloutResult"]
+    F["_distribution<br/>IN: model, partial state<br/>DO: forward and compute probabilities/entropy/scores<br/>OUT: compact analysis and temporary distributions"]
+    T["_sample_action<br/>IN: distributions, policy, generator<br/>DO: sample one legal position-token action<br/>OUT: Action"]
+    G["information_gain<br/>IN: before/after entropy sums, epsilon<br/>DO: normalized transition reduction<br/>OUT: finite gain"]
+    B["backpropagate<br/>IN: child, immediate gain<br/>DO: update child and ancestors once<br/>OUT: visit/value snapshots"]
+    C["_finish<br/>IN: collected candidates, cached rewards<br/>DO: record candidate scores and terminate<br/>OUT: termination event"]
+    Q["result<br/>IN: cached tree/evaluations<br/>DO: read-only highest-reward selection<br/>OUT: selected partial state, stats, trace"]
+    M["complete_medal<br/>IN: selected partial state, fresh seed, temperature<br/>DO: literal adjusted-score softmax completion<br/>OUT: completed IDs and forward counts"]
+    P --> D --> R --> S
+    S --> A --> U --> E --> V
+    V --> F
+    V --> G
+    L --> F --> T --> L
+    V --> B --> S
+    S --> C
+    C --> Q --> M --> L
 ```
 
-The margin uses the full vocabulary, including the mask token; mask tokens are excluded from commitments. Keep the best `K1` legal tokens per position, then the best `K2` actions globally. Equal confidence prefers smaller output position, then smaller token ID. Entropy is zero at committed positions in the saved vectors.
+## Forward accounting and stopping
 
-## One example across the four stages
+Defaults: L=256, Lc=20, C=3, K1=3, K2=5, epsilon=1e-8, seed=1, temperature=1; steps and block length equal L. The search cap is `None`. Strict candidate mode must collect C distinct evaluated candidates; frontier exhaustion or a cap reached before the quota produces `SearchIncompleteError`, retaining flushed traces and earlier predictions.
 
-This is a **controlled illustration**, not an HF prediction. Suppose the output has four masks and every masked position always has probabilities `p(A)=0.7`, `p(B)=0.2`, `p(C)=0.1`, `p(mask)=0`. Every position's entropy is about `0.801819` nats. Use `Lc=2`, `C=3`, `K1=K2=2`.
+Search forwards = one root-analysis forward + one forward per evaluated child. Candidate ranking costs zero forwards. Total = search + fresh final completion, which costs L minus selected depth. A direct-path example with 19 five-child expansion cycles and three final children costs `1 + 19*5 + 3 + 236 = 335` forwards; broader exploration can cost more.
 
-### 1. Selection — `select_node()`
+For a controlled four-position example, Lc=2, C=3, K1=K2=2 and static tied position scores: six children cost six simulation forwards, root analysis costs one, candidate ranking costs zero, and final completion costs two: nine total. The root has six visits.
 
-The first cycle selects the unexpanded root (node 0):
+Explicit `stop_mode: budget` requires a positive finite model-call or simulation cap. It ranks any collected depth-Lc candidates by their cached rewards; otherwise it selects the deepest evaluated state, breaking ties by mean tree reward and node ID, or root if none exists. Unfinished child evaluations never update visits. Final completion is additional. A model-call cap B allows up to B-1 child evaluations; a simulation cap N allows N child evaluations plus the root forward. Neither guarantees depth 20.
 
-```text
-Root: [M0] [M1] [M2] [M3]    E = 3.207274
+## APIs and artifacts
+
+`MCTSSearch(..., seed=1, on_event=...)` exposes resumable `step()`, `run()`, and inference-free `result()`. `mcts_confidence.decode(...)` keeps the historical method identifier and returns `DecodeResult`. Prompt augmentation belongs to task runners, before chat tokenization; low-level callers must pass prepared prompt IDs. `complete_confidence()` remains the standalone greedy baseline helper and is no longer MCTS completion.
+
+```bash
+python scripts/eval_gsm8k_mcts_confidence.py --profile smoke --num-samples 2
+python scripts/inspect_mcts.py --phase one_step --trace-path results/inspection.jsonl
+python scripts/run_gsm8k_sweep.py --profile smoke --num-samples 2 --budgets 128 256 512
 ```
 
-Later cycles traverse expandable children using:
-
-```text
-Q(child) = reward_sum / visits
-UCB(child) = Q(child) + exploration_c * sqrt(log(parent.visits) / child.visits)
-```
-
-Unvisited children have priority; their infinite bonuses are represented by `unvisited: true` and `null` UCB fields in JSON. Ties use action confidence, position, token ID, then node ID. Closed nodes remain visible in sibling tables but are ineligible. Selection returns the entire node-ID path and each sibling comparison.
-
-### 2. Expansion — `expand_node()`
-
-The best global actions are `(0,A)` and `(1,A)`. They produce independent children, each with **one** committed token:
-
-| Child | Action | State | Depth |
-| --- | --- | --- | --- |
-| 1 | `(0,A)` | `A [M1] [M2] [M3]` | 1 |
-| 2 | `(1,A)` | `[M0] A [M2] [M3]` | 1 |
-
-`K2=2` creates two children; it does not commit two tokens within each child. `Lc=2` is reached in a later cycle. The trace records confidence, probability, position, token representation and child ID for every expansion.
-
-### 3. Evaluation — `evaluate_action()`
-
-One forward observes each child's remaining-mask entropy. It makes no further token commitments:
-
-```text
-parent E = 3.207274
-child E  = 2.405456
-reward   = (parent E - child E) / parent E = 0.25
-context_gain = parent E - H_at_committed_position - child E = 0
-```
-
-The reward here comes entirely from removing one uncertain position. `context_gain=0` reveals that other positions did not become more certain. With an actual model, their entropy can increase: context gain may be negative, and reward is negative if total remaining entropy exceeds the parent's total. No negative rewards are clipped. If parent entropy is at most epsilon, reward is zero.
-
-The initial cycle costs **three model forwards**: root analysis and one evaluation for each child. An evaluation at full output depth still performs the contracted forward, with remaining-mask entropy zero.
-
-### 4. Backpropagation — `backpropagate()`
-
-After evaluating child 1, update child 1 and root with reward `0.25`. After child 2, update child 2 and root:
-
-| Node | Visits | Reward sum | Mean reward |
-| --- | --- | --- | --- |
-| Root 0 | 2 | 0.50 | 0.25 |
-| Child 1 | 1 | 0.25 | 0.25 |
-| Child 2 | 1 | 0.25 | 0.25 |
-
-Every update appears with before/after values in the trace. This changes search statistics, not model weights. Each evaluated child contributes its immediate entropy reward once to every ancestor.
-
-## The next cycles and stopping
-
-Cycle 2 selects child 1 by the stable tie rule. Its cached analysis supplies actions without another parent forward. Two evaluations produce `A A [M2] [M3]` (node 3) and `A [M1] A [M3]` (node 4). Both are depth 2, so they become closed candidates. Each edge reward is `1/3`; their root-relative gain is `1/2`.
-
-Cycle 3 selects child 2, since child 1's frontier is exhausted. One child reproduces `A A [M2] [M3]`, which is deduplicated; the other produces `[M0] A A [M3]`. There are now three distinct depth-2 candidates after **seven forwards**. Equal final scores choose the earlier node ID, so node 3 is selected.
-
-Search stops when:
-
-1. A cycle has collected at least `C` distinct depth-`Lc` states. All retained siblings are evaluated unless the budget ends, so the count can exceed `C`.
-2. The root-plus-child forward cap is reached, even in the middle of a sibling set.
-3. No expandable frontier remains.
-
-Final ranking always compares root-to-candidate normalized entropy reduction at the same depth; it does not use the last edge reward or UCB score. If the search stops with fewer than `C` candidates, it selects the best available state at the deepest evaluated depth and records `fallback_used`, `fallback_reason`, `selected_depth`, and `stop_reason`. A cap of one selects the analyzed root as a depth-zero fallback. A `result()` snapshot during unfinished inspection is provisional and does not mark a fallback.
-
-Greedy completion of node 3 preserves its two `A` tokens. Its cached analysis supplies the next commitment at position 2; only the final position needs a new forward. Thus this four-token example uses **7 search + 1 completion forwards**. With 256 positions and selected depth 2, completion normally uses **253 forwards**, because the first of its 254 commitments uses the search cache.
-
-## Direct use with the existing HF model
-
-Run this inside the process that already holds your model. The Colab notebook instead launches the thin inspection/runner scripts so it never creates another model in the kernel.
-
-```python
-from dlm_project.decoding.mcts_decoding import MCTSConfig, MCTSSearch, complete_confidence
-
-# model and tokenizer are the existing HF objects; prompt_ids is [1, P].
-# If using the project wrapper: model = llada.model,
-# tokenizer = llada.tokenizer, prompt_ids = llada.encode_prompt(prompt).
-config = MCTSConfig(init_tokens=2, num_candidates=3,
-                    top_k_tokens=2, top_k_actions=2, max_model_calls=32)
-search = MCTSSearch(model, prompt_ids, mask_id=126336, gen_length=256,
-                    config=config, tokenizer=tokenizer)
-
-events = search.step()  # One full cycle; root + two children on first call.
-for event in events:
-    print(event["stage"], event)
-
-result = search.run()   # Continue this SAME tree to termination.
-print(result.stats)
-completion = complete_confidence(
-    model, result.selected.state, search.prompt_len, search.mask_id, config,
-    initial_analysis=result.selected.analysis, tokenizer=tokenizer,
-)
-text = tokenizer.batch_decode(completion.token_ids[:, search.prompt_len:],
-                              skip_special_tokens=True)[0]
-```
-
-For an end-to-end wrapper call:
-
-```python
-prediction = llada.predict_with_stats(
-    prompt, gen_length=256, steps=256, block_length=256,
-    temperature=0, remasking="low_confidence",
-    decoding={"method": "mcts_entropy", "seed": 1,
-              "mcts": {"init_tokens": 2, "num_candidates": 3}},
-)
-print(prediction["text"], prediction["stats"])
-```
-
-The configuration maps `Lc → init_tokens`, `C → num_candidates`, `K1 → top_k_tokens`, `K2 → top_k_actions`, `gamma → margin_gamma`. The seed belongs to `decoding`; temperature-zero search itself has no sampling. The runner uses `seed + puzzle_index` (modulo `2**63`) and records the actual per-puzzle seed. Model/device floating-point differences can still change close scores.
-
-## Colab verification
-
-After setup, run **Check the search on CUDA before loading LLaDA**. Its three small controlled-model tests compare CUDA and CPU results and verify actual GPU forward inputs, entropy rewards, fixed commitments and cached completion. This subprocess requires CUDA, so an unavailable GPU cannot be mistaken for a passed GPU check. These tests are skipped on local machines without CUDA.
-
-Then run the notebook's one-puzzle configuration, the two inspection commands, full generation, and the saved-artifact checks. The notebook displays **actual HF token predictions**, all four cycle stages, raw generated text, Sudoku scores, and plots. It verifies the loaded HF model's device is CUDA. Its final verification cell checks that search forwards equal root plus evaluations, completion costs match cache reuse, every output position is committed exactly once across initialization/completion, and CUDA memory was measured.
-
-CPU fake-model tests verify search logic, wrapper integration, artifact saving and notebook table rendering. They do not validate the 8B model on GPU or establish Sudoku quality. GPU validation must be run separately on Colab; notebook outputs are intentionally cleared in the repository.
+New labels include `medal-v2`; traces and predictions record implementation version, assumptions, phase costs, completion seed, candidate partial states/rewards, selected initialization, and base/effective prompt hashes. `candidate_evaluation_model_calls` remains available with value zero, and `simulation_decoding_steps` is zero because search has no internal rollouts. Historical artifacts are retained and older report schemas remain readable. Final-answer scoring happens only after generation. CPU tests establish mechanics; real model accuracy requires CUDA benchmark runs.

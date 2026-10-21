@@ -61,6 +61,11 @@ def aggregate(rows, condition):
     for key in ("cell_accuracy", "clues_preserved", "valid_sudoku", "selected_depth",
                 "evaluated_children", "expanded_parents", "realized_branching_factor", "fallback_used"):
         summary["mean_" + key] = average(key)
+    if any(row.get("implementation_version") for row in rows):
+        for phase in ("tree_analysis", "simulation", "candidate_evaluation"):
+            summary[f"mean_{phase}_nfes"] = average(f"{phase}_nfes")
+            summary[f"total_{phase}_nfes"] = sum(row.get(f"{phase}_nfes", 0) for row in rows)
+            summary[f"mean_{phase}_latency_seconds"] = average(f"{phase}_latency_seconds")
     return summary
 
 
@@ -96,7 +101,18 @@ def load_records(directory, config, manifest):
                 or row["method"] != condition["method"]
                 or row["total_nfes"] != row["search_nfes"] + row["completion_nfes"]):
             raise ValueError(f"Inconsistent identity or NFE accounting: {key}")
-        identity = (row["prompt_hash"], row["seed"], row["model_revision"])
+        if config.get("report_schema_version", 1) >= 2:
+            if (row.get("base_prompt_hash") != digest(row["base_prompt"])
+                    or row.get("effective_prompt_hash") != digest(row["prompt"])
+                    or row.get("prompt_template") != condition.get("prompt_template")
+                    or row["search_nfes"] != sum(row.get(f"{phase}_nfes", 0) for phase in
+                        ("tree_analysis", "simulation", "candidate_evaluation"))):
+                raise ValueError(f"Inconsistent effective prompt or phase accounting: {key}")
+            if row.get("decomposition") and row["decomposition"]["effective_prompt_hash"] != row["effective_prompt_hash"]:
+                raise ValueError(f"Decomposition prompt hash differs: {key}")
+            identity = (row["base_prompt_hash"], row["seed"], row["model_revision"])
+        else:
+            identity = (row["prompt_hash"], row["seed"], row["model_revision"])
         if key[0] in identities and identity != identities[key[0]]:
             raise ValueError(f"Conditions do not share a prompt, seed and model: {key[0]}")
         identities[key[0]] = identity
@@ -130,6 +146,7 @@ def summarize(config, state, rows):
             "comparison_sample": "intersection completed under every condition",
             "conditions": conditions, "observed_conditions": observed,
             "completed_prediction_nfes": sum(row["total_nfes"] for row in rows),
+            "incomplete_prediction_nfes": state.get("active_prediction_model_calls", 0),
             "setup": {key: state.get(key) for key in ("model_load_count", "model_loading_seconds",
                                                        "warmup_model_calls", "warmup_seconds")},
             "error": state.get("error")}
@@ -160,10 +177,20 @@ def _cell(value):
 def _markdown(config, summary, rows, directory):
     lines = ["# Milestone 1 decoder sweep", "",
              f"Task: **{config['task']}** · profile: **{config['sweep']['profile']}** · status: **{summary['status']}**.", "",
-             f"Evaluator: **{config['evaluation_variant']}**. This is not a full-rollout MEDAL reproduction.", "",
+             f"Evaluator: **{config['evaluation_variant']}**. " +
+             ("Paper-based reconstruction; author-code parity is unverified. Decomposition is part of the method comparison."
+              if config.get("report_schema_version", 1) >= 2 else "This is not a full-rollout MEDAL reproduction."), "",
              f"Completed {summary['completed_predictions']}/{summary['expected_predictions']} predictions. "
              f"Every main comparison uses **n={summary['common_n']} common examples** "
              f"out of {summary['requested_examples']} selected examples.", ""]
+    if config.get("implementation_version") == "medal_reconstruction_v2":
+        lines += ["Immediate-child accounting: search = one root forward + one forward per evaluated child. "
+                  "Candidate ranking reuses cached rewards and adds no forwards. Final completion is additional "
+                  "and starts with a fresh forward. Only completed child evaluations update tree visits.", ""]
+    elif config.get("report_schema_version", 1) >= 2:
+        lines += ["Full-rollout accounting: search = tree analysis + all branch simulations + candidate evaluation. "
+                  "Final completion is additional and starts with a fresh forward. Interrupted simulation calls count "
+                  "against the budget; their unfinished rewards are never backed up. Budget sweeps are ablations.", ""]
     if not summary["complete"]:
         lines += ["**Incomplete run:** completed records are retained. Execution failures are not scored as wrong answers. "
                   "Examples missing any condition are excluded from paired comparisons.", ""]
@@ -178,10 +205,13 @@ def _markdown(config, summary, rows, directory):
               f"All settings and package versions: [resolved config](config.json).", "",
               "```json", json.dumps({"generation": config["generation"], "decoding": config["decoding"],
                                      "budgets": config["sweep"]["budgets"], "setup_cost": summary["setup"]}, indent=2), "```", "",
-              "- Total NFEs = search NFEs + completion NFEs. Search includes the root and every evaluated child. "
-              "Cached selected-state analysis is counted once, in search; it costs no extra completion forward.",
+              ("- Total NFEs = one root forward + evaluated children + fresh final completion."
+               if config.get("implementation_version") == "medal_reconstruction_v2" else
+               "- Total NFEs = tree analysis + branch simulations + candidate evaluation + fresh final completion."
+               if config.get("report_schema_version", 1) >= 2 else
+               "- Total NFEs = search NFEs + completion NFEs. Search includes root and each evaluated child; first completion reuses cached analysis."),
               "- Budget mode ignores the candidate quota, closes target-depth nodes, and stops at the NFE cap or exhausted frontier. "
-              "Fallback means no target-depth candidate exists; the best state at the deepest reached depth is completed.",
+              "Collected evaluated candidates are ranked; when none exists, fallback completes the deepest evaluated state (or root).",
               "- Realized branching = evaluated children / distinct parents with evaluated children, only for MCTS.",
               "- Decoding latency includes prompt encoding, search, completion and trace capture during those stages; CUDA is synchronized. "
               "Loading, warm-up, scoring and plotting are excluded. Setup forwards/time are listed separately above.",

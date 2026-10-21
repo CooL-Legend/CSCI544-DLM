@@ -15,7 +15,8 @@ from time import perf_counter
 
 import torch
 
-from dlm_project.decoding.mcts_decoding import resolve_decoding
+from dlm_project.decoding.mcts_decoding import resolve_decoding, IMPLEMENTATION_VERSION
+from dlm_project.decoding.medal_prompting import get_gsm8k_demonstrations, gsm8k_prompt, sudoku_prompt
 from dlm_project.experiments.artifacts import save_json
 from dlm_project.experiments.config import load_config, validate_config
 from dlm_project.experiments.manifests import POOL_SIZES, digest, get_manifest, select_examples
@@ -53,7 +54,9 @@ def resolve_settings(task, config, *, profile=None, num_samples=None, budgets=No
     if type(data["num_samples"]) is not int or not 1 <= data["num_samples"] <= POOL_SIZES[task][partition]:
         raise ValueError(f"Select 1–{POOL_SIZES[task][partition]} {partition} examples.")
     config["task"] = task
-    config["evaluation_variant"] = "MEDAL-style one-step entropy; greedy completion"
+    config["evaluation_variant"] = "Budget-limited MEDAL reconstruction; inline decomposition; immediate-child IG"
+    config["report_schema_version"] = 2
+    config["implementation_version"] = IMPLEMENTATION_VERSION
     config["trace_policy"] = "all search-cycle and completion events; no vocabulary logits"
     if config["model"].get("family", "llada") != "llada":
         raise ValueError("Both sweep scripts require original model.family: llada.")
@@ -89,7 +92,10 @@ def make_conditions(config):
         if budget is not None:
             decoding["mcts"]["max_model_calls"] = budget
         conditions.append({"id": f"mcts_{budget}" if budget is not None else method,
-                           "method": method, "search_budget": budget, "decoding": decoding})
+                           "method": method, "search_budget": budget, "decoding": decoding,
+                           "generation": {**config["generation"], "temperature": 1.0 if budget is not None else 0.0},
+                           "prompt_template": ("gsm8k_train_two_shot" if config["task"] == "gsm8k" else
+                                               "sudoku_4_synthetic_two_shot") if budget is not None else None})
     return conditions
 
 
@@ -156,14 +162,18 @@ def _environment():
     return {"python": platform.python_version(), "packages": versions, "git_commit": commit}
 
 
-def _record(task, example, condition, prompt, prediction, seed, trace_file, identity, evaluations):
+def _record(task, example, condition, prompt, prediction, seed, trace_file, identity, evaluations,
+            base_prompt=None, decomposition=None):
     stats = prediction["stats"]
     search, completion = stats["search_model_calls"], stats["completion_model_calls"]
     if stats["total_model_calls"] != search + completion:
         raise ValueError("Decoder total NFE accounting does not reconcile.")
     is_search = condition["method"] == "mcts_entropy"
-    if is_search and (search != 1 + evaluations["children"] or search > condition["search_budget"]):
-        raise ValueError("Search NFEs must equal root plus evaluated children and respect the cap.")
+    if is_search:
+        phase_total = sum(stats.get(f"{phase}_model_calls", 0) for phase in
+                          ("tree_analysis", "simulation", "candidate_evaluation"))
+        if search != phase_total or search > condition["search_budget"]:
+            raise ValueError("Search phase NFEs must reconcile and respect the cap.")
     parents = len(evaluations["parents"])
     record = {"example_id": example["example_id"], "manifest_position": example["position"],
               "partition": example["partition"], "condition": condition["id"],
@@ -181,6 +191,13 @@ def _record(task, example, condition, prompt, prediction, seed, trace_file, iden
               "expanded_parents": parents if is_search else None,
               "realized_branching_factor": (evaluations["children"] / parents if parents else 0.0)
               if is_search else None}
+    record.update(implementation_version=stats.get("implementation_version"),
+                  base_prompt=base_prompt or prompt, base_prompt_hash=digest(base_prompt or prompt),
+                  effective_prompt_hash=digest(prompt), decomposition=decomposition,
+                  prompt_template=decomposition["template"] if decomposition else None)
+    for phase in ("tree_analysis", "simulation", "candidate_evaluation"):
+        record[f"{phase}_nfes"] = stats.get(f"{phase}_model_calls", 0)
+        record[f"{phase}_latency_seconds"] = stats.get(f"{phase}_latency_seconds", 0)
     for key in ("cycles", "stop_mode", "requested_depth", "max_depth", "selected_depth", "candidate_count",
                 "stop_reason", "fallback_used", "fallback_reason", "selected_node_id"):
         record[key] = stats.get(key) if is_search else None
@@ -201,13 +218,18 @@ def run_sweep(task, config, *, manifest_path=None, output_dir=None, model_factor
     config["data"]["revision"] = manifest["dataset"]["revision"]
     dataset_name = "GSM8K" if task == "gsm8k" else "Sudoku4x4"
     output_dir = output_dir or config.get("output_dir")
-    parent = Path(output_dir).expanduser() if output_dir else root / "LLaDA" / dataset_name / "sweeps"
+    parent = Path(output_dir).expanduser() if output_dir else root / "LLaDA" / dataset_name / "sweeps" / "medal-v2"
     directory, started = create_run_directory({"output_dir": str(parent),
                                                "experiment_timezone": config.get("experiment_timezone", "America/Los_Angeles")})
     config["run"] = {"directory": str(directory), "started_at": started.isoformat(),
                      "example_ids": [row["example_id"] for row in examples],
                      "manifest_hash": digest(manifest), "manifest_source": str(manifest_path.resolve()),
                      "environment": _environment()}
+    demonstrations = None
+    if task == "gsm8k":
+        demonstrations = get_gsm8k_demonstrations(manifest_path.with_name("gsm8k_decomposition_train.json"),
+                          revision=manifest["dataset"]["revision"], cache_dir=config["data"].get("cache_dir"))
+        save_json(directory / "decomposition_manifest.json", demonstrations)
     save_json(directory / "config.json", config)
     save_json(directory / "manifest.json", manifest)
     state = {"status": "running", "completed_predictions": 0,
@@ -239,8 +261,13 @@ def run_sweep(task, config, *, manifest_path=None, output_dir=None, model_factor
                 prompt = user_prompt(task, example, config)
                 seed = (config["decoding"]["seed"] + example["position"]) % 2**63
                 for condition in config["conditions"]:
-                    state.update(active_example=example["example_id"], active_condition=condition["id"])
+                    state.update(active_example=example["example_id"], active_condition=condition["id"], active_prediction_model_calls=0)
                     save_json(directory / "run_state.json", state)
+                    base_prompt = prompt = user_prompt(task, example, config)
+                    decomposition = None
+                    if condition["method"] == "mcts_entropy":
+                        prompt, decomposition = (gsm8k_prompt(base_prompt, example["question"], demonstrations)
+                            if task == "gsm8k" else sudoku_prompt(base_prompt, 4, example["puzzle"]))
                     decoding = {**condition["decoding"], "seed": seed}
                     trace_file = f"traces/example_{example['position']:04d}_{condition['id']}.jsonl"
                     evaluations = {"children": 0, "parents": set()}
@@ -248,15 +275,18 @@ def run_sweep(task, config, *, manifest_path=None, output_dir=None, model_factor
                         def emit(event):
                             trace.write(json.dumps(event, allow_nan=False) + "\n")
                             trace.flush()
+                            state["active_prediction_model_calls"] = event.get("generation_nfes",
+                                event.get("search_model_calls", event.get("stats", {}).get("total_model_calls", 0)))
                             if event["stage"] == "evaluation":
                                 evaluations["children"] += 1
                                 evaluations["parents"].add(event["parent_id"])
-                        prediction = model.predict_with_stats(prompt, **config["generation"],
+                        prediction = model.predict_with_stats(prompt, **condition["generation"],
                                                               decoding=decoding, on_event=emit)
                     record = _record(task, example, condition, prompt, prediction, seed,
-                                     trace_file, model.identity, evaluations)
+                                     trace_file, model.identity, evaluations, base_prompt, decomposition)
                     predictions.write(json.dumps(record, allow_nan=False) + "\n")
                     predictions.flush()
+                    state["active_prediction_model_calls"] = 0
                     state["completed_predictions"] += 1
                     save_json(directory / "run_state.json", state)
                     generate_report(directory, plots=False)

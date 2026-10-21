@@ -7,8 +7,7 @@ and conditions sequentially. Sudoku uses **BGPO's released 4×4 dataset**, not i
 fine-tuned weights. The existing BGPO model comparison and single-example
 notebooks retain their behavior.
 
-These experiments use the current **one-step entropy MCTS evaluator with greedy
-completion**. They do not reproduce full-rollout MEDAL or implement AB-MCTS.
+These experiments now use MEDAL reconstruction with immediate parent-to-child information gain, inline decomposition, and literal adjusted-score completion. Finite caps are budget-limited ablations; author-code parity is unverified. Historical report-only artifacts remain supported. See the [walkthrough](mcts_walkthrough.md) for the assumptions and one-forward-per-child cost accounting.
 
 ## Conditions and frozen data
 
@@ -16,9 +15,9 @@ completion**. They do not reproduce full-rollout MEDAL or implement AB-MCTS.
 |---|---|
 | Conditions | `baseline`, `confidence`, `mcts_128`, `mcts_256`, `mcts_512` |
 | Model revision | `08b83a6feb34df1a6011b80c3c00c7563e963b07` |
-| Generation | BF16 on CUDA, batch 1, temperature 0; length = steps = block length = 256 |
+| Generation | BF16 on CUDA, batch 1, temperature 1 for MCTS and 0 for standalone baselines; length = steps = block length = 256 |
 | Search | Lc=20, K1=3, K2=5, gamma=10, exploration=0.01, epsilon=1e-8 |
-| Stopping | `budget`: root + child forwards count against each cap; target-depth nodes stay closed |
+| Stopping | `budget`: all tree-analysis, simulation and candidate-evaluation forwards count against each cap; target-depth nodes stay closed |
 | Smoke profile | First 3 frozen development examples, all five conditions |
 | Milestone profile | First 50 frozen GSM8K evaluation questions / all 30 Sudoku evaluation puzzles |
 | Sampling | Seed 1; sample once, then reuse the manifest |
@@ -179,19 +178,10 @@ inference/accounting/artifacts, not model accuracy or equivalence.
 
 ## Cost and interpretation
 
-One NFE is one call to the DLM at batch size one. Search counts **root + evaluated
-children**; cycles and candidate counts are different quantities. The selected
-node's cached analysis supplies the first completion token without another
-forward. With selected depth `d < 256`, completion costs `256 - d - 1` forwards.
-Negative entropy rewards are preserved, and final candidates are ranked by
-root-relative entropy reduction. Fallback uses the deepest available state only
-when no target-depth candidate exists.
+One NFE is one call to the DLM at batch size one. Search includes one root-analysis forward and one forward per evaluated immediate child. Candidate ranking reuses cached mean tree rewards and adds no forwards. Fresh final completion costs `256 - selected_depth`. Failed child evaluations never update visits. If no target-depth candidate exists, fallback selects a deepest evaluated state, or root.
 
-If all three caps are reached and all selected depths are 20, the five conditions
-cost 256, 256, 363, 491 and 747 NFEs: **2,113 NFEs per example**. This gives
-6,339 prediction NFEs for a three-example task smoke run, before the separately
-recorded one-forward warm-up. These are conditional planning estimates, not
-measured GPU results; use saved actual counts when depth or exhaustion differs.
+Caps 128/256/512 allow at most 127/255/511 immediate-child evaluations after root analysis. These are explicit budget-limited runs; they do not guarantee the candidate quota. Read saved phase counts and selected depths for each example.
+
 Use smoke latency to estimate milestone runtime on your allocated GPU. Model
 loading and warm-up time are reported separately; plotting/scoring are outside
 decoding latency. Trace capture during decoding is included with the same policy
@@ -230,10 +220,10 @@ are rejected. Raw records are never overwritten during reporting.
 - `experiments/sweep.py`: sequential execution, task adapters, warm-up, metrics and incremental saving.
 - `experiments/sweep_report.py`: offline aggregation, Wilson intervals, CSV/Markdown and incomplete-run handling.
 - `experiments/sweep_plots.py`: saved-metric figures and trace inspection.
-- `decoding/mcts_decoding.py`: all search logic, including both stopping modes; reward unchanged.
+- `decoding/mcts_decoding.py`: all search logic, including both stopping modes and immediate-child entropy rewards.
 
 Run `python -m pytest -q` in the pinned LLaDA dependency environment. New tests
-exercise both stop modes, sibling caps, deduplication, cached forward accounting,
+exercise both stop modes, sibling caps, deduplication, immediate-child phase accounting,
 frozen manifests, scoring failures, paired samples, offline report regeneration,
 one model load, incremental saves and figure data. Controlled CPU tests and
 controlled CUDA tests are separate from **actual HF GPU smoke validation**, which

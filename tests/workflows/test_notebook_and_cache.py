@@ -59,7 +59,9 @@ def test_notebook_is_valid_and_contains_no_saved_outputs(name):
             assert cell.execution_count is None
             compile(cell.source, f"cell-{index}", "exec")
     source = "\n".join(cell.source for cell in notebook.cells)
-    assert 'BRANCH = "adi"' in source
+    # The iLLaDA notebook intentionally checks out its own development branch.
+    expected_branch = "adi-dev" if name == "iLLaDA" else "adi"
+    assert f'BRANCH = "{expected_branch}"' in source
     assert f"blob/adi/notebooks/sudoku/{name}_Sudoku_Colab.ipynb" in source
     assert "--run-manifest" in source
     assert 'Image(filename=str(plot_path))' in source

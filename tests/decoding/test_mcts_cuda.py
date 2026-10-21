@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from dlm_project.decoding.mcts_decoding import MCTSConfig, MCTSSearch, complete_confidence
+from dlm_project.decoding.mcts_decoding import MCTSConfig, MCTSSearch, complete_medal
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA runtime required")
 
@@ -42,13 +42,14 @@ class ControlledModel(torch.nn.Module):
 def test_cuda_search_and_completion_match_cpu(root_probabilities, child_probabilities):
     # A mask in the prompt is fixed; only output masks may be committed.
     prompt = torch.tensor([[3, 0]], device="cuda")
-    config = MCTSConfig()
+    config = MCTSConfig(init_tokens=2, top_k_tokens=2, top_k_actions=2)
     gpu_model = ControlledModel("cuda", root_probabilities, child_probabilities)
     gpu = MCTSSearch(gpu_model, prompt, mask_id=0, gen_length=4, config=config)
     first_cycle = gpu.step()
     assert gpu.model_calls == len(gpu_model.forward_devices) == 3
-    assert torch.device(first_cycle[0]["model_device"]).type == "cuda"
-    assert first_cycle[0]["search_state_device"] == "cpu"
+    initialization = next(e for e in first_cycle if e["stage"] == "initialization")
+    assert torch.device(initialization["model_device"]).type == "cuda"
+    assert initialization["search_state_device"] == "cpu"
     gpu_result = gpu.run()
 
     cpu_model = ControlledModel("cpu", root_probabilities, child_probabilities)
@@ -65,15 +66,16 @@ def test_cuda_search_and_completion_match_cpu(root_probabilities, child_probabil
     assert all(node.state.device.type == "cpu" and node.analysis.entropies.device.type == "cpu"
                for node in gpu.nodes)
 
-    completion = complete_confidence(gpu_model, gpu_result.selected.state, 2, 0, config,
-                                     initial_analysis=gpu_result.selected.analysis)
-    cpu_completion = complete_confidence(cpu_model, cpu_result.selected.state, 2, 0, config,
-                                         initial_analysis=cpu_result.selected.analysis)
-    assert torch.equal(completion.token_ids, cpu_completion.token_ids)
+    completion = complete_medal(gpu_model, gpu_result.selected.state, 2, 0, config, seed=1)
+    cpu_completion = complete_medal(cpu_model, cpu_result.selected.state, 2, 0, config, seed=1)
+    # CPU and CUDA generators need not draw identical categorical samples.
+    again = complete_medal(gpu_model, gpu_result.selected.state, 2, 0, config, seed=1)
+    assert torch.equal(completion.token_ids, again.token_ids)
+    assert (cpu_completion.token_ids[:, 2:] != 0).all()
     assert torch.equal(completion.token_ids[:, :2], prompt.cpu())
     committed = gpu_result.selected.state[:, 2:] != 0
     assert torch.equal(completion.token_ids[:, 2:][committed],
                        gpu_result.selected.state[:, 2:][committed])
-    assert completion.model_calls == 1  # One cached commitment, then one CUDA forward.
-    assert len(gpu_model.forward_devices) == gpu.model_calls + completion.model_calls
+    assert completion.model_calls == 2  # Fresh distribution per remaining mask.
+    assert len(gpu_model.forward_devices) == gpu.model_calls + completion.model_calls + again.model_calls
     assert all(torch.device(device).type == "cuda" for device in gpu_model.forward_devices)
