@@ -23,7 +23,8 @@ def _aggregate(condition, rows):
               "shortlist_underfilled_rate": mean(row["shortlist_underfilled"] for row in rows) if n else None}
     keys = ("search_nfes", "completion_nfes", "total_nfes", "decoding_seconds", "search_seconds",
             "completion_seconds", "selected_depth", "max_depth", "average_search_depth",
-            "candidate_count", "shortlist_size", "budget_utilization")
+            "candidate_count", "shortlist_size", "budget_utilization", "selected_ig_reward",
+            "selected_action_history_kl", "selected_kl_penalty", "peak_history_cache_bytes")
     for key in keys:
         values = [row[key] for row in rows if row.get(key) is not None]
         result["mean_" + key] = mean(values) if values else None
@@ -105,6 +106,9 @@ def load_records(directory, config):
         expected_completion = condition.get("completion_method", "medal") if condition["method"] in ("medal", "medal_no_search") else None
         if row.get("completion_method", expected_completion) != expected_completion:
             raise ValueError("E0 completion decoder identity mismatch.")
+        if condition["method"] == "medal" and "reward_mode" in condition:
+            if any(row.get(key) != condition[key] for key in ("reward_mode", "kl_weight", "kl_top_k")):
+                raise ValueError("E0 reward configuration identity mismatch.")
         if condition["search_budget"] is None:
             if row["search_nfes"] != 0:
                 raise ValueError("No-search baseline used search NFEs.")
@@ -209,6 +213,19 @@ def generate_report(run_dir):
         lines.append(f"| {item['condition']} | {item['baseline']} | {number(item['accuracy_gain_pp'])} | "
                      f"{number(item['additional_mean_nfes'])} | {number(item['accuracy_gain_pp_per_additional_nfe'])} |")
     decoder = config.get("decoding", {}).get("completion_method", "medal")
+    mcts = config.get("decoding", {}).get("mcts", {})
+    if mcts.get("reward_mode") == "ig_kl":
+        lines += ["", f"Search reward B: **IG − {mcts['kl_weight']:g} × action-history KL**. "
+                  f"History top-k: **{mcts['kl_top_k']}** (0 = full vocabulary; otherwise top-k + tail approximation). "
+                  "KL compares the outgoing position's grandparent and parent predictions before commitment. "
+                  "Root penalties are zero. It adds no model forwards and does not change completion or stopping.",
+                  "", "| Condition | Selected IG | Selected history KL | Selected penalty | Peak history cache bytes (mean) |",
+                  "|---|---:|---:|---:|---:|"]
+        for item in summary["conditions"]:
+            if item["method"] == "medal":
+                values = [number(item["mean_" + key]) for key in (
+                    "selected_ig_reward", "selected_action_history_kl", "selected_kl_penalty", "peak_history_cache_bytes")]
+                lines.append(f"| {item['id']} | " + " | ".join(values) + " |")
     control = next((condition for condition in config["conditions"]
                     if condition["method"] == "medal_no_search"), None)
     control_note = (f"The T={control['temperature']:g} no-search MEDAL control uses the identical downstream decoder, temperature and completion seed as searched MEDAL. "

@@ -3,7 +3,9 @@
 Immediate parent-to-child information gain, cached candidate ranking,
 and literal adjusted-score softmax completion. The interpretation
 choices are exported in RECONSTRUCTION_ASSUMPTIONS; author-code parity is not
-claimed. Trees retain compact CPU states and never accept reference answers.
+claimed. Trees retain CPU states and never accept reference answers. The opt-in
+ig_kl reward adds branch-local pre-commit stability; full probability history is
+only retained when explicitly requested, and completion policies are unchanged.
 """
 
 from dataclasses import asdict, dataclass, field
@@ -29,10 +31,17 @@ class MCTSConfig:
     exploration_c: float = 0.01
     epsilon: float = 1e-8
     stop_mode: str = "candidates"
+    reward_mode: str = "ig"
+    kl_weight: float = 0.05
+    kl_top_k: int = 32  # 0: full vocabulary; otherwise top-k + one residual bucket.
 
     def __post_init__(self):
         if self.stop_mode not in ("candidates", "budget"):
             raise ValueError("mcts.stop_mode must be candidates or budget.")
+        if self.reward_mode not in ("ig", "ig_kl"):
+            raise ValueError("mcts.reward_mode must be ig or ig_kl.")
+        if type(self.kl_top_k) is not int or self.kl_top_k < 0:
+            raise ValueError("mcts.kl_top_k must be a nonnegative integer (0 means full vocabulary).")
         for name in ("init_tokens", "num_candidates", "top_k_tokens",
                      "top_k_actions"):
             if type(getattr(self, name)) is not int or getattr(self, name) < 1:
@@ -43,12 +52,16 @@ class MCTSConfig:
             raise ValueError("mcts.max_simulations must be null or a positive integer.")
         if self.stop_mode == "budget" and self.max_model_calls is None and self.max_simulations is None:
             raise ValueError("budget mode requires a finite max_model_calls or max_simulations.")
-        for name in ("margin_gamma", "exploration_c", "epsilon"):
+        for name in ("margin_gamma", "exploration_c", "epsilon", "kl_weight"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
                 raise ValueError(f"mcts.{name} must be finite.")
             if value < 0 or (name == "epsilon" and not 0 < value < 1):
                 raise ValueError(f"Invalid mcts.{name}: {value}.")
+
+    @property
+    def uses_history_kl(self):
+        return self.reward_mode == "ig_kl" and self.kl_weight > 0
 
     def validate_length(self, gen_length):
         if type(gen_length) is not int or not 1 <= self.init_tokens < gen_length:
@@ -99,12 +112,32 @@ class Action:
 
 
 @dataclass
+class DistributionHistory:
+    """CPU probability cache for one frontier node, never shared across siblings.
+
+    Sparse mode uses the OLD distribution's top-k token IDs and one tail bin.
+    Full mode stores all vocabulary probabilities. No logits or model graph.
+    """
+    positions: torch.Tensor
+    probabilities: torch.Tensor
+    token_ids: torch.Tensor | None
+    vocab_size: int
+
+    @property
+    def nbytes(self):
+        return sum(t.numel() * t.element_size() for t in
+                   (self.positions, self.probabilities, self.token_ids) if t is not None)
+
+
+@dataclass
 class StateAnalysis:
-    """Compact CPU statistics; never retains vocabulary logits/probabilities."""
+    """CPU statistics; optional probability history is released after expansion."""
     entropies: torch.Tensor  # [output_length]; committed positions are zero.
     actions: tuple[Action, ...]
     state_key: tuple[int, ...]
     mean_margin: float | None = None
+    distribution_history: DistributionHistory | None = None
+    historical_kl: torch.Tensor | None = None  # D_KL(own parent || self), per still-masked position.
 
     @property
     def total_entropy(self):
@@ -126,6 +159,8 @@ class Node:
     expanded: bool = False
     closed: bool = False
     immediate_reward: float | None = None
+    ig_reward: float | None = None
+    action_history_kl: float = 0.0
 
     @property
     def mean_reward(self):
@@ -195,9 +230,54 @@ def _token_topk(probabilities, k, mask_id, excluded_token_ids=()):
     return result
 
 
+def cache_distribution(positions, probabilities, top_k):
+    """Cache without extra forwards. A full-width top-k is stored as full mode."""
+    vocabulary = probabilities.shape[-1]
+    if 0 < top_k < vocabulary:
+        values, ids = probabilities.topk(top_k, dim=-1)
+        values = torch.cat((values, (1 - values.sum(-1, keepdim=True)).clamp_min(0)), -1)
+        return DistributionHistory(positions.clone(), values.detach().cpu(), ids.cpu(), vocabulary)
+    return DistributionHistory(positions.clone(), probabilities.detach().to("cpu", copy=True), None, vocabulary)
+
+
+def historical_kl(history, positions, probabilities, epsilon):
+    """D_KL(previous || current) on aligned still-masked positions.
+
+    Sparse KL is a coarse-grained approximation, not full-vocabulary KL:
+    gather CURRENT mass at PREVIOUS top-k IDs and put all other mass in one bin.
+    Floor and renormalize both distributions for finite values at numerical zeros.
+    Chunk transfers so full mode does not duplicate an entire matrix on the GPU.
+    """
+    if history.vocab_size != probabilities.shape[-1]:
+        raise ValueError("Historical KL requires the same vocabulary.")
+    rows = torch.searchsorted(history.positions, positions)
+    if ((rows >= len(history.positions)).any()
+            or not torch.equal(history.positions[rows], positions)):
+        raise ValueError("Historical KL positions must still be masked in both states.")
+    result = torch.empty(len(positions))
+    chunk_size = max(1, len(positions)) if history.token_ids is not None else 16
+    for start in range(0, len(positions), chunk_size):
+        stop = min(start + chunk_size, len(positions))
+        indices = rows[start:stop]
+        previous = history.probabilities[indices].to(probabilities.device)
+        current = probabilities[start:stop]
+        if history.token_ids is not None:
+            ids = history.token_ids[indices].to(probabilities.device)
+            current = current.gather(-1, ids)
+            current = torch.cat((current, (1 - current.sum(-1, keepdim=True)).clamp_min(0)), -1)
+        previous, current = previous.clamp_min(epsilon), current.clamp_min(epsilon)
+        previous = previous / previous.sum(-1, keepdim=True)
+        current = current / current.sum(-1, keepdim=True)
+        kl = (previous * (previous.log() - current.log())).sum(-1)
+        if not torch.isfinite(kl).all():
+            raise ValueError("Non-finite historical KL.")
+        result[start:stop] = kl.clamp_min(0).cpu()
+    return result
+
+
 def _distribution(model, state, prompt_len, mask_id, config, *, legacy_entropy=False,
-                  search_excluded_token_ids=()):
-    """One forward; full-vocabulary probabilities stay local to this step."""
+                  search_excluded_token_ids=(), history=None, retain_history=False):
+    """One forward; history is opt-in for search, never for completion."""
     if (state.ndim != 2 or state.shape[0] != 1 or state.dtype != torch.long
             or not 0 <= prompt_len <= state.shape[1]):
         raise ValueError("Expected one int64 sequence [1, P+L] and a valid prompt length.")
@@ -235,13 +315,18 @@ def _distribution(model, state, prompt_len, mask_id, config, *, legacy_entropy=F
                 actions.append(Action(position, token_id, probability * factors_cpu[row],
                                       probability, h_cpu[row].item(), margins_cpu[row]))
         actions.sort(key=_action_order)
-    return (StateAnalysis(entropies, tuple(actions[:config.top_k_actions]), _state_key(state), margins.mean().item()),
-            positions, probabilities, factors)
+    analysis = StateAnalysis(entropies, tuple(actions[:config.top_k_actions]), _state_key(state), margins.mean().item())
+    if history is not None:
+        analysis.historical_kl = torch.zeros_like(entropies)
+        analysis.historical_kl[positions] = historical_kl(history, positions, probabilities, config.epsilon)
+    if retain_history:
+        analysis.distribution_history = cache_distribution(positions, probabilities, config.kl_top_k)
+    return analysis, positions, probabilities, factors
 
 
 @torch.inference_mode()
 def analyze_state(model, state, prompt_len, mask_id, config, *, force_forward=False,
-                  legacy_entropy=False, search_excluded_token_ids=()):
+                  legacy_entropy=False, search_excluded_token_ids=(), history=None, retain_history=None):
     """Return compact CPU analysis; completed states need no forward.
 
     force_forward remains accepted for source compatibility, but no longer
@@ -249,7 +334,8 @@ def analyze_state(model, state, prompt_len, mask_id, config, *, force_forward=Fa
     """
     return _distribution(model, state, prompt_len, mask_id, config,
                          legacy_entropy=legacy_entropy,
-                         search_excluded_token_ids=search_excluded_token_ids)[0]
+                         search_excluded_token_ids=search_excluded_token_ids, history=history,
+                         retain_history=config.uses_history_kl if retain_history is None else retain_history)[0]
 
 
 # 1. SELECTION: choose a frontier node using accumulated search statistics.
@@ -301,6 +387,7 @@ def information_gain(before, after, epsilon):
 
 
 IMPLEMENTATION_VERSION = "medal_reconstruction_v2"
+KL_REWARD_VERSION = "ig_action_history_kl_v1"
 PAPER_URL = "https://aclanthology.org/2026.findings-eacl.180.pdf"
 RECONSTRUCTION_ASSUMPTIONS = {
     "simulation": "one forward on the immediate child; cache its entropy and actions",
@@ -470,21 +557,37 @@ def evaluate_action(model, parent, child, prompt_len, mask_id, config, *,
     """Use the cached parent and one child forward to compute the edge reward."""
     if parent.analysis is None or child.analysis is not None:
         raise ValueError("Evaluation requires a cached parent and an unevaluated child.")
+    # B: penalize instability of the position BEFORE it is committed. This is
+    # the parent's historical KL (grandparent -> parent), not parent -> child KL.
+    action_kl = 0.0
+    if config.uses_history_kl and parent.depth > 0:
+        if parent.analysis.historical_kl is None:
+            raise ValueError("IG+KL requires this branch's cached parent-to-current history.")
+        action_kl = parent.analysis.historical_kl[child.action.output_position].item()
+    needs_history = config.uses_history_kl and child.depth < config.init_tokens
+    history = parent.analysis.distribution_history if needs_history else None
+    if needs_history and history is None:
+        raise ValueError("Missing parent probability cache; do not re-forward to reconstruct KL.")
+    history_options = {"history": history, "retain_history": needs_history} if config.uses_history_kl else {}
     analysis = analyze_state(model, child.state, prompt_len, mask_id, config,
-                             search_excluded_token_ids=search_excluded_token_ids)
+                             search_excluded_token_ids=search_excluded_token_ids, **history_options)
     before, after = parent.analysis.total_entropy, analysis.total_entropy
-    
-    # Any trajectory Based Method --> For experiment 2
-    reward = information_gain(before, after, config.epsilon)
-    
-
+    gain = information_gain(before, after, config.epsilon)
+    penalty = config.kl_weight * action_kl if config.uses_history_kl else 0.0
+    reward = gain - penalty
     if not math.isfinite(reward):
         raise ValueError("Non-finite child information gain.")
     child.analysis, child.immediate_reward = analysis, reward
+    child.ig_reward, child.action_history_kl = gain, action_kl
     remaining = int((child.state[0, prompt_len:] == mask_id).sum().item())
     removed = parent.analysis.entropies[child.action.output_position].item()
     return {"entropy_before": before, "entropy_after": after,
-            "immediate_gain": reward, "reward": reward, "evaluation_model_calls": int(remaining > 0),
+            "immediate_gain": gain, "reward": reward, "evaluation_model_calls": int(remaining > 0),
+            "reward_mode": config.reward_mode, "action_history_kl": action_kl,
+            "kl_weight": config.kl_weight, "kl_penalty": penalty,
+            "kl_history_available": config.uses_history_kl and parent.depth > 0,
+            "kl_reference_node_id": parent.parent.node_id if config.uses_history_kl and parent.parent else None,
+            "kl_current_node_id": parent.node_id, "kl_output_position": child.action.output_position,
             "masked_count": remaining, "mean_token_entropy": after / remaining if remaining else 0.0,
             "mean_confidence_margin": analysis.mean_margin,
             "signal_nfe": getattr(model, "calls", None), "signal_extra_nfes": 0,
@@ -538,6 +641,11 @@ class MCTSSearch:
                  search_excluded_token_ids=()):
         self.config = config if isinstance(config, MCTSConfig) else MCTSConfig(**(config or {}))
         self.config.validate_length(gen_length)
+        self.assumptions = dict(RECONSTRUCTION_ASSUMPTIONS)
+        if self.config.reward_mode == "ig_kl":
+            self.assumptions["reward"] = (
+                "Eq9 IG minus kl_weight * D_KL(grandparent || parent) at the outgoing action position; "
+                "root penalty is zero; cached branch-local history, no extra forwards")
         if prompt_ids.ndim != 2 or prompt_ids.shape[0] != 1 or prompt_ids.dtype != torch.long:
             raise ValueError("prompt_ids must be an int64 tensor with shape [1, P].")
         derive_seed(seed, "validation")
@@ -554,6 +662,8 @@ class MCTSSearch:
         self.trace, self.on_event = [], on_event
         self.cycle, self.stop_reason = 0, None
         self.simulations_started = self.simulations_completed = 0
+        self.peak_history_cache_bytes = 0
+        self.kl_estimator = "disabled"
         self._counted = _SearchModel(model, self.config.max_model_calls, self._emit)
 
     @property
@@ -582,14 +692,30 @@ class MCTSSearch:
     def _at_simulation_cap(self):
         return self.config.max_simulations is not None and self.simulations_completed >= self.config.max_simulations
 
+    def _record_history_memory(self):
+        if self.config.uses_history_kl:
+            if self.kl_estimator == "disabled" and self.root.analysis.distribution_history is not None:
+                self.kl_estimator = ("full" if self.root.analysis.distribution_history.token_ids is None
+                                     else "top_k_tail")
+            size = sum(node.analysis.distribution_history.nbytes for node in self.nodes
+                       if node.analysis and node.analysis.distribution_history is not None)
+            self.peak_history_cache_bytes = max(self.peak_history_cache_bytes, size)
+
+    def _clear_history(self):
+        for node in self.nodes:
+            if node.analysis is not None:
+                node.analysis.distribution_history = None
+
     def _finish(self, reason):
         with self._counted.phase("candidate_evaluation"):
             for node in self.candidates.values():
                 self._emit("candidate_evaluation", phase="candidate_evaluation", node_id=node.node_id,
-                           reward=node.mean_reward, immediate_gain=node.immediate_reward, model_calls=0,
+                           reward=node.mean_reward, immediate_gain=node.ig_reward,
+                           action_history_kl=node.action_history_kl, model_calls=0,
                            state=state_record(node.state, self.prompt_len, self.mask_id, self.tokenizer))
             self.stop_reason = reason
             result = self.result()
+        self._clear_history()
         result.stats["candidate_evaluation_latency_seconds"] = self._counted.seconds["candidate_evaluation"]
         self._emit("termination", **{k:v for k,v in result.stats.items() if not k.endswith("_latency_seconds")},
                    selected_state=state_record(result.selected.state, self.prompt_len, self.mask_id, self.tokenizer))
@@ -607,12 +733,15 @@ class MCTSSearch:
                 self.root.analysis = analyze_state(self._counted, self.root.state, self.prompt_len,
                                                    self.mask_id, self.config,
                                                    search_excluded_token_ids=self.search_excluded_token_ids)
+            self._record_history_memory()
             self._emit("initialization", node_id=0, entropy=self.root.analysis.total_entropy,
                        masked_count=self.root.state.shape[1] - self.prompt_len,
                        mean_token_entropy=self.root.analysis.total_entropy / (self.root.state.shape[1] - self.prompt_len),
                        mean_confidence_margin=self.root.analysis.mean_margin,
                        signal_nfe=self.model_calls, signal_extra_nfes=0,
-                       implementation_version=IMPLEMENTATION_VERSION, assumptions=RECONSTRUCTION_ASSUMPTIONS,
+                       implementation_version=IMPLEMENTATION_VERSION, assumptions=dict(self.assumptions),
+                       reward_mode=self.config.reward_mode, kl_weight=self.config.kl_weight,
+                       kl_top_k=self.config.kl_top_k, kl_estimator=self.kl_estimator,
                        model_device=str(model_device(self.model)), search_state_device="cpu",
                        entropies=self.root.analysis.entropies.tolist(),
                        state=state_record(self.root.state, self.prompt_len, self.mask_id, self.tokenizer),
@@ -652,6 +781,7 @@ class MCTSSearch:
                 self._finish("model_call_budget")
                 return self.trace[start:]
             self.simulations_completed += 1
+            self._record_history_memory()
             self._emit("evaluation", parent_id=parent.node_id, child_id=child.node_id,
                        depth=child.depth, action=action_record(action, self.tokenizer),
                        child_state=state_record(child.state, self.prompt_len, self.mask_id, self.tokenizer), **evaluation)
@@ -673,6 +803,9 @@ class MCTSSearch:
             if self._at_simulation_cap():
                 self._finish("simulation_budget")
                 return self.trace[start:]
+        # Its children's own distributions and historical KL are already cached;
+        # this expanded parent can never be selected for expansion again.
+        parent.analysis.distribution_history = None
         self._close_exhausted(parent)
         if self.root.closed:
             self._finish("frontier_exhausted")
@@ -693,7 +826,7 @@ class MCTSSearch:
         fallback = self.done and not complete
         parents = len({node.parent.node_id for node in evaluated})
         stats = {"implementation_version": IMPLEMENTATION_VERSION, "paper_url": PAPER_URL,
-                 "reconstruction_assumptions": dict(RECONSTRUCTION_ASSUMPTIONS),
+                 "reconstruction_assumptions": dict(self.assumptions),
                  "evaluation_variant": "budget-limited MEDAL reconstruction (immediate-child IG)" if self.config.stop_mode == "budget"
                  else "MEDAL reconstruction (immediate-child IG)",
                  "finished": self.done, "stop_reason": self.stop_reason, "stop_mode": self.config.stop_mode,
@@ -717,7 +850,8 @@ class MCTSSearch:
                  "selected_score": score, "fallback_used": fallback,
                  "fallback_reason": self.stop_reason if fallback else None, "budget_exhausted": self._at_cap(),
                  "candidate_evaluations": [{"node_id": n.node_id, "reward": n.mean_reward,
-                     "immediate_gain": n.immediate_reward, "model_calls": 0,
+                     "immediate_gain": n.ig_reward, "action_history_kl": n.action_history_kl,
+                     "kl_penalty": self.config.kl_weight * n.action_history_kl, "model_calls": 0,
                      **state_record(n.state, self.prompt_len, self.mask_id, self.tokenizer)} for n in candidates]}
         # Additive metadata: preserve legacy fallback_used (quota shortfall) for
         # old callers. E0 distinguishes that from actually decoding below Lc.
@@ -728,15 +862,27 @@ class MCTSSearch:
                                            "reward": n.mean_reward} for n in shortlist],
                      shortlist_size=len(shortlist), shortlist_underfilled=len(shortlist) < self.config.num_candidates,
                      selection_source=source, fallback_decode_used=source != "target_depth")
+        stats.update(reward_mode=self.config.reward_mode, kl_weight=self.config.kl_weight,
+                     kl_top_k=self.config.kl_top_k,
+                     reward_version=KL_REWARD_VERSION if self.config.reward_mode == "ig_kl" else "ig",
+                     kl_estimator=self.kl_estimator,
+                     kl_direction="previous_to_current", kl_extra_model_calls=0,
+                     peak_history_cache_bytes=self.peak_history_cache_bytes,
+                     selected_ig_reward=selected.ig_reward,
+                     selected_action_history_kl=selected.action_history_kl,
+                     selected_kl_penalty=self.config.kl_weight * selected.action_history_kl)
         return SearchResult(selected, candidates, stats, list(self.trace))
 
     def run(self):
-        while not self.done:
-            self.step()
-        result = self.result()
-        if self.config.stop_mode == "candidates" and result.stats["fallback_used"]:
-            raise SearchIncompleteError(result.stats)
-        return result
+        try:
+            while not self.done:
+                self.step()
+            result = self.result()
+            if self.config.stop_mode == "candidates" and result.stats["fallback_used"]:
+                raise SearchIncompleteError(result.stats)
+            return result
+        finally:
+            self._clear_history()
 
 
 @torch.inference_mode()
@@ -825,7 +971,8 @@ def complete_confidence(model, state, prompt_len, mask_id, config=None,
     while (x[0, prompt_len:] == mask_id).any():
         reused = analysis is not None
         if analysis is None:
-            analysis = analyze_state(model, x, prompt_len, mask_id, config, legacy_entropy=True)
+            analysis = analyze_state(model, x, prompt_len, mask_id, config, legacy_entropy=True,
+                                     **({"retain_history": False} if config.uses_history_kl else {}))
             calls += 1
         if not analysis.actions:
             raise RuntimeError("No legal commitment for a masked output position.")

@@ -93,8 +93,9 @@ def resolve_settings(source, **overrides):
         raise ValueError("The adjusted-score MEDAL sampler requires positive completion_temperature; use llada at T=0.")
     options = dict(decoding.get("mcts", {}))
     options.setdefault("init_tokens", 5)
-    if overrides.get("init_tokens") is not None:
-        options["init_tokens"] = overrides["init_tokens"]
+    for key in ("init_tokens", "reward_mode", "kl_weight", "kl_top_k"):
+        if overrides.get(key) is not None:
+            options[key] = overrides[key]
     if options.get("max_simulations") is not None:
         raise ValueError("E0 caps forwards, not simulation counts.")
     options.update(stop_mode=evaluation["search_mode"], max_model_calls=max(budgets), max_simulations=None)
@@ -120,6 +121,11 @@ def resolve_settings(source, **overrides):
     ]
     config["conditions"] = [condition for condition in config["conditions"]
                             if condition["method"] in methods]
+    for condition in config["conditions"]:
+        if condition["method"] == "medal":
+            condition.update(reward_mode=mcts.reward_mode, kl_weight=mcts.kl_weight, kl_top_k=mcts.kl_top_k)
+            if mcts.reward_mode == "ig_kl":
+                condition["id"] += f"_ig_kl_l{mcts.kl_weight:g}_k{mcts.kl_top_k}"
     return config
 
 
@@ -328,6 +334,10 @@ def run_experiment(source, *, manifest_path=None, output_dir=None, run_manifest=
                        "fallback_decode_used": status == "completed" and details.get("fallback_decode_used", False),
                        "stop_reason": details.get("stop_reason", "all_masks_filled"),
                        "trace_file": trace_file, "details": details, **decoded, **score}
+                for key in ("reward_mode", "reward_version", "kl_weight", "kl_top_k", "kl_estimator",
+                            "kl_extra_model_calls", "selected_ig_reward",
+                            "selected_action_history_kl", "selected_kl_penalty", "peak_history_cache_bytes"):
+                    row[key] = details.get(key)
                 write_started = perf_counter()
                 output.write(json.dumps(row, allow_nan=False) + "\n")
                 output.flush()
@@ -373,6 +383,9 @@ def main():
     parser.add_argument("--stage", choices=tuple(STAGE_COUNTS))
     parser.add_argument("--num-samples", type=int)
     parser.add_argument("--init-tokens", type=int)
+    parser.add_argument("--reward-mode", choices=("ig", "ig_kl"))
+    parser.add_argument("--kl-weight", type=float)
+    parser.add_argument("--kl-top-k", type=int)
     parser.add_argument("--search-mode", choices=("budget", "candidates"))
     parser.add_argument("--search-budgets", type=int, nargs="+")
     parser.add_argument("--methods", choices=tuple(DECODERS), nargs="+",

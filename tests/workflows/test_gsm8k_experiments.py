@@ -13,12 +13,14 @@ from tests.tasks.test_e0_dataset import manifest
 from tests.workflows.test_experiment_0 import config, wrapper
 
 
-@pytest.mark.parametrize("method,conditions", [
-    ("both", ["confidence_t0", "medal_budget_b8"]),
-    ("llada", ["confidence_t0"]),
-    ("mcts", ["medal_budget_b8"]),
+@pytest.mark.parametrize("method,reward_mode,conditions", [
+    ("both", "ig", ["confidence_t0", "medal_budget_b8"]),
+    ("llada", "ig", ["confidence_t0"]),
+    ("mcts", "ig", ["medal_budget_b8"]),
+    ("both", "ig_kl", ["confidence_t0", "medal_budget_b8_ig_kl_l0.05_k32"]),
+    ("mcts", "ig_kl", ["medal_budget_b8_ig_kl_l0.05_k32"]),
 ])
-def test_launcher_runs_only_requested_methods_offline_with_shared_inputs(tmp_path, monkeypatch, method, conditions):
+def test_launcher_runs_only_requested_methods_offline_with_shared_inputs(tmp_path, monkeypatch, method, reward_mode, conditions):
     monkeypatch.setattr(os, "environ", os.environ.copy())
     profile = launcher.get_profile()
     hub = tmp_path / "model cache"
@@ -59,6 +61,7 @@ def test_launcher_runs_only_requested_methods_offline_with_shared_inputs(tmp_pat
         "--env-file", str(env), "--config", str(source), "--method", method,
         "--stage", "test", "--num-samples", "2", "--search-budget", "8",
         "--lc", "2", "--num-candidates", "1", "--top-k-tokens", "2", "--top-k-actions", "2",
+        "--reward-mode", reward_mode, "--kl-weight", "0.05", "--kl-top-k", "32",
     ])
     assert len(loads) == 1
     prediction_files = list((tmp_path / "results").rglob("predictions.jsonl"))
@@ -83,12 +86,21 @@ def test_launcher_runs_only_requested_methods_offline_with_shared_inputs(tmp_pat
             assert settings["stop_mode"] == "budget"
             assert settings["num_candidates"] == 1
             assert settings["top_k_tokens"] == settings["top_k_actions"] == 2
+            assert row["reward_mode"] == settings["reward_mode"] == reward_mode
+            assert row["kl_weight"] == .05 and row["kl_top_k"] == 32
+            assert row["selected_ig_reward"] is not None
+            assert row["selected_kl_penalty"] >= 0
         else:
             assert row["search_nfes"] == 0
     summary = generate_report(directory)  # Also works without a no-search condition.
     assert summary["complete"] and summary["common_n"] == 2
     assert [condition["id"] for condition in summary["conditions"]] == conditions
     assert len(summary["gains"]) == (1 if method == "both" else 0)
+    if reward_mode == "ig_kl":
+        assert "Search reward B" in (directory / "report/report.md").read_text()
+        searched = next(c for c in summary["conditions"] if c["method"] == "medal")
+        assert searched["mean_peak_history_cache_bytes"] > 0
+        assert searched["mean_selected_ig_reward"] is not None
 
 
 def test_dry_run_does_not_load_model_dataset_or_create_results(tmp_path, monkeypatch, capsys):
@@ -153,3 +165,14 @@ def test_missing_local_inputs_fail_before_experiment(tmp_path, monkeypatch, caps
 def test_e0_rejects_invalid_method_selection(tmp_path, methods):
     with pytest.raises(ValueError, match="methods"):
         e0.resolve_settings(config(tmp_path), methods=methods)
+
+
+def test_e0_reward_overrides_roundtrip_and_invalid_values(tmp_path):
+    source = config(tmp_path)
+    resolved = e0.resolve_settings(source, reward_mode="ig_kl", kl_weight=.02, kl_top_k=0)
+    assert e0.resolve_settings(resolved) == resolved
+    assert resolved["decoding"]["mcts"]["kl_weight"] == .02
+    assert resolved["conditions"][-1]["id"].endswith("_ig_kl_l0.02_k0")
+    for invalid in ({"reward_mode": "bad"}, {"kl_weight": -1}, {"kl_top_k": -1}):
+        with pytest.raises(ValueError):
+            e0.resolve_settings(source, **invalid)

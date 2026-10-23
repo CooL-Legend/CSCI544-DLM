@@ -56,6 +56,9 @@ decoding:
     max_model_calls: null
     max_simulations: null
     stop_mode: budget
+    reward_mode: ig  # Opt in to B with ig_kl; completion and stopping are unchanged.
+    kl_weight: 0.05  # Initial experimental lambda, not a tuned accuracy claim.
+    kl_top_k: 32  # Top-k + tail approximation; 0 for full-vocabulary KL (high CPU RAM).
 evaluation:
   stage: dev
   search_mode: budget

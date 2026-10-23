@@ -85,7 +85,8 @@ def build_config(args, paths, revision):
     config["experiment_root"] = str(paths["RESULTS_DIR"])
     config["data"].update(cache_dir=str(paths["DATASET_DIR"]), revision=revision)
     config["decoding"].update(seed=args.seed, completion_method="llada", completion_temperature=0.0)
-    for key in ("init_tokens", "num_candidates", "top_k_tokens", "top_k_actions"):
+    for key in ("init_tokens", "num_candidates", "top_k_tokens", "top_k_actions",
+                "reward_mode", "kl_weight", "kl_top_k"):
         if getattr(args, key) is not None:
             config["decoding"]["mcts"][key] = getattr(args, key)
     return resolve_settings(
@@ -109,6 +110,9 @@ def parser():
     result.add_argument("--num-candidates", type=int, help="C / shortlist size (YAML default: 3).")
     result.add_argument("--top-k-tokens", type=int, help="K1 (YAML default: 3).")
     result.add_argument("--top-k-actions", type=int, help="K2 (YAML default: 5).")
+    result.add_argument("--reward-mode", choices=("ig", "ig_kl"), help="Original IG or B: IG minus action-history KL.")
+    result.add_argument("--kl-weight", type=float, help="KL penalty lambda; 0 recovers original IG (default: 0.05).")
+    result.add_argument("--kl-top-k", type=int, help="History top-k plus tail bucket (default: 32); 0 caches full vocabulary.")
     result.add_argument("--seed", type=int, default=1)
     result.add_argument("--dry-run", action="store_true", help="Print paths and settings without loading data or weights.")
     return result

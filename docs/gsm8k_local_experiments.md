@@ -94,3 +94,78 @@ For `both`, rows are labeled `confidence_t0` and `medal_budget_b256` (or your
 selected budget). No entropy or separate no-search MEDAL run is included.
 The old `scripts/experiment_0_baseline_test.py` still runs its full condition
 set by default; its new `--methods confidence medal` option selects this subset.
+
+## Reward B: IG minus pre-commit historical KL
+
+This is an opt-in research extension, not a replacement for the original IG
+baseline and not an accuracy guarantee. At current node `s`, let `g` be its
+parent and `a=(i,v)` the action producing child `s_next`. The reward is:
+
+```text
+IG = (H(s) - H(s_next)) / H(s)       # Original epsilon guard is unchanged.
+history_KL = KL(p_g[position i] || p_s[position i])
+reward_B = IG - kl_weight * history_KL
+```
+
+Position `i` must still be masked in both `g` and `s`. This penalizes committing
+an unstable position, NOT the changes the action causes elsewhere in `s_next`.
+Each node uses its own parent history, never the last visited sibling's history.
+Root actions have zero penalty. Different token choices at the same position
+share the historical KL penalty; their IG can still differ.
+
+Only the search reward changes: candidate action filtering, UCB exploration
+constant, backups, final candidate-ranking rule, completion, prompt, and stopping
+are unchanged. The new reward feeds the existing backups and ranking.
+`--kl-weight 0` follows the original IG path without allocating a history cache.
+The initial weight `0.05` is a starting value to tune on development data, not a
+validated optimum. The default reward remains `ig` unless explicitly selected.
+
+```bash
+# Original IG control.
+python scripts/run_gsm8k_experiments.py --method mcts --num-samples 5 \
+  --search-budget 256 --reward-mode ig
+
+# B: start with the same budget to isolate reward quality.
+python scripts/run_gsm8k_experiments.py --method mcts --num-samples 5 \
+  --search-budget 256 --reward-mode ig_kl --kl-weight 0.05 --kl-top-k 32
+
+# Run pure LLaDA, then B on the same questions in one process.
+python scripts/run_gsm8k_experiments.py --method both --num-samples 5 \
+  --search-budget 256 --reward-mode ig_kl --kl-weight 0.05
+
+# Test whether B works at a lower search budget (not adaptive early stopping).
+python scripts/run_gsm8k_experiments.py --method mcts --num-samples 5 \
+  --search-budget 128 --reward-mode ig_kl --kl-weight 0.05
+```
+
+`kl_top_k=32` caches the **previous** distribution's top-32 token IDs/probabilities
+and a single residual-mass bucket. The new distribution is gathered at those
+same IDs; its remaining mass goes in the matching bucket. This is a
+**coarse-grained KL approximation**, not KL between two independently ranked
+top-k vectors, and it cannot observe rearrangements within the tail.
+Both distributions are floored at `epsilon` and renormalized for numerical
+safety. No special tokens are removed from these probability distributions;
+the existing EOS/EOT exclusion still applies only to search actions.
+
+Use `--kl-top-k 0` for full-vocabulary KL with the same numerical smoothing.
+This can require **several GB of CPU RAM** for the frontier; it is not the
+memory-efficient default. A k at least as large as the vocabulary also uses
+full mode. Histories live on CPU, are released after expansion or search exit,
+and are never persisted as full matrices in result files. Leaf candidates do
+not retain histories. Both modes reuse existing forwards, but KL calculations
+and CPU/GPU transfers add runtime; fewer NFEs do not automatically mean faster.
+
+B condition IDs include the settings, e.g.
+`medal_budget_b256_ig_kl_l0.05_k32`. Trace `evaluation` events separately record
+`immediate_gain` (the original IG), `action_history_kl`, `kl_penalty`, `reward`,
+the history node IDs and output position. Predictions/reports include
+`selected_ig_reward`, `selected_action_history_kl`, `selected_kl_penalty` and
+`peak_history_cache_bytes` (retained history tensors only, not total RAM/VRAM).
+`kl_estimator` records the actual mode (`full`, `top_k_tail`, or `disabled`),
+and `kl_extra_model_calls` is zero. Reward/version/parameters are saved for replay.
+
+Fixed-budget search still normally consumes its cap. Compare IG and B at both
+128 and 256 on identical frozen questions, and measure accuracy **and total
+NFEs/runtime**. Choose lambda using development/training data before reporting
+held-out test results. This variant neither introduces automatic early stopping
+nor changes final candidate scoring into a cumulative path reward.
