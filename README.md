@@ -36,28 +36,28 @@ Install the package with `python -m pip install --no-deps -e .` after installing
 
 ## Experiment 0: fixed-budget GSM8K baseline test
 
-[Experiment 0](docs/experiment_0/README.md) compares greedy confidence, greedy entropy,
-MEDAL with standard LLaDA completion without search, and fixed-budget MEDAL.
-All E0 conditions use T=0. Evaluation and testing use search caps of 256, 512 and
-1024 actual forwards. It uses Lc=5, a shared three-step decomposition prompt
-with the fixed pens/muffins examples, search-only EOS/EOT
-filtering, and fallback completion after budget exhaustion. The original
-candidate-quota mode remains available as a separate matched-depth comparison.
+[The shared experiment guide](docs/experiments.md) defines the fixed inputs for
+E0/E1/E2 and the implemented E0 v5 runner. One confidence baseline is compared
+with MEDAL at (Lc, B) = (7, 256), (7, 512), (10, 512), and (10, 1024).
+All conditions use the same two-shot prompt, 256 output tokens, and LLaDA
+Confidence completion at T=0. Search collects every distinct deepest state,
+ranks by mean backed-up reward, retains up to three, and completes only rank 1.
 
-Use the new [development](notebooks/gsm8k/Experiment_0_Baseline_Test_Dev.ipynb),
-[evaluation](notebooks/gsm8k/Experiment_0_Baseline_Test_Evaluation.ipynb), and
-[testing](notebooks/gsm8k/Experiment_0_Baseline_Test_Testing.ipynb) Colab notebooks
-for 5/20 disjoint training questions and 25 held-out test questions, respectively.
-Each loads one model and displays paired accuracy, actual NFEs, runtime, depth,
-fallbacks, and saved answers. Testing can expand to 100 using the same frozen
-ordering. Before these changes are on `adi`, the notebooks also accept the
-delivered `dist/experiment_0_colab_source.zip` through `SOURCE_MODE="upload"`.
-The [implementation README](docs/experiment_0/README.md) explains the exact
-protocol, code interfaces, commands, metrics, saved records, and validation.
+The checked-in manifest freezes 5 dev and 20 evaluation questions from train
+and 200 test questions. All stages load these same inputs offline. The common
+settings are in [experiments_common.yaml](configs/gsm8k/experiments_common.yaml).
 
 ```bash
+python scripts/prepare_gsm8k_experiments.py
 python scripts/experiment_0_baseline_test.py --stage dev
+python scripts/experiment_0_baseline_test.py --stage evaluation
+python scripts/experiment_0_baseline_test.py --stage test
 ```
+
+The existing E0 notebooks remain on the legacy v4 protocol and are not v5
+entry points. The development notebook has pre-existing committed merge
+markers; notebook changes are outside this update. Use the CLI above and
+consult the [v5 guide](docs/experiments.md) for metrics, artifacts, and migration.
 
 ## Single-prompt MEDAL demo
 

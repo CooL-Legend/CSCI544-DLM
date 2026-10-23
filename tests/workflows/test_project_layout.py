@@ -27,6 +27,7 @@ from dlm_project.paths import PROJECT_ROOT as ROOT
     "eval_gsm8k_mcts_confidence.py",
     "run_gsm8k_metrics.py",
     "experiment_0_baseline_test.py",
+    "prepare_gsm8k_experiments.py",
 ])
 def test_installed_entry_points_work_outside_checkout(tmp_path, script):
     # -I ignores PYTHONPATH and the script directory. Imports must come from

@@ -65,7 +65,7 @@ def test_live_progress_matches_evaluations_and_excludes_printing_time(monkeypatc
     assert initial.result.stats['selected_score'] == baseline.result.stats['selected_score']
 
 
-@pytest.mark.parametrize('cap,source,shortlist', [(1, 'root', 0), (2, 'deepest_evaluated', 0),
+@pytest.mark.parametrize('cap,source,shortlist', [(1, 'root', 1), (2, 'deepest_evaluated', 1),
                                                (5, 'target_depth', 1), (6, 'target_depth', 2),
                                                (12, 'target_depth', 3), (100, 'target_depth', 3)])
 def test_demo_shortlist_fallback_metrics_and_completion_counts(cap, source, shortlist, capsys):

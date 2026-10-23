@@ -1,3 +1,7 @@
+> **Historical E0 v1–v4 reference.** The current script implements v5. Use the
+> [shared protocol and E0 v5 guide](../experiments.md) for current settings and
+> commands. Existing notebooks remain legacy and were not updated.
+
 # Experiment 0: Baseline Test — implementation README
 
 E0 measures how effectively MEDAL uses a fixed search budget on GSM8K. It

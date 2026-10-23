@@ -70,7 +70,7 @@ def test_budget_continues_beyond_three_candidates_and_has_zero_candidate_scoring
     assert frontier.stats["search_model_calls"] < 100 and frontier.stats["stop_reason"] == "frontier_exhausted"
 
 
-@pytest.mark.parametrize("cap,source,count", [(1, "root", 0), (2, "deepest_evaluated", 0),
+@pytest.mark.parametrize("cap,source,count", [(1, "root", 1), (2, "deepest_evaluated", 1),
                                             (5, "target_depth", 1), (6, "target_depth", 2),
                                             (12, "target_depth", 3)])
 def test_shortlists_and_fallback_are_distinct_from_quota_shortfalls(cap, source, count):

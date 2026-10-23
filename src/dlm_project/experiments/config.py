@@ -14,6 +14,9 @@ def load_config(path):
         config = yaml.safe_load(handle)
     if not isinstance(config, dict):
         raise ValueError("The configuration must be a YAML mapping.")
+    if "common_config" in config:
+        from dlm_project.tasks.gsm8k.experiment_protocol import resolve_common_reference
+        _, config = resolve_common_reference(config)
     return config
 
 

@@ -174,8 +174,8 @@ def candidate_summaries(initialization, *, tokenizer=None, limit=3):
     root_entropy = search.root.analysis.total_entropy
     candidates = sorted(result.candidates, key=lambda node: (-node.mean_reward, node.node_id))[
         :min(limit, search.config.num_candidates)]
-    fallback = not candidates and limit > 0
-    if fallback:
+    fallback = result.selected.depth < search.config.init_tokens
+    if not candidates and limit > 0:
         candidates = [result.selected]
     rows = []
     for rank, node in enumerate(candidates, 1):
@@ -200,8 +200,7 @@ def candidate_summaries(initialization, *, tokenizer=None, limit=3):
 def show_candidates(initialization, *, tokenizer=None, limit=3):
     rows = candidate_summaries(initialization, tokenizer=tokenizer, limit=limit)
     stats = initialization.result.stats
-    target_rows = sum(not row["is_fallback"] for row in rows)
-    print(f"Top {target_rows} of {len(initialization.result.candidates)} initialization candidates")
+    print(f"Top {len(rows)} of {len(initialization.result.candidates)} initialization candidates")
     print("Q = cached mean tree reward; target-depth leaves use last-edge normalized entropy reduction.")
     if rows and rows[0]["is_fallback"]:
         source = stats.get("selection_source", "root" if rows[0]["depth"] == 0 else "deepest_evaluated")
