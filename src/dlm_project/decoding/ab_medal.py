@@ -5,6 +5,7 @@ come from the repository's MEDAL reconstruction. There are no search rollouts.
 """
 
 from collections import Counter
+import copy
 from dataclasses import asdict, dataclass
 from itertools import combinations
 import math
@@ -200,10 +201,12 @@ class ABMEDALSearch(medal.MCTSSearch):
     """One GEN evaluation per step; every traversal starts again at the root."""
 
     def __init__(self, model, prompt_ids, mask_id, gen_length, config=None,
-                 tokenizer=None, on_event=None, *, seed=1, search_excluded_token_ids=()):
+                 tokenizer=None, on_event=None, *, seed=1, search_excluded_token_ids=(),
+                 checkpoint_budgets=None):
         config = config if isinstance(config, ABMEDALConfig) else ABMEDALConfig(**(config or {}))
         super().__init__(model, prompt_ids, mask_id, gen_length, config, tokenizer, on_event, seed=seed,
-                         search_excluded_token_ids=search_excluded_token_ids)
+                         search_excluded_token_ids=search_excluded_token_ids,
+                         checkpoint_budgets=checkpoint_budgets)
         self._counted = _SearchModel(model, config.max_model_calls, self._emit)
         self.rng = np.random.default_rng(seed)
         self.posteriors, self.remaining_actions, self.decision_history = {}, {}, {}
@@ -211,6 +214,16 @@ class ABMEDALSearch(medal.MCTSSearch):
         self.initialization_seconds = 0.0
         self._round = None
         self._pending = None
+
+    def _snapshot_checkpoint(self, budget, stop_reason="model_call_budget"):
+        snapshot = super()._snapshot_checkpoint(budget, stop_reason=stop_reason)
+        snapshot.update(
+            posteriors={node_id: {k: copy.deepcopy(p) for k, p in models.items()}
+                        for node_id, models in self.posteriors.items()},
+            remaining_actions={node_id: list(actions) for node_id, actions in self.remaining_actions.items()},
+            decision_history={node_id: list(history) for node_id, history in self.decision_history.items()},
+        )
+        return snapshot
 
     def _register(self, node):
         if node.node_id not in self.posteriors:
@@ -376,6 +389,7 @@ class ABMEDALSearch(medal.MCTSSearch):
                        actions=[medal.action_record(a, self.tokenizer) for a in analysis.actions],
                        policy=self.config.search_policy, priors=asdict(self.config.new_posterior()))
             self._pending = None
+            self._check_checkpoint()
             return
         evaluation = medal.apply_child_analysis(parent, child, analysis, self.prompt_len,
                                                  self.mask_id, self.config, signal_nfe=self.model_calls)
@@ -388,6 +402,7 @@ class ABMEDALSearch(medal.MCTSSearch):
             posterior_updates, visits = self._backup(child, parent, request.path, evaluation["reward"])
         self._emit("backpropagation", child_id=child.node_id, reward=evaluation["reward"],
                    posterior_updates=posterior_updates, updates=visits)
+        self._check_checkpoint()
         if child.depth == self.config.init_tokens:
             key = medal._state_key(child.state)
             duplicate = key in self.candidates
