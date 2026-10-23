@@ -59,6 +59,16 @@ protocol, code interfaces, commands, metrics, saved records, and validation.
 python scripts/experiment_0_baseline_test.py --stage dev
 ```
 
+For just **pure LLaDA and fixed-budget MCTS**, use the
+[local experiment runner](docs/gsm8k_local_experiments.md). Paths are read from
+`.env` (see `.env.example`); existing model and dataset caches are used offline.
+`--method both` runs all questions with LLaDA first, then MCTS in the same process;
+`--method llada` and `--method mcts` run either method separately.
+
+```bash
+python scripts/run_gsm8k_experiments.py --method both --num-samples 5 --search-budget 256
+```
+
 ## Single-prompt MEDAL demo
 
 Use [MEDAL_MCTS_Demo.ipynb](notebooks/gsm8k/MEDAL_MCTS_Demo.ipynb) for one E0-style MEDAL run. It loads one model from the runtime, Drive, or the pinned Hub checkpoint and uses the fixed pens/muffins prompt. Before MCTS, the no-search block runs standard LLaDA completion from all masks and displays its independent outputs, NFE/runtime and accuracy metrics. Defaults for searched MEDAL are target depth 5 and a 512-forward search budget; set `SEARCH_BUDGET` to 1024 or 2048 for larger runs. Live counters show actual search NFEs/budget, evaluated depth and candidate count. The existing cells inspect up to three cached candidates or the selected fallback, then complete that state. The control and search share the model, prompt and completion seed; the control's cost is kept separate from searched MEDAL's totals.

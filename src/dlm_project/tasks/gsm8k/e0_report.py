@@ -209,9 +209,11 @@ def generate_report(run_dir):
         lines.append(f"| {item['condition']} | {item['baseline']} | {number(item['accuracy_gain_pp'])} | "
                      f"{number(item['additional_mean_nfes'])} | {number(item['accuracy_gain_pp_per_additional_nfe'])} |")
     decoder = config.get("decoding", {}).get("completion_method", "medal")
-    temperature = next(condition["temperature"] for condition in config["conditions"]
-                       if condition["method"] == "medal_no_search")
-    lines += ["", f"MEDAL completion decoder: **{decoder}**. The T={temperature:g} no-search MEDAL control uses the identical downstream decoder, temperature and completion seed as searched MEDAL. "
+    control = next((condition for condition in config["conditions"]
+                    if condition["method"] == "medal_no_search"), None)
+    control_note = (f"The T={control['temperature']:g} no-search MEDAL control uses the identical downstream decoder, temperature and completion seed as searched MEDAL. "
+                    if control else "The separate no-search MEDAL control was not requested. ")
+    lines += ["", f"MEDAL completion decoder: **{decoder}**. " + control_note +
               "Greedy baselines use T=0. Search excludes EOS/EOT; every completion permits them and fills all positions. "
               "Scoring uses only the prefix before the first terminator, with the existing strict #### parser.",
               "", "Fallback outputs count normally. Strict quota failures count as incorrect. Missing/interrupted outcomes "

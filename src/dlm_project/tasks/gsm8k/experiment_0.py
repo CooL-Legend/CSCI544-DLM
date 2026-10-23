@@ -36,12 +36,18 @@ def resolve_settings(source, **overrides):
     config = copy.deepcopy(source)
     evaluation = config.setdefault("evaluation", {})
     for key, default in (("stage", "dev"), ("search_mode", "budget"), ("run_order", "example"),
+                         ("methods", list(DECODERS)),
                          ("search_budgets", [512, 1024, 2048])):
         evaluation[key] = overrides.get(key) if overrides.get(key) is not None else evaluation.get(key, default)
     if evaluation["stage"] not in STAGE_COUNTS or evaluation["search_mode"] not in ("budget", "candidates"):
         raise ValueError("E0 requires stage dev/evaluation/test and search_mode budget/candidates.")
     if evaluation["run_order"] not in ("example", "condition"):
         raise ValueError("E0 run_order must be example or condition.")
+    methods = evaluation["methods"]
+    if (not isinstance(methods, (list, tuple)) or not methods
+            or any(not isinstance(method, str) or method not in DECODERS for method in methods)
+            or len(set(methods)) != len(methods)):
+        raise ValueError("E0 methods must be a nonempty, unique list of decoder names.")
     budgets = evaluation["search_budgets"]
     if (not isinstance(budgets, (list, tuple)) or not budgets
             or any(type(b) is not int or b < 1 for b in budgets) or len(set(budgets)) != len(budgets)):
@@ -112,6 +118,8 @@ def resolve_settings(source, **overrides):
         *[{"id": f"medal_{evaluation['search_mode']}_b{b}", "method": "medal",
            "temperature": temperature, "search_budget": b, "completion_method": decoding["completion_method"]} for b in budgets],
     ]
+    config["conditions"] = [condition for condition in config["conditions"]
+                            if condition["method"] in methods]
     return config
 
 
@@ -367,6 +375,8 @@ def main():
     parser.add_argument("--init-tokens", type=int)
     parser.add_argument("--search-mode", choices=("budget", "candidates"))
     parser.add_argument("--search-budgets", type=int, nargs="+")
+    parser.add_argument("--methods", choices=tuple(DECODERS), nargs="+",
+                        help="Run only the selected methods; default runs all E0 methods.")
     parser.add_argument("--run-order", choices=("example", "condition"),
                         help="Finish all conditions per example, or all examples per condition.")
     parser.add_argument("--model-path", type=Path)
