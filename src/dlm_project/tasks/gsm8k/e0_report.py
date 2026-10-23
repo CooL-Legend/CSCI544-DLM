@@ -32,6 +32,13 @@ def _aggregate(condition, rows):
         result["mean_" + key] = mean(values) if values else None
     for key in ("search_nfes", "completion_nfes", "total_nfes", "decoding_seconds"):
         result["total_" + key] = sum(row[key] for row in rows)
+    audited = [row["search_audit_metrics"] for row in rows if row.get("search_audit_metrics")]
+    result["allocation_audited_n"] = len(audited)
+    for key in ("branching_factor_min", "branching_factor_max", "unique_evaluated_states",
+                "duplicate_state_count", "duplicate_state_percentage", "root_subtree_coverage",
+                "negative_ig_count", "negative_ig_percentage", "ig_min", "ig_mean", "ig_max", "selected_q"):
+        values = [m[key] for m in audited if m.get(key) is not None]
+        result["mean_" + key] = mean(values) if values else None
     latencies = [row["decoding_seconds"] for row in rows]
     result.update(median_decoding_seconds=median(latencies) if n else None,
                   p95_decoding_seconds=percentile(latencies, .95),
@@ -146,6 +153,25 @@ def load_records(directory, config):
         identity = (row["prompt_ids_hash"], row["prompt_hash"], row["seed"], row["model_revision"])
         if identities.setdefault(key[0], identity) != identity:
             raise ValueError("E0 conditions did not share tokenized prompts and seeds.")
+        if row.get("search_audit_file"):
+            from dlm_project.decoding import search_audit
+            audit = json.loads((directory / row["search_audit_file"]).read_text())
+            prompt_record = json.loads((directory / "prompts" / f"{row['example_id'].replace(':', '_')}.json").read_text())
+            if digest([prompt_record["prompt_ids"]]) != row["prompt_ids_hash"]:
+                raise ValueError("Saved audit prompt token IDs differ from the E0 prompt hash.")
+            search_audit.reconstruct(audit, prompt_record["prompt_ids"])
+            measured = search_audit.metrics(audit)
+            if measured != row["search_audit_metrics"] or measured["search_nfes"] != row["search_nfes"]:
+                raise ValueError("E0 offline allocation metrics differ from saved evidence.")
+        elif row["search_nfes"] and row.get("trace_file") and (directory / row["trace_file"]).is_file():
+            from dlm_project.decoding import search_audit
+            events = [json.loads(line) for line in (directory / row["trace_file"]).read_text().splitlines() if line.strip()]
+            recovered = search_audit.from_events(events, mask_id=config["provenance"]["model"].get("mask_id", 126336),
+                gen_length=config["generation"]["gen_length"], requested_depth=row.get("requested_depth") or config["decoding"]["mcts"].get("init_tokens"),
+                requested_budget=condition["search_budget"], search_nfes=row["search_nfes"],
+                stop_mode=config["evaluation"]["search_mode"], allow_legacy=True)
+            if recovered["nodes"]:
+                row["search_audit_metrics"] = search_audit.metrics(recovered)
         seen.add(key)
         rows.append(row)
     return rows, warnings
@@ -259,6 +285,9 @@ def generate_report(run_dir):
     write_csv(destination / "summary.csv", summary["conditions"])
     write_csv(destination / "observed_summary.csv", summary["observed_conditions"])
     write_csv(destination / "accuracy_gains.csv", summary["gains"])
+    write_csv(destination / "compute_allocation.csv", [
+        {"example_id": row["example_id"], "condition": row["condition"], **row["search_audit_metrics"]}
+        for row in rows if row.get("search_audit_metrics")])
     _plots(summary, destination / "plots")
 
     def number(value):

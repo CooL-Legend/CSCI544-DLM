@@ -126,6 +126,7 @@ class Node:
     expanded: bool = False
     closed: bool = False
     immediate_reward: float | None = None
+    evaluation_order: int | None = None
 
     @property
     def mean_reward(self):
@@ -237,6 +238,24 @@ def _distribution(model, state, prompt_len, mask_id, config, *, legacy_entropy=F
     prediction = model(state.to(device))
     logits = prediction.logits[0, (positions + prompt_len).to(device)].float()
     del prediction
+    timing = (model.phase("candidate_filtering")
+              if isinstance(model, _SearchModel) and model.current_phase == "simulation" else nullcontext())
+    return distribution_from_logits(logits, state, prompt_len, mask_id, config, masked_only=True,
+                                    legacy_entropy=legacy_entropy,
+                                    search_excluded_token_ids=search_excluded_token_ids,
+                                    filtering_timer=timing)
+
+
+def distribution_from_logits(logits, state, prompt_len, mask_id, config, *,
+                             legacy_entropy=False, search_excluded_token_ids=(),
+                             filtering_timer=None, masked_only=False):
+    """Shared serial/batched analysis; no model call and no retained logits."""
+    state = state.detach().cpu()
+    positions = torch.nonzero(state[0, prompt_len:] == mask_id, as_tuple=False).flatten()
+    entropies = torch.zeros(state.shape[1] - prompt_len)
+    if not positions.numel():
+        return StateAnalysis(entropies, (), _state_key(state)), positions, None, None
+    logits = logits.float() if masked_only else logits[(positions + prompt_len).to(logits.device)].float()
     if not 0 <= mask_id < logits.shape[-1] or logits.shape[-1] < 2:
         raise ValueError("The model vocabulary must contain the mask ID and a non-mask token.")
     probabilities = torch.softmax(logits, dim=-1)
@@ -249,9 +268,7 @@ def _distribution(model, state, prompt_len, mask_id, config, *, legacy_entropy=F
     factors = torch.exp(-h) * torch.sigmoid(config.margin_gamma * margins)
     # Root filtering is already in tree_analysis. Split child filtering out for
     # the demo's stage report; the existing simulation timer stays inclusive.
-    timing = (model.phase("candidate_filtering")
-              if isinstance(model, _SearchModel) and model.current_phase == "simulation" else nullcontext())
-    with timing:
+    with filtering_timer if filtering_timer is not None else nullcontext():
         token_rows = _token_topk(probabilities, config.top_k_tokens, mask_id,
                                 search_excluded_token_ids)
         h_cpu, margins_cpu, factors_cpu = h.cpu(), margins.cpu().tolist(), factors.cpu().tolist()
@@ -499,6 +516,14 @@ def evaluate_action(model, parent, child, prompt_len, mask_id, config, *,
         raise ValueError("Evaluation requires a cached parent and an unevaluated child.")
     analysis = analyze_state(model, child.state, prompt_len, mask_id, config,
                              search_excluded_token_ids=search_excluded_token_ids)
+    return apply_child_analysis(parent, child, analysis, prompt_len, mask_id, config,
+                                signal_nfe=getattr(model, "calls", None))
+
+
+def apply_child_analysis(parent, child, analysis, prompt_len, mask_id, config, *, signal_nfe=None):
+    """Apply a completed evaluation using the same IG rule for every executor."""
+    if parent.analysis is None or child.analysis is not None:
+        raise ValueError("Evaluation requires a cached parent and an unevaluated child.")
     before, after = parent.analysis.total_entropy, analysis.total_entropy
     
     # Any trajectory Based Method --> For experiment 2
@@ -514,7 +539,7 @@ def evaluate_action(model, parent, child, prompt_len, mask_id, config, *,
             "immediate_gain": reward, "reward": reward, "evaluation_model_calls": int(remaining > 0),
             "masked_count": remaining, "mean_token_entropy": after / remaining if remaining else 0.0,
             "mean_confidence_margin": analysis.mean_margin,
-            "signal_nfe": getattr(model, "calls", None), "signal_extra_nfes": 0,
+            "signal_nfe": signal_nfe, "signal_extra_nfes": 0,
             "committed_position_entropy": removed, "context_gain": before - removed - after,
             "entropies_before": parent.analysis.entropies.tolist(),
             "entropies_after": child.analysis.entropies.tolist()}
@@ -597,6 +622,16 @@ class MCTSSearch:
         if self.on_event:
             self.on_event(event)
 
+    def _record_evaluated(self, node):
+        """Compact, model-free identity of each successfully evaluated state."""
+        node.evaluation_order = self.simulations_completed if node.parent else 0
+        self._emit("node_evaluated", trace_schema_version="search_trace_v1",
+                   node_id=node.node_id, parent_id=node.parent.node_id if node.parent else None,
+                   depth=node.depth, evaluation_order=node.evaluation_order,
+                   state_hash=candidate_value_record(node)["state_hash"],
+                   immediate_reward=node.immediate_reward,
+                   action=None if node.action is None else asdict(node.action))
+
     def _close_exhausted(self, node):
         while node is not None:
             node.closed = node.depth >= self.config.init_tokens or (
@@ -630,7 +665,17 @@ class MCTSSearch:
             self.stop_reason = reason
             result = self.result()
         result.stats["candidate_evaluation_latency_seconds"] = self._counted.seconds["candidate_evaluation"]
-        self._emit("termination", **{k:v for k,v in result.stats.items() if not k.endswith("_latency_seconds")},
+        self._emit("search_selection", trace_schema_version="search_trace_v1",
+                   requested_depth=self.config.init_tokens, requested_budget=self.config.max_model_calls,
+                   candidate_ids=result.stats["candidate_ids"],
+                   shortlist_ids=[row["node_id"] for row in result.stats["candidate_shortlist"]],
+                   selected_node_id=result.selected.node_id, selected_depth=result.selected.depth,
+                   stop_reason=reason, fallback=result.selected.depth < self.config.init_tokens,
+                   root_action_count=len(self.root.analysis.actions),
+                   node_statistics=[{"node_id": n.node_id, "visits": n.visits,
+                                     "reward_sum": n.reward_sum, "q_value": n.mean_reward}
+                                    for n in self.nodes if n.evaluation_order is not None])
+        self._emit("termination", **{k:v for k,v in result.stats.items() if "seconds" not in k},
                    selected_state=state_record(result.selected.state, self.prompt_len, self.mask_id, self.tokenizer))
         if self.config.stop_mode == "candidates" and result.stats["fallback_used"]:
             raise SearchIncompleteError(result.stats)
@@ -646,6 +691,7 @@ class MCTSSearch:
                 self.root.analysis = analyze_state(self._counted, self.root.state, self.prompt_len,
                                                    self.mask_id, self.config,
                                                    search_excluded_token_ids=self.search_excluded_token_ids)
+            self._record_evaluated(self.root)
             self._emit("initialization", node_id=0, entropy=self.root.analysis.total_entropy,
                        masked_count=self.root.state.shape[1] - self.prompt_len,
                        mean_token_entropy=self.root.analysis.total_entropy / (self.root.state.shape[1] - self.prompt_len),
@@ -691,6 +737,7 @@ class MCTSSearch:
                 self._finish("model_call_budget")
                 return self.trace[start:]
             self.simulations_completed += 1
+            self._record_evaluated(child)
             self._emit("evaluation", parent_id=parent.node_id, child_id=child.node_id,
                        depth=child.depth, action=action_record(action, self.tokenizer),
                        child_state=state_record(child.state, self.prompt_len, self.mask_id, self.tokenizer), **evaluation)

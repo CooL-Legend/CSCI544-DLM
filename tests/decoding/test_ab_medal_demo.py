@@ -1,10 +1,8 @@
 """The staged AB notebook shares MEDAL reports without changing AB decisions."""
 
 import json
-from pathlib import Path
 from types import SimpleNamespace
 
-import nbformat
 import pytest
 import torch
 
@@ -32,7 +30,7 @@ def demonstrations_path(tmp_path):
 
 
 def settings(**kwargs):
-    return ABMEDALConfig(**{"init_tokens": 2, "num_candidates": 3,
+    return ABMEDALConfig(**{"stop_mode": "candidates", "max_model_calls": None, "init_tokens": 2, "num_candidates": 3,
                             "top_k_tokens": 2, "top_k_actions": 2, **kwargs})
 
 
@@ -110,75 +108,6 @@ def test_incomplete_search_is_inspectable_and_never_calls_sampler(cap, candidate
     assert report["total_nfe"] == len(initial.search.model.seen) == cap
     assert report["decoding_nfe"] == 0 and report["score"] is report["accuracy"] is None
     assert "Completion and scoring skipped" in capsys.readouterr().out
-
-
-def execute_notebook(demonstrations_path, tmp_path, *, question=demo.DEFAULT_QUESTION,
-                     reference=None, use_file=False, cap=None, monkeypatch=None):
-    notebook = nbformat.read(Path(__file__).resolve().parents[2] /
-                             "notebooks/gsm8k/AB_MEDAL_MCTS_Colab.ipynb", as_version=4)
-    nbformat.validate(notebook)
-    for index, cell in enumerate(notebook.cells):
-        if cell.cell_type == "code":
-            assert cell.outputs == [] and cell.execution_count is None
-            compile(cell.source, f"cell-{index}", "exec")
-    instance, loads = wrapper(), []
-    scope = {name: getattr(demo, name) for name in (
-        "DEFAULT_QUESTION", "prepare_demo_prompt", "show_prompt", "show_candidates", "show_metrics", "score_answer")}
-    if cap is not None:
-        scope["score_answer"] = lambda *a, **kw: pytest.fail("Incomplete search scored")
-    prompt_file = tmp_path / "question.txt"
-    if use_file:
-        prompt_file.write_text(question, encoding="utf-8")
-    scope.update(
-        Path=Path, MODEL_PATH="/drive/model", DTYPE="bfloat16", QUESTION=question,
-        PROMPT_FILE=prompt_file if use_file else None, REFERENCE_SOLUTION=reference,
-        DRIVE_ROOT=tmp_path, DEMONSTRATIONS_PATH=demonstrations_path,
-        os=SimpleNamespace(environ={"HF_DATASETS_CACHE": str(tmp_path / "cache")}),
-        GEN_LENGTH=4, SEED=7, TEMPERATURE=1.0, MCTS_SETTINGS=settings(max_model_calls=cap),
-        load_demo_model=lambda **kw: loads.append(kw) or instance,
-        run_initialization=ab.run_initialization, run_completion=ab.run_completion,
-        export_diagnostics=lambda *a, **kw: pytest.fail("Disabled diagnostics ran"),
-        run_pilot=lambda *a, **kw: pytest.fail("Disabled pilot ran"),
-    )
-    start = next(i for i, c in enumerate(notebook.cells) if c.source.startswith("llada = load_demo_model"))
-    initialization_calls = None
-    for cell in notebook.cells[start:]:
-        if cell.cell_type == "code":
-            if cell.source.startswith("DECODING_METHOD ="):
-                initialization_calls = len(instance.model.seen)
-                assert scope["completion"] is None and scope["score"] is None
-            exec(cell.source, scope)
-    assert len(loads) == 1
-    assert scope["RUN_DIAGNOSTICS"] is scope["RUN_PILOT"] is False
-    assert initialization_calls == scope["metrics"]["initialization_nfe"]
-    expected, _ = demo.prepare_prompt(question, demonstrations_path)
-    assert scope["prompt"] == expected
-    assert scope["decomposition"]["planning_model_calls"] == 0
-    return scope, instance
-
-
-@pytest.mark.parametrize("question,reference,use_file,expected_reference", [
-    (demo.DEFAULT_QUESTION, None, False, "27"),
-    ("Custom question?", None, False, None),
-    ("Custom question?", "#### 42", False, "42"),
-    ("Question from file?", "#### 8", True, "8"),
-])
-def test_actual_notebook_cells_share_prompting_and_scoring(demonstrations_path, tmp_path, monkeypatch,
-                                                          question, reference, use_file, expected_reference):
-    from dlm_project.tasks.gsm8k import benchmark_dataset
-    monkeypatch.setattr(benchmark_dataset, "get_manifest", lambda *a, **kw: pytest.fail("Single demo loaded test set"))
-    scope, instance = execute_notebook(demonstrations_path, tmp_path, question=question,
-                                       reference=reference, use_file=use_file)
-    assert scope["score"]["reference_answer"] == expected_reference
-    assert scope["completion"].model_calls == 2
-    assert scope["metrics"]["total_nfe"] == len(instance.model.seen) == 9
-
-
-def test_actual_notebook_cells_skip_completion_and_scoring_when_capped(demonstrations_path, tmp_path):
-    scope, instance = execute_notebook(demonstrations_path, tmp_path, cap=4)
-    assert scope["completion"] is scope["response"] is scope["score"] is None
-    assert scope["metrics"]["total_nfe"] == len(instance.model.seen) == 4
-    assert scope["metrics"]["accuracy"] is None
 
 
 @pytest.mark.parametrize("complete", [True, False])

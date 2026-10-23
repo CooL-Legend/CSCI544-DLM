@@ -385,9 +385,11 @@ Then complete evaluation and freeze the compared settings.
 
 ### Legacy notebooks
 
-Notebook files are intentionally unchanged. The three E0 notebooks target v4,
+The E0 and MEDAL notebook files remain unchanged. The three E0 notebooks target v4,
 including old condition receipts and single-depth controls; use the CLI above
 for v5. The committed development and MEDAL demo notebooks also contain unresolved
 merge markers and are invalid JSON. They need separate notebook repairs before use.
 The [historical E0 guide](experiment_0/README.md) describes previous protocols
 and must not be used as the v5 execution specification.
+
+The [AB-MEDAL implementation guide](ab_medal_walkthrough.md) describes the aligned serial development workflow and optional batching. Both MEDAL and AB now export `search_trace_v1` node identities and evaluation order for offline depth/subtree allocation analysis; this additive trace schema does not change the shared protocol fingerprint.

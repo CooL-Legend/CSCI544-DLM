@@ -204,9 +204,19 @@ def test_real_decoders_use_the_fixed_matrix_and_rebuild_report(tmp_path, monkeyp
     rows = records(directory)
     assert summary['complete'] and len(rows) == 25
     assert len(model.seen) == sum(r['total_nfes'] for r in rows) + 1
+    calls_before_reporting = len(model.seen)
     assert generate_report(directory)['conditions'] == summary['conditions']
+    assert len(model.seen) == calls_before_reporting
+    assert (directory / 'report' / 'compute_allocation.csv').is_file()
     for row in rows:
         if row['method'] == 'medal':
+            audit = json.loads((directory / row['search_audit_file']).read_text())
+            assert len(audit['nodes']) == row['search_nfes']
+            assert all(n['state_hash'] and n['evaluation_order'] == i for i, n in enumerate(audit['nodes']))
+            allocation = row['search_audit_metrics']
+            assert sum(allocation['nfes_per_depth'].values()) == row['search_nfes']
+            assert allocation['root_analysis_nfes'] + sum(allocation['nfes_per_root_subtree'].values()) == row['search_nfes']
+            assert allocation['decision_counts'] is None
             details = row['details']
             assert row['shortlist_size'] == min(3, row['candidate_count'])
             assert row['selected_depth'] == row['max_depth']

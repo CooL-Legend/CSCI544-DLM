@@ -160,9 +160,10 @@ def run_experiment(source, *, manifest_path=None, output_dir=None, run_manifest=
                      "manifest_hash": digest(manifest)}
     config["provenance"] = _code_identity()
     records, setup = [], {"status": "running", "model_load_count": 0, "warmup_nfes": 0,
-                          "tokenization_seconds": 0.0, "scoring_seconds": 0.0,
+                          "tokenization_seconds": 0.0, "scoring_seconds": 0.0, "offline_analysis_seconds": 0.0,
                           "artifact_writing_seconds": 0.0, "active_total_nfes": 0}
     (directory / "traces").mkdir()
+    (directory / "prompts").mkdir()
     save_json(directory / "config.json", config)
     save_json(directory / "manifest.json", manifest)
     save_json(directory / "selection.json", examples)
@@ -230,6 +231,12 @@ def run_experiment(source, *, manifest_path=None, output_dir=None, run_manifest=
                     setup["tokenization_seconds"] += perf_counter() - started
                     seed = example_seed(example["row_id"], config["decoding"]["seed"])
                     prompt_cache[example["example_id"]] = prompt, prompt_ids, seed
+                    write_started = perf_counter()
+                    save_json(directory / "prompts" / f"{example['example_id'].replace(':', '_')}.json",
+                              {"text": prompt, "prompt_ids": prompt_ids[0].cpu().tolist(),
+                               "mask_id": wrapper.mask_id, "gen_length": config["generation"]["gen_length"],
+                               "prompt_ids_hash": digest(prompt_ids.cpu().tolist())})
+                    setup["artifact_writing_seconds"] += perf_counter() - write_started
                 prompt, prompt_ids, seed = prompt_cache[example["example_id"]]
                 if completed_counts[condition["id"]] == 0:
                     print(f"Starting {condition['id']} on {len(examples)} questions", flush=True)
@@ -289,6 +296,20 @@ def run_experiment(source, *, manifest_path=None, output_dir=None, run_manifest=
                     config["termination"]["token_ids"])
                 score = score_answer(decoded["scoring_text"], example["reference_solution"])
                 setup["scoring_seconds"] += perf_counter() - scoring_started
+                audit_file, audit_metrics = None, None
+                if any(event["stage"] == "node_evaluated" for event in events):
+                    from dlm_project.decoding.search_audit import from_events, metrics as allocation_metrics
+                    analysis_started = perf_counter()
+                    audit = from_events(events, prompt_ids=prompt_ids[0].cpu().tolist(),
+                        mask_id=wrapper.mask_id, gen_length=config["generation"]["gen_length"],
+                        requested_depth=condition["requested_depth"], requested_budget=condition["search_budget"],
+                        search_nfes=search_nfes)
+                    audit_metrics = allocation_metrics(audit)
+                    setup["offline_analysis_seconds"] += perf_counter() - analysis_started
+                    write_started = perf_counter()
+                    audit_file = trace_file.replace(".jsonl", "_audit.json")
+                    save_json(directory / audit_file, audit)
+                    setup["artifact_writing_seconds"] += perf_counter() - write_started
                 row = {**example, "protocol_version": PROTOCOL_VERSION, "condition": condition["id"],
                        "method": condition["method"], "temperature": condition["temperature"],
                        "requested_depth": condition["requested_depth"],
@@ -316,7 +337,8 @@ def run_experiment(source, *, manifest_path=None, output_dir=None, run_manifest=
                        "selection_source": details.get("selection_source", "no_search"),
                        "fallback_decode_used": status == "completed" and details.get("fallback_decode_used", False),
                        "stop_reason": details.get("stop_reason", "all_masks_filled"),
-                       "trace_file": trace_file, "details": details, **decoded, **score}
+                       "trace_file": trace_file, "search_audit_file": audit_file,
+                       "search_audit_metrics": audit_metrics, "details": details, **decoded, **score}
                 write_started = perf_counter()
                 output.write(json.dumps(row, allow_nan=False) + "\n")
                 output.flush()

@@ -56,8 +56,26 @@ python scripts/experiment_0_baseline_test.py --stage test
 
 The existing E0 notebooks remain on the legacy v4 protocol and are not v5
 entry points. The development notebook has pre-existing committed merge
-markers; notebook changes are outside this update. Use the CLI above and
+markers; repairs to those notebooks are outside this update. Use the CLI above and
 consult the [v5 guide](docs/experiments.md) for metrics, artifacts, and migration.
+
+## AB-MEDAL development
+
+The updated [AB-MEDAL notebook](notebooks/gsm8k/AB_MEDAL_MCTS_Colab.ipynb) starts
+with the first frozen development question, depth 7, a 256-forward search budget,
+and serial execution. It uses the shared two-shot prompt, immediate IG, deepest
+empirical-Q selection, and LLaDA Confidence at T=0. It displays all search,
+reward, compute-allocation, and decoding metrics from saved traces, followed by
+optional five-question validation and parity-gated batching at sizes 1, 2, and 4.
+
+```bash
+python scripts/run_ab_medal_single.py --condition A --num-samples 1
+python scripts/run_ab_medal_single.py --condition A --num-samples 5
+```
+
+The [implementation guide](docs/ab_medal_walkthrough.md) explains prompting,
+Student-t GEN/CONT selection, posterior updates, completion, offline metrics,
+and the optional batch study. Formal E1/E3 runners remain separate.
 
 ## Single-prompt MEDAL demo
 

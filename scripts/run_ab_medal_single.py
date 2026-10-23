@@ -1,11 +1,12 @@
-"""Validate one pinned GSM8K example and save the complete Adaptive MEDAL audit.
+"""Run fixed-protocol AB development (default: first dev question, Lc=7, B=256).
 
-Example (CUDA / Colab, target-reaching and uncapped):
-    python scripts/run_ab_medal_single.py --example-index 0 --seed 1 \
-        --Lc 20 --C 3 --K1 3 --K2 5 --output-dir results/ab_medal/single
+Legacy comparison adapters below retain explicit candidate-mode behavior.
 
-Finite synthetic trees test the mechanism on CPU. They do not establish that a
-real DLM reaches the target; metrics.json records that gate separately.
+Example (CUDA / Colab):
+    python scripts/run_ab_medal_single.py --condition A --num-samples 1
+    python scripts/run_ab_medal_single.py --condition A --num-samples 5
+    python scripts/run_ab_medal_single.py --from-result PATH_TO_QUESTION_ARTIFACTS
+
 """
 
 import argparse
@@ -272,7 +273,7 @@ def add_common_arguments(parser):
 
 
 def search_config(args, max_nfe=None, *, adaptive=True):
-    settings = dict(init_tokens=args.Lc, num_candidates=args.C, top_k_tokens=args.K1,
+    settings = dict(stop_mode="candidates", init_tokens=args.Lc, num_candidates=args.C, top_k_tokens=args.K1,
                     top_k_actions=args.K2, max_model_calls=max_nfe)
     if adaptive:
         settings.update(prior_m=args.prior_m, prior_kappa=args.prior_kappa, prior_nu=args.prior_nu,
@@ -301,7 +302,7 @@ def load_inputs(args):
                                "model_load_count": 1, "warmup_model_calls": 0, "warmup_wall_seconds": 0.0}
 
 
-def main(argv=None):
+def legacy_main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     add_common_arguments(parser)
     parser.add_argument("--example-index", type=int, default=0, help="Zero-based pinned GSM8K test index.")
@@ -330,6 +331,12 @@ def main(argv=None):
                          plot_max_nodes=args.plot_max_nodes, plot_max_depth=args.plot_max_depth)
     print(f"Full-target DLM gate: {'observed' if report['full_target_dlm_gate'] else 'NOT satisfied'}", flush=True)
     return 0 if report["status"] == "complete" else 2
+
+
+def main(argv=None):
+    """Current entry point; legacy adapters above serve historical comparisons."""
+    from dlm_project.tasks.gsm8k.ab_development import main as development_main
+    return development_main(argv)
 
 
 if __name__ == "__main__":

@@ -387,6 +387,9 @@ The E0 configuration sets `decoding.completion_method: llada`; the demo reads
 this into `COMPLETION_METHOD`. Its `"llada"` decoder supports T=0 as well as
 positive temperatures. `completion_method="medal"` and the demo's `"medal"`
 sampler retain the original adjusted-score softmax completion (T>0). Existing
-low-level adapter defaults, the legacy CLI, and AB-MEDAL retain their prior
-completion behavior. MCTS action scoring, immediate IG, UCB and backpropagation
-are shared unchanged.
+low-level MEDAL adapter defaults and the legacy CLI retain their prior completion
+behavior. AB-MEDAL now defaults to fixed-budget search and LLaDA Confidence T=0;
+its explicitly requested candidate mode retains historical completion behavior.
+MCTS action scoring, immediate IG, and ordinary reward backups remain shared.
+
+See the [AB-MEDAL implementation guide](../../../docs/ab_medal_walkthrough.md) for the fixed-budget protocol, offline compute-allocation logs, and optional cross-question batching.
