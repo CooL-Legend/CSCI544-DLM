@@ -58,6 +58,7 @@ def plot_tree(tree, path, *, max_nodes=120, max_depth=20):
     if max_nodes < 1 or max_depth < 0:
         raise ValueError("Tree plot limits require max_nodes >= 1 and max_depth >= 0.")
     nodes = {n["node_id"]: n for n in tree["nodes"]}
+    adaptive = any(n.get('posteriors') for n in nodes.values())
     visible = []
 
     def visit(node_id):
@@ -109,7 +110,7 @@ def plot_tree(tree, path, *, max_nodes=120, max_depth=20):
         if node["candidate"]:
             label += "\nTERMINAL CANDIDATE"
         text(x, y, label, "#d1fadf" if node["candidate"] else "#eff4ff")
-        if not node["candidate"]:
+        if adaptive and not node["candidate"]:
             for name, offset in (("GEN", -.23), ("CONT", .23)):
                 count = sum(d["choice"] == name for d in node.get("decisions", []))
                 model = models.get(name)
@@ -123,7 +124,8 @@ def plot_tree(tree, path, *, max_nodes=120, max_depth=20):
             action = child["action"]
             reward = child["immediate_reward"]
             label = f"p{action['output_position']}=t{action['token_id']}\nr={reward:+.3g}" if reward is not None else "unevaluated"
-            edge(x + .23, y - 1.1, positions[child_id], -child["depth"] * 3 + .3, label)
+            edge(x + (.23 if adaptive else 0), y - (1.1 if adaptive else .3),
+                 positions[child_id], -child["depth"] * 3 + .3, label)
         omitted_roots = [c for c in node["children"] if c not in shown]
         if omitted_roots:
             pending, omitted = list(omitted_roots), 0
@@ -134,9 +136,10 @@ def plot_tree(tree, path, *, max_nodes=120, max_depth=20):
             text(x, y - 1.65, f"… {omitted} nodes omitted\n(plot limit)", "#fff1f3", 6)
     axis.set_xlim(-.7, max(positions.values()) + .7)
     axis.set_ylim(-depth * 3 - 2.3, 1)
-    axis.set_title(f"Adaptive MEDAL: {len(visible)}/{len(nodes)} states shown; "
-                   "GEN generates one action, CONT chooses an existing child\n"
-                   "m = posterior location; green = distinct terminal candidate; full tree in tree.json", fontsize=10)
+    mechanism = ('Adaptive MEDAL: GEN/CONT; m = posterior location' if adaptive
+                 else 'MEDAL: UCB selection and retained-sibling expansion rounds')
+    axis.set_title(f"{mechanism}\n{len(visible)}/{len(nodes)} states shown; "
+                   "green = distinct deepest candidate; full tree in tree.json", fontsize=10)
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     FigureCanvasAgg(figure).print_png(str(path))

@@ -1,23 +1,15 @@
 """The interactive demo reuses one initialization and measures actual forwards."""
 
 import json
-from pathlib import Path
 from types import SimpleNamespace
 
-import nbformat
 import pytest
 import torch
 
 from dlm_project.decoding import medal_demo as demo
 from dlm_project.decoding.mcts_decoding import MCTSConfig
-from dlm_project.decoding.decoder_result import CountingModel
-from dlm_project.decoding.medal_no_search import decode as decode_medal_no_search
-from dlm_project.experiments.config import load_config
 from dlm_project.experiments.manifests import digest
-from dlm_project.models.profiles import get_profile
-from dlm_project.tasks.gsm8k.e0_tokens import decode_output, resolve_termination_tokens
 from tests.decoding.helpers import FakeModel, FakeTokenizer, MASK, PROMPT
-from tests.tasks.test_e0_dataset import Tokenizer as E0Tokenizer
 
 
 @pytest.fixture
@@ -175,75 +167,7 @@ def test_cli_runs_one_question_without_an_evaluation(demonstrations_path, tmp_pa
     assert "accuracy" not in output.lower()
 
 
-@pytest.mark.parametrize("question", ["A custom question?", demo.DEFAULT_QUESTION])
-@pytest.mark.parametrize("budget", [1, 12])
-def test_notebook_action_cells_run_with_one_model(demonstrations_path, tmp_path, question, budget):
-    root = Path(__file__).resolve().parents[2]
-    notebook = nbformat.read(root / "notebooks/gsm8k/MEDAL_MCTS_Demo.ipynb", as_version=4)
-    nbformat.validate(notebook)
-    assert [cell.id for cell in notebook.cells] == [
-        "0fb94d89", "5a532510", "05cd374e", "2bda1f2f", "b0cdc487", "422b92ec", "9b56c23c",
-        "3e50fa7b", "8e2fb8a6", "1a98942a", "cc6e8808", "46d5d403",
-        "medal-no-search-heading", "medal-no-search-decode", "medal-no-search-output", "medal-no-search-metrics",
-        "292fe0aa", "ec0e6744",
-        "5a5fdb7d", "02b7b325", "f0d6e2ee", "9faf852b", "e71f242e", "2b576fd9", "score-answer",
-        "7741b4d8", "3ae77c20", "runtime-explanation", "runtime-costs", "batch-description",
-        "batch-settings", "run-batch", "batch-summary",
-    ]
-    for index, cell in enumerate(notebook.cells):
-        if cell.cell_type == "code":
-            assert cell.outputs == [] and cell.execution_count is None
-            compile(cell.source, f"cell-{index}", "exec")
-    # Execute the actual action cells with a controlled model, not copied orchestration.
-    model, tokenizer = FakeModel(lambda _: [0, .45, .35, .1, .06, .04]), E0Tokenizer()
-    prompts = []
-    wrapper = SimpleNamespace(model=model, tokenizer=tokenizer, mask_id=MASK,
-                              encode_prompt=lambda text: prompts.append(text) or PROMPT.clone())
-    loads = []
-    scope = {name: getattr(demo, name) for name in (
-        "prepare_demo_prompt", "show_prompt", "run_initialization", "show_candidates", "show_metrics", "run_completion",
-        "score_answer", "show_no_search_metrics")}
-    scope.update(Path=Path, REPO_DIR=root, get_profile=get_profile, load_config=load_config,
-                 MCTSConfig=MCTSConfig, DEFAULT_QUESTION=demo.DEFAULT_QUESTION, DRIVE_ROOT=tmp_path,
-                 run_demo_batch=lambda *a, **kw: pytest.fail("Disabled batch must not run"),
-                 DEMONSTRATIONS_PATH=demonstrations_path, os=SimpleNamespace(environ={"HF_DATASETS_CACHE": "cache"}),
-                 resolve_termination_tokens=resolve_termination_tokens,
-                 decode_medal_no_search=decode_medal_no_search, CountingModel=CountingModel, decode_output=decode_output,
-                 load_demo_model=lambda **kw: loads.append(kw) or wrapper)
-    exec(next(cell.source for cell in notebook.cells if cell.id == "3e50fa7b"), scope)
-    assert scope["SEARCH_BUDGET"] == 512 and scope["MCTS_SETTINGS"].init_tokens == 5
-    assert scope["COMPLETION_METHOD"] == "llada"
-    assert scope["TEMPERATURE"] == 0.0
-    assert scope["MCTS_SETTINGS"].stop_mode == "budget" and scope["MCTS_SETTINGS"].max_simulations is None
-    scope.update(MODEL_PATH="/drive/model", QUESTION=question, GEN_LENGTH=8, SEED=7,
-                 MCTS_SETTINGS=MCTSConfig(init_tokens=2, num_candidates=3, top_k_tokens=2, top_k_actions=3,
-                                          stop_mode="budget", max_model_calls=budget))
-    start = next(i for i, cell in enumerate(notebook.cells) if cell.source.startswith("llada = load_demo_model"))
-    for cell in notebook.cells[start:]:
-        if cell.cell_type == "code":
-            assert len(cell.source.splitlines()) <= 5
-            if cell.id == "ec0e6744":
-                assert "initialization" not in scope
-                assert scope["no_search"].total_nfes == len(model.seen) == scope["GEN_LENGTH"]
-                assert scope["no_search_metrics"]["search_nfes"] == 0
-            exec(cell.source, scope)
-    assert len(loads) == 1
-    assert len(model.seen) == scope["no_search"].total_nfes + scope["metrics"]["total_nfe"]
-    assert scope["metrics"]["total_nfe"] == scope["metrics"]["total_nfes"]
-    assert scope["initialization"].result.stats["search_model_calls"] == budget
-    assert scope["completion"].model_calls == 8 - scope["metrics"]["selected_depth"]
-    assert scope["prompt"] == prompts[0] and scope["prompt"].endswith(f"Problem: {question}")
-    assert "Example 1:" in scope["prompt"] and "Example 2:" in scope["prompt"]
-    assert scope["response"] == scope["completion"].decoded_output["scoring_text"]
-    assert scope["completion"].method == scope["no_search"].details["completion_method"] == "llada"
-    assert scope["no_search"].details["temperature"] == 0.0
-    assert all(node.action.token_id not in scope["TERMINATION_IDS"] for node in scope["initialization"].search.nodes[1:])
-    assert scope["metrics"]["fallback_decode_used"] == (budget == 1)
-    if budget == 1:
-        assert torch.equal(scope["no_search"].token_ids, scope["completion"].token_ids)
-    assert scope["no_search_score"]["reference_answer"] == scope["score"]["reference_answer"]
-    assert scope["score"]["reference_answer"] == ("27" if question == demo.DEFAULT_QUESTION else None)
-    assert scope["RUN_BATCH"] is False
+# Frozen-input notebook execution is covered by workflows/test_medal_development.py.
 
 
 def test_prompt_timing_separates_setup_and_adds_no_forwards(demonstrations_path, monkeypatch):

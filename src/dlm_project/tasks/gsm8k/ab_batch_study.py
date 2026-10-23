@@ -8,11 +8,10 @@ from statistics import median
 import torch
 
 from dlm_project.decoding.ab_batch import pack_states, sync
-from dlm_project.decoding.ab_medal import ABMEDALConfig
 from dlm_project.decoding.mcts_decoding import distribution_from_logits, model_device
 from dlm_project.experiments.artifacts import save_json
 from dlm_project.experiments.sweep_report import write_csv, percentile
-from dlm_project.tasks.gsm8k.ab_development import run_samples, warmup
+from dlm_project.tasks.gsm8k.ab_development import run_samples, warmup, search_config
 from dlm_project.tasks.gsm8k.experiment_protocol import load_samples
 
 RTOL, ATOL = 1e-4, 1e-5
@@ -29,6 +28,8 @@ def compare_runs(reference, candidate):
         differences.append('Different question counts')
     for left, right in zip(left_rows, right_rows):
         name = left['example_id']
+        if left.get('method', 'ab_medal') != right.get('method', 'ab_medal'):
+            differences.append(f'{name}: initialization method')
         for key in ('example_id', 'seed', 'prompt_ids_hash', 'selected_node_id', 'selected_state_ids',
                     'selected_depth', 'search_nfes', 'completion_nfes', 'correct'):
             if left[key] != right[key]:
@@ -87,7 +88,7 @@ def padding_probe(wrapper, prepared, ctx, baseline, batch_size):
     """Unpadded vs padded-serial vs batched predictions on identical saved states."""
     rows, calls, nfes = [], 0, 0
     device = model_device(wrapper.model)
-    config = ABMEDALConfig(**ctx['search'])
+    config = search_config(ctx)
 
     def forward(ids, attention=None):
         nonlocal calls, nfes
@@ -242,5 +243,5 @@ def _plot(rows, directory):
         present = [r for r in good if r[key] is not None]
         axis.bar([str(r['batch_size']) for r in present], [r[key] / (2**30 if key.endswith('bytes') else 1) for r in present])
         axis.set(xlabel='Independent questions per batch', ylabel=label)
-    figure.suptitle('AB batching: parity-validated trials only')
+    figure.suptitle('Search batching: parity-validated trials only')
     FigureCanvasAgg(figure).print_png(str(directory / 'batch_comparison.png'))

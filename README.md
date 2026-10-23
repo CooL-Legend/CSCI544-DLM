@@ -79,9 +79,15 @@ and the optional batch study. Formal E1/E3 runners remain separate.
 
 ## Single-prompt MEDAL demo
 
-Use [MEDAL_MCTS_Demo.ipynb](notebooks/gsm8k/MEDAL_MCTS_Demo.ipynb) for one E0-style MEDAL run. It loads one model from the runtime, Drive, or the pinned Hub checkpoint and uses the fixed pens/muffins prompt. Before MCTS, the no-search block runs standard LLaDA completion from all masks and displays its independent outputs, NFE/runtime and accuracy metrics. Defaults for searched MEDAL are target depth 5 and a 512-forward search budget; set `SEARCH_BUDGET` to 1024 or 2048 for larger runs. Live counters show actual search NFEs/budget, evaluated depth and candidate count. The existing cells inspect up to three cached candidates or the selected fallback, then complete that state. The control and search share the model, prompt and completion seed; the control's cost is kept separate from searched MEDAL's totals.
-
-The completion cell reuses the same initialization and defaults to `method="llada"` (Gumbel token proposals and low-confidence remasking); `"medal"` selects the prior adjusted-score sampler, and custom callables or `"my_sampler:decode"` remain supported. Each sampler receives a fresh partial-state copy; the helper counts its actual forwards and checks that it preserves the prompt and initialized tokens. Search excludes EOS/EOT; completion fills all positions and retains full outputs while scoring the prefix before the first terminator. Reports include stage costs, search/completion/total NFEs and runtime, budget utilization, depths, shortlist/fallback status, parse success and reference-based accuracy with a Wilson interval. An optional 10-question batch reuses the model and saves aggregate metrics.
+The [MEDAL notebook](notebooks/gsm8k/MEDAL_MCTS_Demo.ipynb) mirrors the
+[AB-MEDAL notebook](notebooks/gsm8k/AB_MEDAL_MCTS_Colab.ipynb): same first frozen
+development question, prompt, settings, candidate selection, Confidence T=0
+completion, metrics and optional batch study. Defaults are n=1, Lc=7, search
+budget=256 and batch size=1. Only initialization changes: MEDAL uses the existing
+UCB search and retained-sibling rounds; AB uses Student-t GEN/CONT. MEDAL's
+GEN/CONT fields are unavailable. Both export identical offline audit schemas.
+See the [notebook alignment guide](docs/medal_notebook.md) for the shared workflow,
+serial validation and parity-gated batching at sizes 1, 2 and 4.
 
 The separate CLI retains its original prompt, depth-20 quota defaults and sampler interface:
 

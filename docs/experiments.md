@@ -385,10 +385,11 @@ Then complete evaluation and freeze the compared settings.
 
 ### Legacy notebooks
 
-The E0 and MEDAL notebook files remain unchanged. The three E0 notebooks target v4,
+The E0 experiment notebook files remain unchanged. The three E0 notebooks target v4,
 including old condition receipts and single-depth controls; use the CLI above
-for v5. The committed development and MEDAL demo notebooks also contain unresolved
-merge markers and are invalid JSON. They need separate notebook repairs before use.
+for v5. The committed E0 development notebook still contains unresolved merge markers
+and needs separate repair before use. The [MEDAL demo](medal_notebook.md) now
+mirrors the AB notebook with UCB initialization and the current shared settings.
 The [historical E0 guide](experiment_0/README.md) describes previous protocols
 and must not be used as the v5 execution specification.
 

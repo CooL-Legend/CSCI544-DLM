@@ -1,4 +1,4 @@
-"""Cooperative AB-MEDAL across independent questions, with actual batched forwards.
+"""Cooperative MEDAL/AB-MEDAL questions, with actual batched forwards.
 
 One outstanding root/child per tree. Search decisions are never speculative.
 This executor does not select questions, construct prompts, or inspect answers.
@@ -11,7 +11,8 @@ import torch
 
 from dlm_project.decoding.ab_medal import ABMEDALConfig, ABMEDALSearch
 from dlm_project.decoding.common import commit_from_logits
-from dlm_project.decoding.mcts_decoding import CompletionResult, model_device
+from dlm_project.decoding.mcts_decoding import CompletionResult, MCTSConfig, model_device
+from dlm_project.decoding.medal_batch import CooperativeMEDALSearch
 
 
 def sync(model):
@@ -82,11 +83,12 @@ def run_group(model, prompts, mask_id, config, *, seeds, pad_token_id,
     """
     if not prompts or len(prompts) != len(seeds):
         raise ValueError('Supply one seed for each question.')
-    if not isinstance(config, ABMEDALConfig) or config.stop_mode != 'budget':
-        raise ValueError('Batched AB requires a fixed-budget ABMEDALConfig.')
+    if not isinstance(config, MCTSConfig) or config.stop_mode != 'budget':
+        raise ValueError('Batched search requires a fixed-budget MCTSConfig.')
     if pad_token_id == mask_id:
         raise ValueError('Padding must not use the output mask token.')
-    trees = [ABMEDALSearch(model, ids, mask_id, 256, config, seed=seed,
+    search_class = ABMEDALSearch if isinstance(config, ABMEDALConfig) else CooperativeMEDALSearch
+    trees = [search_class(model, ids, mask_id, 256, config, seed=seed,
                           search_excluded_token_ids=search_excluded_token_ids, tokenizer=tokenizer)
              for ids, seed in zip(prompts, seeds)]
     return execute_trees(trees, pad_token_id=pad_token_id)

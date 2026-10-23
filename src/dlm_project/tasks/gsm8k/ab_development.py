@@ -1,4 +1,8 @@
-"""Frozen-input AB development walkthrough; formal E1/E3 runners are separate."""
+"""Shared frozen-input MEDAL/AB walkthrough; formal E1/E3 runners are separate.
+
+The historical module name remains import-compatible. Only initialization is
+method-specific; prompting, completion, scoring, metrics and exports are shared.
+"""
 
 import argparse
 from dataclasses import asdict
@@ -9,7 +13,8 @@ from time import perf_counter
 import torch
 
 from dlm_project.decoding.ab_medal import ABMEDALConfig, ABMEDALSearch
-from dlm_project.decoding.ab_medal_demo import run_completion
+from dlm_project.decoding.medal_demo import run_completion
+from dlm_project.decoding.mcts_decoding import MCTSConfig, MCTSSearch
 from dlm_project.decoding.ab_batch import run_group, sync
 from dlm_project.decoding import search_audit
 from dlm_project.experiments.artifacts import save_json
@@ -23,7 +28,7 @@ from dlm_project.tasks.gsm8k.evaluation import score_answer
 IMPLEMENTATION_VERSION = 'ab_medal_fixed_budget_v2'
 
 
-def context(*, stage='dev', condition='A', indices=(0,)):
+def context(*, stage='dev', condition='A', indices=(0,), method='ab_medal'):
     """Validate frozen inputs before loading a model. Subsets are diagnostics."""
     common = load_shared_protocol()
     manifest = get_manifest(common=common)
@@ -35,13 +40,22 @@ def context(*, stage='dev', condition='A', indices=(0,)):
     selected = next((c for c in common['search']['conditions'] if c['label'] == condition), None)
     if selected is None:
         raise ValueError('Condition must be A, B, C, or D.')
-    config = ABMEDALConfig(**common['decoding']['mcts'], init_tokens=selected['depth'],
-                           max_model_calls=selected['budget'])
-    return dict(implementation_version=IMPLEMENTATION_VERSION, common=common,
+    if method not in ('medal', 'ab_medal'):
+        raise ValueError('Initialization method must be medal or ab_medal.')
+    config_class = ABMEDALConfig if method == 'ab_medal' else MCTSConfig
+    config = config_class(**common['decoding']['mcts'], init_tokens=selected['depth'],
+                          max_model_calls=selected['budget'], stop_mode='budget')
+    return dict(implementation_version=IMPLEMENTATION_VERSION if method == 'ab_medal' else 'medal_fixed_budget_v5',
+                method=method, common=common,
                 common_protocol_hash=digest(common), prompt_template_hash=digest(common['prompt']['template']),
                 stage=stage, condition=condition, search=asdict(config),
                 examples=[examples[i] for i in indices], run_type='development_diagnostic',
                 manifest_hash=digest(manifest), setup={})
+
+
+def search_config(ctx):
+    config_class = ABMEDALConfig if ctx.get('method', 'ab_medal') == 'ab_medal' else MCTSConfig
+    return config_class(**ctx['search'])
 
 
 def validate_model(wrapper, ctx):
@@ -61,11 +75,12 @@ def validate_context(ctx):
         if example not in rows:
             raise ValueError('Development samples must retain their frozen contents and identities.')
         indices.append(rows.index(example))
-    expected = context(stage=ctx['stage'], condition=ctx['condition'], indices=tuple(indices))
+    expected = context(stage=ctx['stage'], condition=ctx['condition'], indices=tuple(indices),
+                       method=ctx.get('method', 'ab_medal'))
     for key in ('implementation_version', 'common', 'common_protocol_hash', 'prompt_template_hash',
                 'search', 'examples', 'manifest_hash', 'run_type'):
         if ctx[key] != expected[key]:
-            raise ValueError(f'Frozen AB development setting changed: {key}.')
+            raise ValueError(f'Frozen development setting changed: {key}.')
 
 
 def validate_prepared(wrapper, prepared, ctx, *, complete_stage=True):
@@ -141,8 +156,9 @@ def warmup(wrapper, prepared, ctx, *, batch_size=1):
 def initialize(wrapper, prepared, ctx, directory=None):
     validate_prepared(wrapper, [prepared], ctx, complete_stage=False)
     from dlm_project.decoding.medal_demo import InitializationResult
-    search = ABMEDALSearch(wrapper.model, prepared['ids'], wrapper.mask_id, 256,
-        config=ABMEDALConfig(**ctx['search']), seed=prepared['seed'], tokenizer=wrapper.tokenizer,
+    search_class = ABMEDALSearch if ctx.get('method', 'ab_medal') == 'ab_medal' else MCTSSearch
+    search = search_class(wrapper.model, prepared['ids'], wrapper.mask_id, 256,
+        config=search_config(ctx), seed=prepared['seed'], tokenizer=wrapper.tokenizer,
         search_excluded_token_ids=ctx['termination']['token_ids'])
     sync(wrapper.model)
     started = perf_counter()
@@ -162,6 +178,8 @@ def initialize(wrapper, prepared, ctx, directory=None):
 
 def complete(wrapper, prepared, initialization, ctx, directory=None):
     validate_prepared(wrapper, [prepared], ctx, complete_stage=False)
+    if not initialization.search.done:
+        raise ValueError('Finish the search before completing its selected state.')
     class Counter:
         calls = 0
         def __init__(self):
@@ -223,7 +241,7 @@ def export_question(wrapper, prepared, ctx, search, completion, directory, *,
     audit = search_audit.from_events(events, prompt_ids=prepared['prompt_ids'], mask_id=wrapper.mask_id,
         gen_length=256, requested_depth=ctx['search']['init_tokens'],
         requested_budget=ctx['search']['max_model_calls'], search_nfes=search.model_calls,
-        adaptive=ctx['search']['search_policy'] == 'gaussian')
+        adaptive=ctx['search'].get('search_policy') == 'gaussian')
     metrics = search_audit.metrics(audit)
     result = search.result() if search.root.analysis is not None else None
     completion_nfes = completion.model_calls if completion is not None else (completion_attempts or 0)
@@ -236,7 +254,8 @@ def export_question(wrapper, prepared, ctx, search, completion, directory, *,
             raise RuntimeError('Completion NFE accounting failed.')
     if search.model_calls > ctx['search']['max_model_calls']:
         raise RuntimeError('Search exceeded its forward budget.')
-    record = dict(**metrics, example_id=prepared['example']['example_id'], condition=ctx['condition'],
+    record = dict(**metrics, method=ctx.get('method', 'ab_medal'),
+        example_id=prepared['example']['example_id'], condition=ctx['condition'],
         common_protocol_hash=ctx['common_protocol_hash'], prompt_ids_hash=prepared['prompt_ids_hash'],
         prompt_hash=prepared['prompt_hash'], prompt_template_hash=prepared['prompt_template_hash'],
         seed=prepared['seed'], status=status, error=error, batch_size=batch_size, group_id=group_id,
@@ -274,11 +293,13 @@ def export_question(wrapper, prepared, ctx, search, completion, directory, *,
     tree = []
     for row in audit['nodes']:
         node = search.nodes[row['node_id']]
-        tree.append({**row, 'children': [c.node_id for c in node.children if c.analysis is not None],
-                     'candidate': row['node_id'] in (audit['selection'] or {}).get('candidate_ids', []),
-                     'posteriors': {key: asdict(p) for key, p in search.posteriors[row['node_id']].items()},
-                     'decisions': search.decision_history[row['node_id']]})
-    save_json(directory / 'tree.json', dict(nodes=tree, statistics=metrics))
+        item = {**row, 'children': [c.node_id for c in node.children if c.analysis is not None],
+                'candidate': row['node_id'] in (audit['selection'] or {}).get('candidate_ids', [])}
+        if hasattr(search, 'posteriors'):
+            item.update(posteriors={key: asdict(p) for key, p in search.posteriors[row['node_id']].items()},
+                        decisions=search.decision_history[row['node_id']])
+        tree.append(item)
+    save_json(directory / 'tree.json', dict(method=ctx.get('method', 'ab_medal'), nodes=tree, statistics=metrics))
     return record
 
 
@@ -305,6 +326,9 @@ def show_metrics(record):
     }
     for group, keys in groups.items():
         print(group)
+        if group == 'Adaptive decisions' and record.get('decision_counts') is None:
+            print('  Unavailable: MEDAL uses UCB sibling rounds and has no GEN/CONT decisions.')
+            continue
         for key in keys:
             print(f'  {key}: {record.get(key)}')
     return record
@@ -326,7 +350,7 @@ def plot_metrics(directory):
     FigureCanvasAgg(figure).print_png(str(directory / 'compute_allocation.png'))
     tree = json.loads((directory / 'tree.json').read_text())
     if tree['nodes']:
-        plot_tree(tree, directory / 'ab_medal_tree.png', max_nodes=120, max_depth=10)
+        plot_tree(tree, directory / f"{tree.get('method', 'ab_medal')}_tree.png", max_nodes=120, max_depth=10)
     return directory / 'compute_allocation.png'
 
 
@@ -359,7 +383,7 @@ def run_samples(wrapper, prepared, ctx, directory, *, batch_size=1):
         for group_id, offset in enumerate(range(0, len(prepared), batch_size)):
             items = prepared[offset:offset + batch_size]
             run = run_group(wrapper.model, [p['ids'] for p in items], wrapper.mask_id,
-                ABMEDALConfig(**ctx['search']), seeds=[p['seed'] for p in items], pad_token_id=ctx['pad_token_id'],
+                search_config(ctx), seeds=[p['seed'] for p in items], pad_token_id=ctx['pad_token_id'],
                 search_excluded_token_ids=ctx['termination']['token_ids'], tokenizer=wrapper.tokenizer)
             groups.append(run.metrics)
             _jsonl(directory / f'group_{group_id}_forwards.jsonl', run.forwards)

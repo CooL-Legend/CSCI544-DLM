@@ -8,6 +8,8 @@ its forward budget. It does not change the prompt, reward, or final decoder.
 The first development run uses one frozen development question, depth 7, search
 budget 256, and one question at a time. The formal E1/E3 runners are separate.
 Optional batching is an implementation study, not an algorithmic treatment.
+The [matched MEDAL notebook](medal_notebook.md) now shares the executable
+walkthrough, changing only the initialization selector to UCB MEDAL.
 
 Entry points:
 
@@ -375,7 +377,8 @@ per-question latencies overlap and must not be summed. Model loading, warm-up,
 tokenization, scoring, offline analysis, plotting, and disk writes are separate.
 The local CPU fixtures establish implementation behavior, not GPU speedup.
 Future MEDAL-versus-AB algorithmic comparisons must use matched execution
-conditions; serial remains the default until both batching paths are validated.
+conditions; serial remains the default until both batching paths pass real
+LLaDA CUDA validation. Both paths have CPU stub parity tests.
 
 ## 10. Development commands and checks
 
