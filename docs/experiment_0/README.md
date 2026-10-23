@@ -351,7 +351,7 @@ changed beforehand.
 For a current single-sample MEDAL run, use
 [`MEDAL_MCTS_Demo.ipynb`](../../notebooks/gsm8k/MEDAL_MCTS_Demo.ipynb).
 It now follows the [matched MEDAL/AB development workflow](../medal_notebook.md):
-first frozen development question, Lc=7, search budget=256, Confidence T=0,
+first frozen development question, Lc=10, search budget=256, Confidence T=0,
 common offline metrics and optional parity-validated independent-question
 batching. The historical defaults in this document do not apply to that
 notebook. The standalone `demo_medal.py` CLI retains its legacy interfaces.

@@ -71,7 +71,7 @@ def test_budget_continues_beyond_three_candidates_and_has_zero_candidate_scoring
 
 
 @pytest.mark.parametrize("cap,source,count", [(1, "root", 1), (2, "deepest_evaluated", 1),
-                                            (5, "target_depth", 1), (6, "target_depth", 2),
+                                            (5, "deepest_evaluated", 3), (6, "deepest_evaluated", 3),
                                             (12, "target_depth", 3)])
 def test_shortlists_and_fallback_are_distinct_from_quota_shortfalls(cap, source, count):
     search = MCTSSearch(FakeModel(), PROMPT, MASK, 4, settings(max_model_calls=cap))
@@ -83,8 +83,8 @@ def test_shortlists_and_fallback_are_distinct_from_quota_shortfalls(cap, source,
     assert result.stats["fallback_decode_used"] == (source != "target_depth")
     assert result.selected is search.root or result.selected.immediate_reward is not None
     if source == "deepest_evaluated":
-        eligible = [n for n in search.nodes if n.immediate_reward is not None]
-        assert result.selected is min(eligible, key=lambda n: (-n.depth, -n.mean_reward, n.node_id))
+        eligible = [n for n in search.nodes if n.immediate_reward is not None and n.depth == result.selected.depth]
+        assert result.selected is min(eligible, key=lambda n: (-n.mean_reward, n.node_id))
     if cap <= 6:
         with pytest.raises(SearchIncompleteError):
             MCTSSearch(FakeModel(), PROMPT, MASK, 4, settings(max_model_calls=cap, stop_mode="candidates")).run()

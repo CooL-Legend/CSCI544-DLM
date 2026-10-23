@@ -37,11 +37,13 @@ Install the package with `python -m pip install --no-deps -e .` after installing
 ## Experiment 0: fixed-budget GSM8K baseline test
 
 [The shared experiment guide](docs/experiments.md) defines the fixed inputs for
-E0/E1/E2 and the implemented E0 v5 runner. One confidence baseline is compared
-with MEDAL at (Lc, B) = (7, 256), (7, 512), (10, 512), and (10, 1024).
+E0/E1/E2 and the implemented E0 v6 runner. One confidence baseline is compared
+with MEDAL at (Lc, B) = (10, 256), (10, 512), and (10, 1024).
 All conditions use the same two-shot prompt, 256 output tokens, and LLaDA
-Confidence completion at T=0. Search collects every distinct deepest state,
-ranks by mean backed-up reward, retains up to three, and completes only rank 1.
+Confidence completion at T=0. Search collects distinct states at the deepest depth
+having at least C distinct nodes (falling back to the depth with the most distinct states,
+breaking ties towards deeper depths), ranks by mean backed-up reward, retains up to
+three, and completes only rank 1.
 
 The checked-in manifest freezes 5 dev and 20 evaluation questions from train
 and 200 test questions. All stages load these same inputs offline. The common
@@ -54,17 +56,15 @@ python scripts/experiment_0_baseline_test.py --stage evaluation
 python scripts/experiment_0_baseline_test.py --stage test
 ```
 
-The existing E0 notebooks remain on the legacy v4 protocol and are not v5
-entry points. The development notebook has pre-existing committed merge
-markers; repairs to those notebooks are outside this update. Use the CLI above and
-consult the [v5 guide](docs/experiments.md) for metrics, artifacts, and migration.
+The existing E0 notebooks are aligned with the v6 protocol. Use the CLI above and
+consult the [v6 guide](docs/experiments.md) for metrics, artifacts, and migration.
 
 ## AB-MEDAL development
 
 The updated [AB-MEDAL notebook](notebooks/gsm8k/AB_MEDAL_MCTS_Colab.ipynb) starts
-with the first frozen development question, depth 7, a 256-forward search budget,
+with the first frozen development question, depth 10, a 256-forward search budget,
 and serial execution. It uses the shared two-shot prompt, immediate IG, deepest
-empirical-Q selection, and LLaDA Confidence at T=0. It displays all search,
+qualified empirical-Q selection, and LLaDA Confidence at T=0. It displays all search,
 reward, compute-allocation, and decoding metrics from saved traces, followed by
 optional five-question validation and parity-gated batching at sizes 1, 2, and 4.
 
@@ -82,7 +82,7 @@ and the optional batch study. Formal E1/E3 runners remain separate.
 The [MEDAL notebook](notebooks/gsm8k/MEDAL_MCTS_Demo.ipynb) mirrors the
 [AB-MEDAL notebook](notebooks/gsm8k/AB_MEDAL_MCTS_Colab.ipynb): same first frozen
 development question, prompt, settings, candidate selection, Confidence T=0
-completion, metrics and optional batch study. Defaults are n=1, Lc=7, search
+completion, metrics and optional batch study. Defaults are n=1, Lc=10, search
 budget=256 and batch size=1. Only initialization changes: MEDAL uses the existing
 UCB search and retained-sibling rounds; AB uses Student-t GEN/CONT. MEDAL's
 GEN/CONT fields are unavailable. Both export identical offline audit schemas.

@@ -66,7 +66,7 @@ def test_live_progress_matches_evaluations_and_excludes_printing_time(monkeypatc
 
 
 @pytest.mark.parametrize('cap,source,shortlist', [(1, 'root', 1), (2, 'deepest_evaluated', 1),
-                                               (5, 'target_depth', 1), (6, 'target_depth', 2),
+                                               (5, 'deepest_evaluated', 3), (6, 'deepest_evaluated', 3),
                                                (12, 'target_depth', 3), (100, 'target_depth', 3)])
 def test_demo_shortlist_fallback_metrics_and_completion_counts(cap, source, shortlist, capsys):
     model, events = FakeModel(), []

@@ -162,22 +162,42 @@ def _state_key(state):
     return tuple(state[0].tolist())
 
 
-def select_deepest_candidates(nodes, limit=3):
-    """All deepest evaluated states, first-occurrence deduplication, mean-Q ranking.
+CANDIDATE_SELECTION_VERSION = "deepest_with_c_distinct_mean_q_v2"
 
-    The analyzed root is the only eligible zero-visit state. This helper does
-    not mutate the tree, pool transpositions, or invoke the model.
+
+def select_candidate_depth(distinct_counts, limit):
+    """Deepest depth with >= limit distinct states, else the most-populated depth.
+
+    distinct_counts maps depth -> number of distinct evaluated states. Fallback
+    ties prefer the deeper depth. Shared by live search and offline audits.
+    """
+    if not distinct_counts or type(limit) is not int or limit < 1:
+        raise ValueError("Depth selection requires distinct-state counts and a positive limit.")
+    qualified = [depth for depth, count in distinct_counts.items() if count >= limit]
+    if qualified:
+        return max(qualified)
+    return max(distinct_counts, key=lambda depth: (distinct_counts[depth], depth))
+
+
+def select_deepest_candidates(nodes, limit=3):
+    """Distinct states at the deepest depth holding >= limit of them; mean-Q ranking.
+
+    limit is C. Depth d* is the deepest depth with at least C distinct evaluated
+    states; when no depth qualifies, d* is the depth with the most distinct
+    states (deeper wins ties). States at d* use first-occurrence deduplication
+    and are ranked by backed-up mean reward. The analyzed root is the only
+    eligible zero-visit state. This helper does not mutate the tree, pool
+    transpositions, or invoke the model.
     """
     eligible = [n for n in nodes if n.analysis is not None
                 and (n.parent is None or n.immediate_reward is not None)]
     if not eligible or type(limit) is not int or limit < 1:
         raise ValueError("Selection requires evaluated nodes and a positive shortlist limit.")
-    depth = max(n.depth for n in eligible)
-    distinct = {}
+    by_depth = {}
     for node in sorted(eligible, key=lambda n: n.node_id):
-        if node.depth == depth:
-            distinct.setdefault(_state_key(node.state), node)
-    candidates = list(distinct.values())
+        by_depth.setdefault(node.depth, {}).setdefault(_state_key(node.state), node)
+    depth = select_candidate_depth({d: len(states) for d, states in by_depth.items()}, limit)
+    candidates = list(by_depth[depth].values())
     shortlist = sorted(candidates, key=lambda n: (-n.mean_reward, n.node_id))[:limit]
     return candidates, shortlist
 
@@ -649,7 +669,9 @@ class MCTSSearch:
         if self.config.stop_mode == "budget":
             assumptions.update(
                 quota="stop at the forward cap or exhausted frontier; no candidate quota",
-                candidate_evaluation="all deepest evaluated states; first-occurrence deduplication; cached mean rewards",
+                candidate_evaluation=("deepest depth with at least C distinct evaluated states (else the most "
+                                      "populated depth, deeper on ties); first-occurrence deduplication; "
+                                      "cached mean rewards"),
             )
         return assumptions
 
@@ -671,6 +693,7 @@ class MCTSSearch:
                    shortlist_ids=[row["node_id"] for row in result.stats["candidate_shortlist"]],
                    selected_node_id=result.selected.node_id, selected_depth=result.selected.depth,
                    stop_reason=reason, fallback=result.selected.depth < self.config.init_tokens,
+                   candidate_selection_version=result.stats["candidate_selection_version"],
                    root_action_count=len(self.root.analysis.actions),
                    node_statistics=[{"node_id": n.node_id, "visits": n.visits,
                                      "reward_sum": n.reward_sum, "q_value": n.mean_reward}
@@ -812,9 +835,10 @@ class MCTSSearch:
         # Additive metadata: preserve legacy fallback_used (quota shortfall) for
         # old callers. E0 distinguishes that from actually decoding below Lc.
         shortlist = sorted(candidates, key=lambda n: (-n.mean_reward, n.node_id))[:self.config.num_candidates]
-        source = "target_depth" if selected.depth == self.config.init_tokens else "deepest_evaluated" if evaluated else "root"
+        source = ("target_depth" if selected.depth == self.config.init_tokens
+                  else "deepest_evaluated" if evaluated else "root")
         stats.update(search_excluded_token_ids=list(self.search_excluded_token_ids),
-                     candidate_selection_version="deepest_mean_q_v1" if self.config.stop_mode == "budget" else "target_mean_q_v1",
+                     candidate_selection_version=CANDIDATE_SELECTION_VERSION if self.config.stop_mode == "budget" else "target_mean_q_v1",
                      candidate_shortlist=[candidate_value_record(n) for n in shortlist],
                      shortlist_size=len(shortlist), shortlist_underfilled=len(shortlist) < self.config.num_candidates,
                      selection_source=source, fallback_decode_used=source != "target_depth")

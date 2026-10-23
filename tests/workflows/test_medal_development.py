@@ -33,7 +33,7 @@ def test_notebooks_have_identical_code_except_initialization_selector():
             assert left.source == right.source
 
 
-@pytest.mark.parametrize('condition', ['A', 'B', 'C', 'D'])
+@pytest.mark.parametrize('condition', ['A', 'B', 'C'])
 def test_all_common_inputs_and_configurations_match_ab(condition):
     ab = dev.context(condition=condition)
     medal = dev.context(condition=condition, method='medal')

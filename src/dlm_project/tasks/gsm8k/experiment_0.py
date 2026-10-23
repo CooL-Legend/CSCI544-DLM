@@ -1,4 +1,4 @@
-"""E0: one confidence baseline and the frozen four-condition MEDAL matrix."""
+"""E0: one confidence baseline and the frozen three-condition MEDAL budget matrix (Lc = 10)."""
 
 import argparse
 import json
@@ -27,11 +27,11 @@ from dlm_project.tasks.gsm8k.e0_tokens import decode_output, resolve_termination
 from dlm_project.tasks.gsm8k.evaluation import score_answer
 
 
-PROTOCOL_VERSION = "e0_fixed_budget_v5"
+PROTOCOL_VERSION = "e0_fixed_budget_v6"
 DECODERS = {"confidence": confidence.decode, "medal": mcts_confidence.decode}
 E0_MCTS = {"margin_gamma": 10.0, "exploration_c": 0.01, "epsilon": 1e-8,
            "stop_mode": "budget", "max_simulations": None}
-MIGRATION = ("E0 v5 uses the fixed A/B/C/D depth-budget matrix. Remove single-depth, "
+MIGRATION = ("E0 v6 uses the fixed A/B/C budget matrix at Lc=10. Remove single-depth, "
              "search_budgets and candidate-quota settings; see docs/experiments.md.")
 
 
@@ -153,7 +153,7 @@ def run_experiment(source, *, manifest_path=None, output_dir=None, run_manifest=
     config["data"]["revision"] = manifest["dataset"]["revision"]
     m = config["decoding"]["mcts"]
     parent = Path(output_dir) if output_dir else root / "LLaDA/GSM8K/experiment_0"
-    parent = parent / config["evaluation"]["stage"] / "fixed-matrix-v5"
+    parent = parent / config["evaluation"]["stage"] / "fixed-matrix-v6"
     directory, _ = create_run_directory({"output_dir": str(parent),
         "experiment_timezone": config.get("experiment_timezone", "America/Los_Angeles")})
     config["run"] = {"example_ids": [row["example_id"] for row in examples],

@@ -1,7 +1,7 @@
 # GSM8K experiments: shared protocol and E0
 
-The shared protocol is `gsm8k_shared_v1`. The implemented E0 runner uses
-`e0_fixed_budget_v5`. E1 and E2 must consume the same sample, prompt, generation,
+The shared protocol is `gsm8k_shared_v2`. The implemented E0 runner uses
+`e0_fixed_budget_v6`. E1 and E2 must consume the same sample, prompt, generation,
 and candidate-selection interfaces when their experiment runners are added.
 Their adaptive search and trajectory reward are outside this implementation.
 
@@ -20,9 +20,9 @@ Their adaptive search and trajectory reward are outside this implementation.
 | Sample seed / decoding seed | 1 / 1 |
 | Prompt | The deterministic two-shot template in Section 2 |
 | Candidate filtering | K1 = 3 eligible tokens per masked position; K2 = 5 retained actions per expansion |
-| Maximum depths | 7 and 10, according to the fixed matrix below |
+| Maximum depth | Fixed at Lc = 10 across all experiments; only budget varies |
 | Search budgets | 256, 512, and 1024 actual model forwards |
-| Final shortlist | C = 3, or fewer when fewer distinct deepest states exist |
+| Final shortlist | C = 3, or fewer when fewer distinct states exist at chosen depth |
 | Completion decoder | Standard LLaDA Confidence at T = 0 |
 | Output length / steps / block length | 256 / 256 / 256 |
 | Search simulation | Evaluate the immediate child state; no full rollouts |
@@ -130,13 +130,15 @@ solution is never passed to the prompt builder, search, or decoder.
 
 ## 3. Common candidate selection
 
-Search with reward R, collect **all** distinct deepest evaluated states, rank
-by expected reward Q_R, retain up to three, and complete only the best one.
+Search with reward R, select the depth having at least C distinct evaluated states,
+rank by expected reward Q_R, retain up to three, and complete only the best one.
 
 1. Search until budget B is exhausted or the frontier is exhausted. Never stop
    simply because three candidates exist.
-2. Among successfully evaluated states, find the deepest depth d*, up to Lc.
-   An allocated but unevaluated child is ineligible.
+2. Among successfully evaluated states, find the candidate depth d*: the deepest
+   depth having at least C distinct evaluated states. If no depth has at least C
+   distinct states, choose the depth with the most distinct states (breaking
+   ties by preferring the deeper depth).
 3. Collect every state at d*. Deduplicate exact token-ID arrays, including mask
    positions; decoded text is not an identity key.
 4. Keep the first successfully evaluated node for each repeated state. Its
@@ -144,7 +146,7 @@ by expected reward Q_R, retain up to three, and complete only the best one.
    tree nodes or alter UCB's tree structure.
 5. Rank by Q_R(s) = reward_sum(s) / visits(s), descending. Break ties by ascending
    node ID. Do not rank by the UCB bonus or run extra model evaluations.
-6. Retain min(3, number of distinct states) and complete rank 1 exactly once.
+6. Retain min(3, number of distinct states at d*) and complete rank 1 exactly once.
 
 Each immediate-child reward is backed up once into that child and every
 ancestor. Values are the final accumulated statistics at selection time.
@@ -186,10 +188,9 @@ MEDAL's current UCB selection and immediate information-gain reward.
 | Condition | ID | Lc | Search B | Completion NFEs at Lc | Total NFEs at full B and Lc |
 |---|---|---:|---:|---:|---:|
 | LLaDA Confidence | `confidence_t0` | — | 0 | 256 | 256 |
-| MEDAL A | `medal_lc7_b256` | 7 | 256 | 249 | 505 |
-| MEDAL B | `medal_lc7_b512` | 7 | 512 | 249 | 761 |
-| MEDAL C | `medal_lc10_b512` | 10 | 512 | 246 | 758 |
-| MEDAL D | `medal_lc10_b1024` | 10 | 1024 | 246 | 1270 |
+| MEDAL A | `medal_lc10_b256` | 10 | 256 | 246 | 502 |
+| MEDAL B | `medal_lc10_b512` | 10 | 512 | 246 | 758 |
+| MEDAL C | `medal_lc10_b1024` | 10 | 1024 | 246 | 1270 |
 
 The last two columns are accounting examples, not measured results. Frontier
 exhaustion can use less search budget; fallback changes completion cost. The
@@ -197,8 +198,8 @@ confidence baseline runs once per question. Entropy and no-search MEDAL
 controls are not part of E0 v5.
 
 Load one model for the whole stage. Every searched condition receives a fresh
-independent tree. By default run Confidence across the stage, then A, B, C, D.
-`--run-order example` instead runs all five conditions per question. Both orders
+independent tree. By default run Confidence across the stage, then A, B, C.
+`--run-order example` instead runs all four conditions per question. Both orders
 reuse the same prompts and seeds.
 
 ### Retained MEDAL behavior
@@ -277,9 +278,9 @@ outside condition NFE totals.
 
 Report condition means, total compute, latency median/p95, stop-reason counts,
 and Wilson accuracy intervals. The main comparison uses only questions with
-terminal records for all five conditions. Observed summaries retain completed
+terminal records for all four conditions. Observed summaries retain completed
 records from partial stages. Interrupted/unattempted outcomes are not invented
-as incorrect predictions. A complete test run contains 1,000 terminal records
+as incorrect predictions. A complete test run contains 800 terminal records
 and 200 paired questions.
 
 ## 5. Execution, artifacts, and validation
@@ -322,7 +323,7 @@ change the matrix under v5.
 
 ### Saved artifacts
 
-Runs use `<experiment_root>/LLaDA/GSM8K/experiment_0/<stage>/fixed-matrix-v5/<timestamp>/`.
+Runs use `<experiment_root>/LLaDA/GSM8K/experiment_0/<stage>/fixed-matrix-v6/<timestamp>/`.
 An explicit output directory replaces the root before stage/matrix/timestamp.
 
 | Artifact | Contents |

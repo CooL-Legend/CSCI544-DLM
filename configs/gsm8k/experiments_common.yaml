@@ -1,5 +1,5 @@
 # Shared frozen inputs for E0, E1 and E2. See docs/experiments.md.
-protocol_version: gsm8k_shared_v1
+protocol_version: gsm8k_shared_v2
 model:
   family: llada
   repo_id: GSAI-ML/LLaDA-8B-Instruct
@@ -56,16 +56,14 @@ decoding:
     num_candidates: 3
 search:
   simulation: immediate_child
+  # Lc is fixed at 10 for every experiment; only the search budget varies.
   conditions:
   - label: A
-    depth: 7
+    depth: 10
     budget: 256
   - label: B
-    depth: 7
-    budget: 512
-  - label: C
     depth: 10
     budget: 512
-  - label: D
+  - label: C
     depth: 10
     budget: 1024

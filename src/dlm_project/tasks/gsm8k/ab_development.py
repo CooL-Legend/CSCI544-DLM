@@ -39,13 +39,13 @@ def context(*, stage='dev', condition='A', indices=(0,), method='ab_medal'):
         raise ValueError('Sample index is outside the frozen stage.')
     selected = next((c for c in common['search']['conditions'] if c['label'] == condition), None)
     if selected is None:
-        raise ValueError('Condition must be A, B, C, or D.')
+        raise ValueError('Condition must be A, B, or C.')
     if method not in ('medal', 'ab_medal'):
         raise ValueError('Initialization method must be medal or ab_medal.')
     config_class = ABMEDALConfig if method == 'ab_medal' else MCTSConfig
     config = config_class(**common['decoding']['mcts'], init_tokens=selected['depth'],
                           max_model_calls=selected['budget'], stop_mode='budget')
-    return dict(implementation_version=IMPLEMENTATION_VERSION if method == 'ab_medal' else 'medal_fixed_budget_v5',
+    return dict(implementation_version=IMPLEMENTATION_VERSION if method == 'ab_medal' else 'medal_fixed_budget_v6',
                 method=method, common=common,
                 common_protocol_hash=digest(common), prompt_template_hash=digest(common['prompt']['template']),
                 stage=stage, condition=condition, search=asdict(config),
@@ -420,7 +420,7 @@ def run_samples(wrapper, prepared, ctx, directory, *, batch_size=1):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--stage', choices=('dev', 'evaluation', 'test'), default='dev')
-    parser.add_argument('--condition', choices=('A', 'B', 'C', 'D'), default='A')
+    parser.add_argument('--condition', choices=('A', 'B', 'C'), default='A')
     parser.add_argument('--num-samples', type=int, default=1)
     parser.add_argument('--model-path')
     parser.add_argument('--device', default='cuda')

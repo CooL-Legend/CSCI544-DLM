@@ -73,23 +73,31 @@ def reconstruct(audit, prompt_ids=None):
             raise ValueError("Search statistics do not match reward backups.")
     selection = audit.get("selection")
     if selection and audit.get("stop_mode", "budget") == "budget":
-        deepest = max(row["depth"] for row in rows)
-        distinct = {}
+        by_depth = {}
         for row in sorted(rows, key=lambda n: n["node_id"]):
-            if row["depth"] == deepest:
-                # Old artifacts can lack hashes; never fabricate identities.
-                key = tuple(states[row["node_id"]]) if states else row.get("state_hash")
-                if key is None:
-                    break
-                distinct.setdefault(key, row)
+            key = tuple(states[row["node_id"]]) if states else row.get("state_hash")
+            if key is None:
+                break
+            by_depth.setdefault(row["depth"], {}).setdefault(key, row)
         else:
-            shortlist = sorted(distinct.values(), key=lambda r: (-r["q_value"], r["node_id"]))[:audit.get("shortlist_limit", 3)]
+            limit = audit.get("shortlist_limit", 3)
+            version = selection.get("candidate_selection_version")
+            if version == "deepest_with_c_distinct_mean_q_v2":
+                distinct_counts = {d: len(s) for d, s in by_depth.items()}
+                qualified = [d for d, c in distinct_counts.items() if c >= limit]
+                selected_depth = max(qualified) if qualified else max(distinct_counts, key=lambda d: (distinct_counts[d], d))
+                distinct = by_depth[selected_depth]
+            else:
+                deepest = max(row["depth"] for row in rows)
+                selected_depth = deepest
+                distinct = by_depth.get(deepest, {})
+            shortlist = sorted(distinct.values(), key=lambda r: (-r["q_value"], r["node_id"]))[:limit]
             if (selection["candidate_ids"] != [r["node_id"] for r in distinct.values()]
                     or selection["shortlist_ids"] != [r["node_id"] for r in shortlist]
                     or selection["selected_node_id"] != shortlist[0]["node_id"]
-                    or selection["selected_depth"] != deepest
-                    or selection["fallback"] != (deepest < audit["requested_depth"])):
-                raise ValueError("Saved selection differs from deepest empirical-Q ranking.")
+                    or selection["selected_depth"] != selected_depth
+                    or selection["fallback"] != (selected_depth < audit["requested_depth"])):
+                raise ValueError("Saved selection differs from empirical-Q ranking.")
     return states
 
 
@@ -139,7 +147,8 @@ def from_events(events, *, prompt_ids=None, mask_id, gen_length, requested_depth
             if any(actual[key] != expected[key] for key in ("visits", "reward_sum", "q_value")):
                 raise ValueError("Saved final statistics differ from reconstructed backups.")
     selection = None if final is None else {key: final[key] for key in (
-        "candidate_ids", "shortlist_ids", "selected_node_id", "selected_depth", "stop_reason", "fallback")}
+        "candidate_ids", "shortlist_ids", "selected_node_id", "selected_depth", "stop_reason", "fallback",
+        "candidate_selection_version") if key in final}
     root_event = next((e for e in events if e.get("stage") == "initialization"), {})
     audit = dict(trace_schema_version=TRACE_SCHEMA_VERSION if modern else "legacy_recovered",
                  mask_id=mask_id, gen_length=gen_length, requested_depth=requested_depth,
@@ -180,11 +189,12 @@ def metrics(audit):
     negative = sum(r < 0 for r in rewards)
     deepest = max(depths, default=0)
     target = {tuple(sorted(paths[r["node_id"]])) for r in nodes if r["depth"] == audit["requested_depth"]}
-    deepest_states = {tuple(sorted(paths[r["node_id"]])) for r in nodes if r["depth"] == deepest}
-    deepest_representatives = {}
+    candidate_depth = selection["selected_depth"] if selection else deepest
+    candidate_states = {tuple(sorted(paths[r["node_id"]])) for r in nodes if r["depth"] == candidate_depth}
+    candidate_representatives = {}
     for row in sorted(nodes, key=lambda n: n['node_id']):
-        if row['depth'] == deepest:
-            deepest_representatives.setdefault(tuple(sorted(paths[row['node_id']])), row['node_id'])
+        if row['depth'] == candidate_depth:
+            candidate_representatives.setdefault(tuple(sorted(paths[row['node_id']])), row['node_id'])
     decisions = audit["decisions"]
     counts = Counter(d["decision_type"] for d in decisions) if decisions is not None else None
     forced = Counter(d["decision_type"] for d in decisions if d["forced"]) if decisions is not None else None
@@ -209,12 +219,12 @@ def metrics(audit):
         branching_factor_min=min(branching.values(), default=0),
         branching_factor_mean=_mean(list(branching.values())) or 0.0,
         branching_factor_max=max(branching.values(), default=0),
-        candidate_count=len(deepest_states), target_depth_candidate_count=len(target), shortlist_size=len(shortlist),
+        candidate_count=len(candidate_states), target_depth_candidate_count=len(target), shortlist_size=len(shortlist),
         unique_evaluated_states=unique, duplicate_state_count=duplicates,
         duplicate_state_percentage=100 * duplicates / len(children) if children else None,
         evaluated_root_subtrees=len(subtrees), retained_root_actions=audit["root_action_count"],
         root_subtree_coverage=len(subtrees) / audit["root_action_count"] if audit["root_action_count"] else None,
-        deepest_candidate_root_subtrees=sorted({root_child[i] for i in deepest_representatives.values() if i != 0}),
+        deepest_candidate_root_subtrees=sorted({root_child[i] for i in candidate_representatives.values() if i != 0}),
         shortlist_root_subtrees=sorted({root_child[i] for i in shortlist if i != 0}),
         negative_ig_count=negative, negative_ig_percentage=100 * negative / len(rewards) if rewards else None,
         ig_min=min(rewards) if rewards else None, ig_mean=_mean(rewards), ig_max=max(rewards) if rewards else None,

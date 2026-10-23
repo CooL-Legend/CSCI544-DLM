@@ -34,7 +34,7 @@ def wrapper(model=None):
         encode_prompt=lambda text: torch.tensor([[3] * (2 + len(text) % 4)]))
 
 
-@pytest.mark.parametrize('condition,depth,budget', [('A', 7, 256), ('B', 7, 512), ('C', 10, 512), ('D', 10, 1024)])
+@pytest.mark.parametrize('condition,depth,budget', [('A', 10, 256), ('B', 10, 512), ('C', 10, 1024)])
 def test_shared_conditions_prompts_seeds_and_order(condition, depth, budget):
     ctx = dev.context(condition=condition, indices=(0, 1))
     w = wrapper()

@@ -23,7 +23,7 @@ from dlm_project.tasks.gsm8k.experiment_protocol import get_manifest, load_share
 from tests.tasks.test_e0_dataset import Tokenizer
 
 
-CONDITIONS = ['confidence_t0', 'medal_lc7_b256', 'medal_lc7_b512', 'medal_lc10_b512', 'medal_lc10_b1024']
+CONDITIONS = ['confidence_t0', 'medal_lc10_b256', 'medal_lc10_b512', 'medal_lc10_b1024']
 PROMPT = torch.tensor([[5, 4]], dtype=torch.long)
 
 
@@ -114,15 +114,15 @@ def test_five_conditions_one_load_fixed_samples_accounting_and_offline_report(tm
     directory, summary = e0.run_experiment(config, run_manifest=tmp_path / 'receipt.json')
     assert config == original and len(loads) == 1
     assert summary['complete'] and summary['common_n'] == n
-    assert len(summary['conditions']) == 5 and len(summary['gains']) == 4
+    assert len(summary['conditions']) == 4 and len(summary['gains']) == 3
     rows = records(directory)
-    assert len(rows) == 5 * n
+    assert len(rows) == 4 * n
     ids = loads[0]['run']['example_ids']
     expected = ([(example, condition) for condition in CONDITIONS for example in ids] if order == 'condition'
                 else [(example, condition) for example in ids for condition in CONDITIONS])
     assert [(r['example_id'], r['condition']) for r in rows] == expected
     assert instance.model.calls == sum(r['total_nfes'] for r in rows) + 1
-    assert sum(r['total_nfes'] for r in rows) == n * 3550
+    assert sum(r['total_nfes'] for r in rows) == n * 2786
     assert len(prompts) == n + 1
     for example in ids:
         paired = [r for r in rows if r['example_id'] == example]
@@ -131,7 +131,7 @@ def test_five_conditions_one_load_fixed_samples_accounting_and_offline_report(tm
     for row in rows:
         assert row['reference_solution'] not in row['prompt']
         assert row['prompt'].endswith('Problem: ' + row['question'])
-        assert row['protocol_version'] == 'e0_fixed_budget_v5'
+        assert row['protocol_version'] == 'e0_fixed_budget_v6'
         assert row['completion_nfes'] == 256 - row['selected_depth']
         assert row['search_nfes'] <= row['requested_search_budget']
         assert row['total_nfes'] == row['search_nfes'] + row['completion_nfes']
@@ -140,14 +140,14 @@ def test_five_conditions_one_load_fixed_samples_accounting_and_offline_report(tm
     assert receipt['common_protocol_hash'] == summary['common_protocol_hash']
     assert generate_report(directory)['conditions'] == summary['conditions']
     text = (directory / 'report/report.md').read_text()
-    assert 'Expanded parents' in text and 'Lc=7,10' in text
+    assert 'Expanded parents' in text and 'Lc=10' in text
     assert 'no-search MEDAL control' not in text
     for name in ('summary.csv', 'observed_summary.csv', 'results.csv', 'accuracy_gains.csv'):
         assert (directory / 'report' / name).is_file()
     for key in ('mean_expanded_parents', 'mean_realized_branching_factor', 'mean_target_depth_candidate_count'):
         assert key in summary['conditions'][1]
     if stage == 'test':
-        assert len(rows) == 1000
+        assert len(rows) == 800
 
 
 def test_fixed_config_and_migration_errors(tmp_path):
@@ -155,10 +155,10 @@ def test_fixed_config_and_migration_errors(tmp_path):
     resolved = e0.resolve_settings(cfg)
     assert e0.resolve_settings(resolved) == resolved
     assert [r['id'] for r in resolved['conditions']] == CONDITIONS
-    assert [(r['requested_depth'], r['search_budget']) for r in resolved['conditions']] == [(None, 0), (7, 256), (7, 512), (10, 512), (10, 1024)]
+    assert [(r['requested_depth'], r['search_budget']) for r in resolved['conditions']] == [(None, 0), (10, 256), (10, 512), (10, 1024)]
     assert e0.resolve_settings(cfg, stage='test')['data']['num_samples'] == 200
     for override in ({'init_tokens': 7}, {'search_budgets': [256, 512, 1024]}, {'search_mode': 'candidates'}):
-        with pytest.raises(ValueError, match='fixed A/B/C/D'):
+        with pytest.raises(ValueError, match=r'fixed A/B/C'):
             e0.resolve_settings(cfg, **override)
     for override in ({'num_samples': 2}, {'num_samples': True}, {'dataset_revision': 'a' * 40}, {'run_order': 'random'}):
         with pytest.raises(ValueError):
@@ -202,7 +202,7 @@ def test_real_decoders_use_the_fixed_matrix_and_rebuild_report(tmp_path, monkeyp
     finally:
         torch.set_num_threads(threads)
     rows = records(directory)
-    assert summary['complete'] and len(rows) == 25
+    assert summary['complete'] and len(rows) == 20
     assert len(model.seen) == sum(r['total_nfes'] for r in rows) + 1
     calls_before_reporting = len(model.seen)
     assert generate_report(directory)['conditions'] == summary['conditions']
@@ -219,7 +219,8 @@ def test_real_decoders_use_the_fixed_matrix_and_rebuild_report(tmp_path, monkeyp
             assert allocation['decision_counts'] is None
             details = row['details']
             assert row['shortlist_size'] == min(3, row['candidate_count'])
-            assert row['selected_depth'] == row['max_depth']
+            assert row['selected_depth'] <= row['max_depth']
+            assert row['selected_depth'] == row['max_depth'] or row['candidate_count'] >= 3
             assert details['candidate_evaluation_model_calls'] == 0
             assert details['simulation_decoding_steps'] == 0
             for position in details['selected_initialization']['committed']:
@@ -304,5 +305,5 @@ def test_unchanged_notebooks_are_valid_but_explicitly_legacy(label):
     cells = {cell.id: cell.source for cell in notebook.cells}
     assert 'e0_fixed_budget_v4' in cells['e0-run']
     assert '--init-tokens' in cells['e0-run']
-    with pytest.raises(ValueError, match='fixed A/B/C/D'):
+    with pytest.raises(ValueError, match=r'fixed A/B/C'):
         e0.resolve_settings(load_config(ROOT / 'configs/gsm8k/experiment_0.yaml'), init_tokens=5)

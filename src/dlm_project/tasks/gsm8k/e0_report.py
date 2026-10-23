@@ -13,6 +13,11 @@ from dlm_project.tasks.gsm8k.evaluation import score_answer
 from dlm_project.tasks.gsm8k.experiment_protocol import validate_manifest, select_examples
 
 
+# Fixed-budget E0 protocols. v5: deepest evaluated depth. v6: Lc = 10 and the
+# deepest depth holding at least C distinct states.
+FIXED_BUDGET_VERSIONS = ("e0_fixed_budget_v5", "e0_fixed_budget_v6")
+
+
 def _aggregate(condition, rows):
     n = len(rows)
     correct = sum(bool(row["exact_match"]) for row in rows)
@@ -72,7 +77,7 @@ def summarize(config, setup, records):
             "requested_n": len(requested), "common_n": len(common), "common_example_ids": common,
             "expected_predictions": expected, "terminal_predictions": len(terminal),
             "comparison_sample": ("questions with completed outcomes under every condition"
-                                  if config["protocol_version"] == "e0_fixed_budget_v5" else
+                                  if config["protocol_version"] in FIXED_BUDGET_VERSIONS else
                                   "questions with a terminal outcome under every condition; incomplete searches count as incorrect"),
             "conditions": summaries,
             "observed_conditions": [_aggregate(c, [row for row in terminal if row["condition"] == c["id"]]) for c in conditions],
@@ -86,7 +91,7 @@ def load_records(directory, config):
     manifest = json.loads((directory / "manifest.json").read_text())
     if digest(manifest) != config["run"]["manifest_hash"]:
         raise ValueError("E0 manifest hash mismatch.")
-    current = config["protocol_version"] == "e0_fixed_budget_v5"
+    current = config["protocol_version"] in FIXED_BUDGET_VERSIONS
     if current:
         common = config["common_protocol"]
         validate_manifest(manifest, common)
@@ -178,13 +183,13 @@ def load_records(directory, config):
 
 
 def _validate_current_record(row, condition, config):
-    """Check v5 selection evidence and metric semantics without model access."""
+    """Check fixed-budget selection evidence and metric semantics without model access."""
     if (row["common_protocol_hash"] != config["common_protocol_hash"]
             or row["prompt_template_hash"] != config["prompt_template_hash"]
             or row["requested_depth"] != condition["requested_depth"]
             or row["generation_length"] != config["generation"]["gen_length"]
             or row["status"] != "completed"):
-        raise ValueError("E0 v5 record identity mismatch.")
+        raise ValueError("E0 fixed-budget record identity mismatch.")
     for field in ("search_seconds", "completion_seconds", "decoding_seconds", "average_search_depth",
                   "realized_branching_factor"):
         if not math.isfinite(row[field]) or row[field] < 0:
@@ -203,12 +208,23 @@ def _validate_current_record(row, condition, config):
     depth = row["selected_depth"]
     details = row["details"]
     candidates, shortlist = details["candidate_evaluations"], details["candidate_shortlist"]
+    limit, lc = config["decoding"]["mcts"].get("num_candidates", 3), condition["requested_depth"]
+    if config["protocol_version"] == "e0_fixed_budget_v5":
+        depth_ok = (0 <= depth == row["max_depth"] <= lc
+                    and row["target_depth_candidate_count"] == (len(candidates) if depth == lc else 0))
+    else:
+        # Deepest depth with >= C distinct states; else the most-populated depth.
+        # A shallower choice implies fewer than C distinct states at Lc.
+        depth_ok = (0 <= depth <= row["max_depth"] <= lc
+                    and (len(candidates) >= limit or depth == row["max_depth"] or depth == 0
+                         or row["target_depth_candidate_count"] <= len(candidates))
+                    and (row["target_depth_candidate_count"] == len(candidates) if depth == lc
+                         else row["target_depth_candidate_count"] < limit))
     if (not candidates or len(candidates) != row["candidate_count"]
             or len({c["state_hash"] for c in candidates}) != len(candidates)
             or len({tuple(c["output_ids"]) for c in candidates}) != len(candidates)
-            or not 0 <= depth == row["max_depth"] <= condition["requested_depth"]
-            or row["fallback_decode_used"] != (depth < condition["requested_depth"])
-            or row["target_depth_candidate_count"] != (len(candidates) if depth == condition["requested_depth"] else 0)
+            or not depth_ok
+            or row["fallback_decode_used"] != (depth < lc)
             or row["shortlist_size"] != min(3, len(candidates))
             or row["shortlist_underfilled"] != (len(candidates) < 3)
             or row["budget_utilization"] != row["search_nfes"] / condition["search_budget"]
@@ -293,7 +309,7 @@ def generate_report(run_dir):
     def number(value):
         return "—" if value is None else f"{value:.3f}"
 
-    current = config["protocol_version"] == "e0_fixed_budget_v5"
+    current = config["protocol_version"] in FIXED_BUDGET_VERSIONS
     diagnostic_header = "Stop reasons" if current else "Quota failures"
     lines = ["# Experiment 0: Baseline Test", "",
              f"Stage: **{summary['stage']}** · mode: **{summary['search_mode']}** · Lc={_depth_label(summary)} · "
@@ -327,8 +343,8 @@ def generate_report(run_dir):
     decoder = config.get("decoding", {}).get("completion_method", "medal")
     controls = [c for c in config["conditions"] if c["method"] == "medal_no_search"]
     completion_note = (f"The T={controls[0]['temperature']:g} no-search MEDAL control uses the identical downstream decoder, temperature and completion seed as searched MEDAL. "
-                       if controls else "All five conditions use LLaDA Confidence completion at T=0. ")
-    if config["protocol_version"] == "e0_fixed_budget_v5":
+                       if controls else f"All {len(config['conditions'])} conditions use LLaDA Confidence completion at T=0. ")
+    if config["protocol_version"] in FIXED_BUDGET_VERSIONS:
         lines += ["", f"Common protocol SHA256: `{summary['common_protocol_hash']}`.", "",
                   "| Condition | Parse rate | Search seconds | Completion seconds | Expanded parents | Mean branching | Requested-depth candidates |",
                   "|---|---:|---:|---:|---:|---:|---:|"]

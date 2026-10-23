@@ -17,12 +17,12 @@ Both call the same development helpers, retaining the historical
 | Prompt | Exact shared pens/muffins two-shot template and chat tokenization |
 | Seed | Shared per-question seed, `(1 + 5 * row_id) % 2**63` |
 | Initial output | 256 masks |
-| Default | Condition A: Lc=7, search budget=256, batch size=1 |
-| Other conditions | B=(7,512), C=(10,512), D=(10,1024) |
+| Default | Condition A: Lc=10, search budget=256, batch size=1 |
+| Other conditions | B=(10,512), C=(10,1024) |
 | Retained actions | K1=3, K2=5; identical probability/entropy/margin scoring |
 | Reward | Immediate normalized information gain, including negative rewards |
 | Stopping | Forward budget or frontier exhaustion; root forward counts |
-| Final selection | All deepest evaluated distinct states, first occurrence, empirical Q, top 3, best 1 |
+| Final selection | Depth with >= C distinct states (fallback to most distinct, deeper on ties), first occurrence, empirical Q, top 3, best 1 |
 | Fallback | Selected depth below Lc; valid root-only and short shortlists complete |
 | Completion | LLaDA Confidence, temperature 0; fixed 256 output tokens |
 | Scoring | EOS/EOT-prefix scoring and strict GSM8K answer parsing |

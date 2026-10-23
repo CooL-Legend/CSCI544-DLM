@@ -1,4 +1,4 @@
-"""Run fixed-protocol AB development (default: first dev question, Lc=7, B=256).
+"""Run fixed-protocol AB development (default: first dev question, Lc=10, B=256).
 
 Legacy comparison adapters below retain explicit candidate-mode behavior.
 

@@ -5,7 +5,7 @@ inputs, immediate information-gain reward, final selection, and Confidence
 completion as MEDAL's E0 protocol. Adaptive branching changes how search spends
 its forward budget. It does not change the prompt, reward, or final decoder.
 
-The first development run uses one frozen development question, depth 7, search
+The first development run uses one frozen development question, depth 10, search
 budget 256, and one question at a time. The formal E1/E3 runners are separate.
 Optional batching is an implementation study, not an algorithmic treatment.
 The [matched MEDAL notebook](medal_notebook.md) now shares the executable
@@ -270,7 +270,7 @@ N_{total}=N_{search}+N_{completion},\quad N_{search}\le B,\quad
 N_{completion}=256-d_{selected}.
 \]
 
-At full budget 256 and depth 7: 256 search + 249 completion = 505 sequence NFEs.
+At full budget 256 and depth 10: 256 search + 246 completion = 502 sequence NFEs.
 At a root-only budget of 1: 1 + 256 = 257. There is one completion, no candidate
 rollout, and no additional ranking forward.
 
