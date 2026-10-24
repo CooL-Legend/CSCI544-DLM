@@ -64,6 +64,6 @@ search:
   - label: B
     depth: 10
     budget: 512
-  - label: C
-    depth: 10
-    budget: 1024
+  # - label: C
+  #   depth: 10
+  #   budget: 1024
