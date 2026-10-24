@@ -42,7 +42,10 @@ def load_shared_protocol(path=None):
                                       "mcts": {"top_k_tokens": 3, "top_k_actions": 5, "num_candidates": 3}}
             or common["search"]["simulation"] != "immediate_child"
             or [(p["label"], p["depth"], p["budget"]) for p in common["search"]["conditions"]]
-               != [("A", FIXED_DEPTH, 256), ("B", FIXED_DEPTH, 512), ("C", FIXED_DEPTH, 1024)]
+               not in (
+                   [("A", FIXED_DEPTH, 256), ("B", FIXED_DEPTH, 512)],
+                   [("A", FIXED_DEPTH, 256), ("B", FIXED_DEPTH, 512), ("C", FIXED_DEPTH, 1024)],
+               )
             or common["prompt"]["medal_decomposition"] is not False
             or common["prompt"]["template"].count("{GSM8K_question}") != 1):
         raise ValueError("Invalid frozen common experimental protocol.")

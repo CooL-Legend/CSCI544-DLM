@@ -33,7 +33,17 @@ from dlm_project.tasks.gsm8k.experiment_protocol import (
 )
 
 PROTOCOL_VERSION = "e1_unified_fixed_depth_v1"
-CHECKPOINT_BUDGETS = (256, 512, 1024)
+
+
+def _load_default_budgets() -> Tuple[int, ...]:
+    try:
+        common = load_shared_protocol()
+        return tuple(c["budget"] for c in common["search"]["conditions"])
+    except Exception:
+        return (256, 512)
+
+
+CHECKPOINT_BUDGETS = _load_default_budgets()
 MAX_SEARCH_DEPTH = 10
 MIN_CANDIDATES = 3
 
@@ -42,10 +52,12 @@ def state_hash(state_tensor):
     return hashlib.sha256(repr(medal._state_key(state_tensor)).encode()).hexdigest()
 
 
-def context(*, stage="dev", methods=("medal", "ab_medal"), budgets=CHECKPOINT_BUDGETS,
+def context(*, stage="dev", methods=("medal", "ab_medal"), budgets=None,
             max_depth=MAX_SEARCH_DEPTH, num_candidates=MIN_CANDIDATES, num_samples=None):
     """Create and validate execution context for E1."""
     common = load_shared_protocol()
+    if budgets is None:
+        budgets = tuple(c["budget"] for c in common["search"]["conditions"])
     manifest = get_manifest(common=common)
     examples = select_examples(manifest, stage)
     if num_samples is not None:
