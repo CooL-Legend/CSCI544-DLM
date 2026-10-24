@@ -321,8 +321,8 @@ def run_diagnostics(
 def main():
     parser = argparse.ArgumentParser(description="Diagnose LLaDA padding alignment and attention kernel divergence.")
     parser.add_argument("--method", choices=["medal", "ab_medal"], default="medal")
-    parser.add_argument("--condition", choices=["A", "B", "C"], default="A")
-    parser.add_argument("--num_samples", type=int, default=2)
+    parser.add_argument("--condition", choices=["A", "B", "C"], default="B")
+    parser.add_argument("--num_samples", type=int, default=3)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--dtype", default="bfloat16")
     parser.add_argument("--model-path", default=None, help="Local directory or HuggingFace repo ID.")

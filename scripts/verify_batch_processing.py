@@ -171,8 +171,8 @@ def run_verification(
     wrapper,
     methods: Sequence[str] = ("medal", "ab_medal"),
     batch_sizes: Sequence[int] = (2,),
-    num_samples: int = 2,
-    condition: str = "A",
+    num_samples: int = 3,
+    condition: str = "B",
     output_dir: Path = Path("results/batch_verification"),
 ) -> Tuple[Dict[str, Any], bool]:
     """Execute batch verification across both methods and compile full diagnostics."""
@@ -220,17 +220,17 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--methods", nargs="+", choices=("medal", "ab_medal"), default=["medal", "ab_medal"])
     parser.add_argument("--batch-sizes", nargs="+", type=int, default=[2])
-    parser.add_argument("--num-samples", type=int, default=2, help="Number of frozen dev questions (default: 2)")
-    parser.add_argument("--condition", choices=("A", "B", "C"), default="A", help="Condition A=(10,256), B=(10,512), C=(10,1024)")
+    parser.add_argument("--num-samples", type=int, default=3, help="Number of frozen dev questions (default: 3)")
+    parser.add_argument("--condition", choices=("A", "B", "C"), default="B", help="Condition A=(10,256), B=(10,512), C=(10,1024)")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--model-path", help="Local model directory or HuggingFace repo ID.")
     parser.add_argument("--local-files-only", action="store_true")
     parser.add_argument("--output-dir", type=Path, default=Path("results/batch_verification"))
-    parser.add_argument("--fast", action="store_true", help="Fast diagnostic mode with 2 samples and batch_size 2.")
+    parser.add_argument("--fast", action="store_true", help="Fast diagnostic mode with 3 samples and batch_size 2.")
     args = parser.parse_args(argv)
 
     if args.fast:
-        args.num_samples = min(args.num_samples, 2)
+        args.num_samples = min(args.num_samples, 3)
         args.batch_sizes = [2]
 
     if torch.device(args.device).type == "cuda" and not torch.cuda.is_available():
