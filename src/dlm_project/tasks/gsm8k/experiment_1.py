@@ -281,7 +281,14 @@ def run_question_e1(wrapper, prepared_item, ctx, method: str,
         chk_metrics = search_audit.metrics(chk_audit)
 
         # Save checkpoint artifacts
-        save_json(chk_dir / "selection.json", chk["selection"])
+        selection_record = {
+            **chk["selection"],
+            "selected_q": chk["selected_q"],
+            "max_depth_reached": chk["max_depth_reached"],
+            "selection_depth_gap": chk["selection_depth_gap"],
+            "distinct_candidates_by_depth": chk["distinct_candidates_by_depth"],
+        }
+        save_json(chk_dir / "selection.json", selection_record)
         save_json(chk_dir / "completion.json", {
             **decoded, "score": score, "token_ids": completion.token_ids.tolist(),
             "completion_nfes": comp_nfes, "completion_wall_seconds": comp_time,
@@ -344,6 +351,7 @@ def run_question_e1(wrapper, prepared_item, ctx, method: str,
             "selected_depth": chk["selected_depth"],
             "selection_depth_gap": chk["selection_depth_gap"],
             "selected_depth_candidate_count": chk["selected_depth_candidate_count"],
+            "distinct_candidates_by_depth": chk["distinct_candidates_by_depth"],
             "shortlist_node_ids": chk["shortlist_node_ids"],
             "selected_node_id": chk["selected_node_id"],
             "selected_q": chk["selected_q"],
