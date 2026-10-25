@@ -374,19 +374,19 @@ Run `python -m pytest -q` for controlled CPU tests and existing regressions.
 Actual 8B smoke and benchmark runs require an appropriate CUDA environment;
 controlled tests do not measure GSM8K model accuracy.
 
-### E0 and the interactive MEDAL demo
+### E0 and the matched MEDAL / AB-MEDAL demos
 
-E0 protocol v3 and `MEDAL_MCTS_Demo.ipynb` use **standard LLaDA completion**
-(`completion_method="llada"`): Gumbel token proposals at the configured
-temperature, followed by native token-confidence position selection. The same
-decoder starts from all masks for the no-search control and from the selected
-partial state after MEDAL search. Both preserve the prompt and commitments,
-permit EOS/EOT and fill one output mask per actual forward.
+The two [matched development notebooks](../../../docs/medal_notebook.md) use
+identical frozen prompts, samples, depth/budget settings, deepest empirical-Q
+selection and LLaDA Confidence completion at T=0. Only initialization differs:
+MEDAL uses UCB sibling rounds; AB-MEDAL uses Student-t GEN/CONT. Both use the
+same offline metrics and independent-question batching coordinator. The MEDAL
+cooperative adapter preserves complete sibling rounds before UCB reselection.
 
-The E0 configuration sets `decoding.completion_method: llada`; the demo reads
-this into `COMPLETION_METHOD`. Its `"llada"` decoder supports T=0 as well as
-positive temperatures. `completion_method="medal"` and the demo's `"medal"`
-sampler retain the original adjusted-score softmax completion (T>0). Existing
-low-level adapter defaults, the legacy CLI, and AB-MEDAL retain their prior
-completion behavior. MCTS action scoring, immediate IG, UCB and backpropagation
-are shared unchanged.
+Low-level MEDAL adapter defaults and legacy CLI entry points retain their prior
+completion interfaces, including the adjusted-score sampler. The current
+notebook workflow always uses fixed-length Confidence T=0, preserving prompt
+and search commitments and scoring the prefix before the first EOS/EOT.
+
+See the [AB-MEDAL implementation guide](../../../docs/ab_medal_walkthrough.md)
+for the shared protocol, offline compute-allocation logs and batch parity gates.

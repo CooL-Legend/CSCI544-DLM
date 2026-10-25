@@ -1,39 +1,43 @@
-"""One-load E0 integration, partial-run preservation, reports and Colab cells."""
+"""Fixed E0 matrix, real invocation accounting around stub decoders, and reports."""
 
 import copy
-import io
 import json
-import os
 from pathlib import Path
 import signal
-import subprocess
 import sys
 from types import SimpleNamespace
 
 import nbformat
 import pytest
 import torch
-import yaml
 
+from dlm_project.decoding.decoder_result import DecodeResult
+from dlm_project.decoding.mcts_decoding import Node, candidate_value_record, state_record
+from dlm_project.experiments.artifacts import save_json
 from dlm_project.experiments.config import load_config
 from dlm_project.models.profiles import get_profile
 from dlm_project.paths import PROJECT_ROOT as ROOT
 from dlm_project.tasks.gsm8k import experiment_0 as e0
-from dlm_project.tasks.gsm8k.e0_prompt import build_e0_prompt
-from dlm_project.tasks.gsm8k.e0_report import generate_report
-from tests.decoding.helpers import FakeModel, PROMPT, MASK
-from tests.tasks.test_e0_dataset import Tokenizer, manifest
+from dlm_project.tasks.gsm8k.e0_report import generate_report, load_records
+from dlm_project.tasks.gsm8k.experiment_protocol import get_manifest, load_shared_protocol
+from tests.tasks.test_e0_dataset import Tokenizer
 
 
-def config(tmp_path):
-    source = load_config(ROOT / "configs/gsm8k/experiment_0.yaml")
-    source["experiment_root"] = str(tmp_path)
-    source["model"].update(device="cpu", dtype="float32")
-    source["data"]["num_samples"] = 2
-    source["generation"] = dict(gen_length=8, steps=8, block_length=8)
-    source["decoding"]["mcts"].update(init_tokens=2, top_k_tokens=2, top_k_actions=3)
-    source["evaluation"]["search_budgets"] = [1, 8, 16]
-    return source
+CONDITIONS = ['confidence_t0', 'medal_lc10_b256', 'medal_lc10_b512', 'medal_lc10_b1024']
+PROMPT = torch.tensor([[5, 4]], dtype=torch.long)
+
+
+class CounterModel:
+    """Cheap invocation-only model: decoder mathematics has separate unit tests."""
+    device = 'cpu'
+    config = SimpleNamespace(eos_token_id=1, vocab_size=6)
+
+    def __init__(self):
+        self.calls = 0
+
+    def __call__(self, ids):
+        self.calls += 1
+        return None
 
 
 def wrapper():
@@ -41,210 +45,265 @@ def wrapper():
     def encode(text):
         prompts.append(text)
         return PROMPT.clone()
-    model = FakeModel(lambda _: [0, .05, .04, .6, .2, .11])
-    model.config = SimpleNamespace(eos_token_id=1, vocab_size=6)
-    return SimpleNamespace(model=model, tokenizer=Tokenizer(), device="cpu", mask_id=MASK,
-                           identity={**get_profile(), "controlled_test_model": True}, encode_prompt=encode), prompts
+    return SimpleNamespace(model=CounterModel(), tokenizer=Tokenizer(), device='cpu', mask_id=0,
+                           identity=get_profile(), encode_prompt=encode), prompts
+
+
+def stub_decode(counter, prompt_ids, mask_id, *, gen_length, mcts=None, **kwargs):
+    """Exercise every forward through CountingModel without doing inference."""
+    budget = mcts['max_model_calls'] if mcts else 0
+    depth = mcts['init_tokens'] if mcts else 0
+    nfes = budget + gen_length - depth
+    for _ in range(nfes):
+        counter(prompt_ids)
+    details = {}
+    if mcts:
+        candidates = []
+        for i, reward in enumerate((.3, .2, .1), start=1):
+            state = torch.zeros((1, prompt_ids.shape[1] + gen_length), dtype=torch.long)
+            state[:, :prompt_ids.shape[1]] = prompt_ids
+            state[:, prompt_ids.shape[1]:prompt_ids.shape[1] + depth] = 3
+            state[0, prompt_ids.shape[1]] = i + 2
+            node = Node(i, state, depth=depth, visits=1, reward_sum=reward, immediate_reward=reward)
+            candidates.append({**candidate_value_record(node), 'model_calls': 0,
+                               **state_record(state, prompt_ids.shape[1], mask_id)})
+        parents, children = (budget + 3) // 5, budget - 1
+        details = dict(search_model_calls=budget, selected_depth=depth, max_depth=depth,
+                       average_search_depth=depth / 2, candidate_count=3, target_depth_candidate_count=3,
+                       shortlist_size=3, shortlist_underfilled=False, expanded_parents=parents,
+                       evaluated_children=children, realized_branching_factor=children / parents,
+                       fallback_decode_used=False, selection_source='target_depth', stop_reason='model_call_budget',
+                       selected_score=.3, selected_node_id=1, candidate_evaluations=candidates,
+                       candidate_shortlist=[{k: c[k] for k in ('node_id', 'depth', 'visits', 'reward_sum',
+                                                               'q_value', 'reward', 'state_hash', 'immediate_gain')}
+                                            for c in candidates],
+                       candidate_evaluation_model_calls=0, search_latency_seconds=0., completion_latency_seconds=0.,
+                       selected_initialization={k: candidates[0][k] for k in ('output_ids', 'committed', 'remaining_masks', 'partial_output')})
+    output = torch.cat((prompt_ids, torch.full((1, gen_length), 3, dtype=torch.long)), dim=1)
+    return DecodeResult(output, nfes, details=details)
 
 
 @pytest.fixture
 def prepared(monkeypatch):
-    frozen = manifest()
-    monkeypatch.setattr(e0, "get_manifest", lambda *args, **kwargs: frozen)
-    return wrapper()
-
-
-def test_six_conditions_one_load_real_accounting_and_offline_report(tmp_path, monkeypatch, prepared):
-    instance, prompts = prepared
-    source = config(tmp_path)
-    original = copy.deepcopy(source)
+    instance, prompts = wrapper()
     loads = []
     def factory(config):
-        loads.append(config)
+        loads.append(copy.deepcopy(config))
         return instance
-    receipt = tmp_path / "receipt.json"
-    directory, summary = e0.run_experiment(source, model_factory=factory, run_manifest=receipt)
-    assert source == original and len(loads) == 1
-    assert summary["complete"] and summary["common_n"] == 2
-    assert len(summary["conditions"]) == 6 and len(summary["gains"]) == 9
-    rows = [json.loads(line) for line in (directory / "predictions.jsonl").read_text().splitlines()]
-    assert len(rows) == 12
-    assert len(instance.model.seen) == sum(row["total_nfes"] for row in rows) + 1
-    assert json.loads(receipt.read_text())["run_dir"] == str(directory)
-    assert all("REFERENCE_ONLY" not in prompt for prompt in prompts)
-    assert len(prompts) == 3  # Warm-up + one tokenization per question, not per method.
+    monkeypatch.setattr(e0, '_load_model', factory)
+    monkeypatch.setattr(e0, 'DECODERS', {'confidence': stub_decode, 'medal': stub_decode})
+    return instance, prompts, loads
+
+
+def source(tmp_path, stage='dev', order='condition'):
+    result = load_config(ROOT / 'configs/gsm8k/experiment_0.yaml')
+    result['experiment_root'] = str(tmp_path)
+    result['evaluation'].update(stage=stage, run_order=order)
+    return result
+
+
+def records(directory):
+    return [json.loads(line) for line in (directory / 'predictions.jsonl').read_text().splitlines()]
+
+
+@pytest.mark.parametrize('stage,order,n', [('dev', 'example', 5), ('test', 'condition', 200)])
+def test_five_conditions_one_load_fixed_samples_accounting_and_offline_report(tmp_path, prepared, stage, order, n):
+    instance, prompts, loads = prepared
+    config = source(tmp_path, stage, order)
+    original = copy.deepcopy(config)
+    directory, summary = e0.run_experiment(config, run_manifest=tmp_path / 'receipt.json')
+    assert config == original and len(loads) == 1
+    assert summary['complete'] and summary['common_n'] == n
+    assert len(summary['conditions']) == 4 and len(summary['gains']) == 3
+    rows = records(directory)
+    assert len(rows) == 4 * n
+    ids = loads[0]['run']['example_ids']
+    expected = ([(example, condition) for condition in CONDITIONS for example in ids] if order == 'condition'
+                else [(example, condition) for example in ids for condition in CONDITIONS])
+    assert [(r['example_id'], r['condition']) for r in rows] == expected
+    assert instance.model.calls == sum(r['total_nfes'] for r in rows) + 1
+    assert sum(r['total_nfes'] for r in rows) == n * 2786
+    assert len(prompts) == n + 1
+    for example in ids:
+        paired = [r for r in rows if r['example_id'] == example]
+        assert len({r['prompt_ids_hash'] for r in paired}) == len({r['prompt_hash'] for r in paired}) == 1
+        assert len({r['seed'] for r in paired}) == 1
     for row in rows:
-        assert row["prompt"].startswith(
-            "Decompose the question into three steps and solve the math problem following the examples.\n"
-            "State the goal of each step clearly.\nShow your final numerical answer after ####."
-        )
-        assert row["prompt"].count("Example 1:") == row["prompt"].count("Example 2:") == 1
-        assert "#### 27\n\nExample 2:" in row["prompt"]
-        assert "#### 16\n\nNow solve the following question using the same decomposition format." in row["prompt"]
-        assert row["prompt"].endswith(f"Problem: {row['question']}")
-        assert "\nQuestion:\n" not in row["prompt"]
-        assert row["protocol_version"] == "e0_fixed_budget_v3"
-    for example in summary["common_example_ids"]:
-        paired = [row for row in rows if row["example_id"] == example]
-        assert len({row["prompt_ids_hash"] for row in paired}) == 1
-        assert len({row["prompt_hash"] for row in paired}) == 1
-        root = next(row for row in paired if row["condition"] == "medal_budget_b1")
-        control = next(row for row in paired if row["method"] == "medal_no_search")
-        assert root["full_output_ids"] == control["full_output_ids"]
-        assert root["total_nfes"] == control["total_nfes"] + 1
-        assert root["fallback_decode_used"] and root["status"] == "completed"
-    saved = json.loads((directory / "config.json").read_text())
-    assert saved["prompt"]["medal_decomposition"] is False
-    for stem in ("accuracy_vs_total_nfes", "accuracy_vs_runtime"):
-        for extension in ("png", "pdf"):
-            assert (directory / f"report/plots/{stem}.{extension}").stat().st_size > 100
-    monkeypatch.setattr(e0, "_load_model", lambda *args: pytest.fail("Report loaded model"))
-    monkeypatch.setattr(e0, "get_manifest", lambda *args, **kw: pytest.fail("Report downloaded dataset"))
-    assert generate_report(directory) == summary
-    monkeypatch.setattr(sys, "argv", ["e0", "--report-only", str(directory)])
-    e0.main()
-    rows[0]["total_nfes"] += 1
-    (directory / "predictions.jsonl").write_text("\n".join(json.dumps(row) for row in rows) + "\n")
-    with pytest.raises(ValueError, match="accounting"):
-        generate_report(directory)
+        assert row['reference_solution'] not in row['prompt']
+        assert row['prompt'].endswith('Problem: ' + row['question'])
+        assert row['protocol_version'] == 'e0_fixed_budget_v6'
+        assert row['completion_nfes'] == 256 - row['selected_depth']
+        assert row['search_nfes'] <= row['requested_search_budget']
+        assert row['total_nfes'] == row['search_nfes'] + row['completion_nfes']
+    receipt = json.loads((tmp_path / 'receipt.json').read_text())
+    assert receipt['condition_ids'] == CONDITIONS and receipt['status'] == 'completed'
+    assert receipt['common_protocol_hash'] == summary['common_protocol_hash']
+    assert generate_report(directory)['conditions'] == summary['conditions']
+    text = (directory / 'report/report.md').read_text()
+    assert 'Expanded parents' in text and 'Lc=10' in text
+    assert 'no-search MEDAL control' not in text
+    for name in ('summary.csv', 'observed_summary.csv', 'results.csv', 'accuracy_gains.csv'):
+        assert (directory / 'report' / name).is_file()
+    for key in ('mean_expanded_parents', 'mean_realized_branching_factor', 'mean_target_depth_candidate_count'):
+        assert key in summary['conditions'][1]
+    if stage == 'test':
+        assert len(rows) == 800
 
 
-def test_quota_failures_record_answers_as_incorrect_and_continue(tmp_path, prepared):
-    instance, _ = prepared
-    source = config(tmp_path)
-    source["evaluation"].update(search_mode="candidates", search_budgets=[1, 16])
-    directory, summary = e0.run_experiment(source, model_factory=lambda _: instance)
-    assert summary["complete"] and summary["search_mode"] == "candidates"
-    row = next(item for item in summary["conditions"] if item["id"] == "medal_candidates_b1")
-    assert row["search_incomplete_count"] == 2 and row["accuracy_percent"] == 0
-    assert row["mean_completion_nfes"] == 0 and row["fallback_rate"] == 0
-    assert summary["common_n"] == 2
-
-
-@pytest.mark.parametrize("failure", [RuntimeError("controlled error"), KeyboardInterrupt()])
-def test_errors_keep_partial_records_actual_cost_and_receipt(tmp_path, monkeypatch, prepared, failure):
-    instance, _ = prepared
-    def fail(model, ids, *args, **kwargs):
-        with torch.inference_mode():
-            model(ids)
-        raise failure
-    monkeypatch.setitem(e0.DECODERS, "entropy", fail)
-    receipt = tmp_path / "receipt.json"
-    with pytest.raises(type(failure)):
-        e0.run_experiment(config(tmp_path), model_factory=lambda _: instance, run_manifest=receipt)
-    saved = json.loads(receipt.read_text())
-    assert saved["status"] == ("interrupted" if isinstance(failure, KeyboardInterrupt) else "failed")
-    directory = Path(saved["run_dir"])
-    summary = json.loads((directory / "report/summary.json").read_text())
-    assert not summary["complete"] and summary["common_n"] == 0
-    assert summary["unfinished_attempt_nfes"] == 1
-    assert summary["terminal_predictions"] == 1
-    assert summary["observed_conditions"][0]["n"] == 1
-
-
-def test_config_defaults_and_overrides():
-    source = load_config(ROOT / "configs/gsm8k/experiment_0.yaml")
-    default = e0.resolve_settings(source)
-    assert default["data"]["num_samples"] == 5
-    assert default["decoding"]["mcts"]["init_tokens"] == 5
-    assert default["decoding"]["mcts"]["stop_mode"] == "budget"
-    assert default["evaluation"]["search_budgets"] == [512, 1024, 2048]
-    assert default["decoding"]["completion_method"] == "llada"
-    assert all(c["completion_method"] == "llada" for c in default["conditions"] if c["method"].startswith("medal"))
-    question = "How many items are in {a, b, c}?"
-    assert build_e0_prompt(question, default["prompt"]).endswith(f"Problem: {question}")
-    assert build_e0_prompt(question, {"instructions": "Solve."}) == f"Solve.\n\nQuestion:\n{question}"
-    for invalid_prompt in (
-        {"instructions": "Solve."},
-        {"template": "Missing question placeholder"},
-        {"template": "{GSM8K_question} {GSM8K_question}"},
-    ):
-        invalid = copy.deepcopy(source)
-        invalid["prompt"] = invalid_prompt
-        with pytest.raises(ValueError, match="prompt.template"):
-            e0.resolve_settings(invalid)
-    extended = e0.resolve_settings(source, stage="evaluation", init_tokens=7)
-    assert extended["data"]["num_samples"] == 20
-    assert extended["decoding"]["mcts"]["init_tokens"] == 7
-    assert e0.resolve_settings(source, stage="test")["data"]["num_samples"] == 25
-    for override in ({"search_budgets": [1, 1]}, {"search_budgets": [0]}, {"init_tokens": 256}):
+def test_fixed_config_and_migration_errors(tmp_path):
+    cfg = source(tmp_path)
+    resolved = e0.resolve_settings(cfg)
+    assert e0.resolve_settings(resolved) == resolved
+    assert [r['id'] for r in resolved['conditions']] == CONDITIONS
+    assert [(r['requested_depth'], r['search_budget']) for r in resolved['conditions']] == [(None, 0), (10, 256), (10, 512), (10, 1024)]
+    assert e0.resolve_settings(cfg, stage='test')['data']['num_samples'] == 200
+    for override in ({'init_tokens': 7}, {'search_budgets': [256, 512, 1024]}, {'search_mode': 'candidates'}):
+        with pytest.raises(ValueError, match=r'fixed A/B/C'):
+            e0.resolve_settings(cfg, **override)
+    for override in ({'num_samples': 2}, {'num_samples': True}, {'dataset_revision': 'a' * 40}, {'run_order': 'random'}):
         with pytest.raises(ValueError):
-            e0.resolve_settings(source, **override)
-    source["prompt"]["medal_decomposition"] = True
-    with pytest.raises(ValueError, match="decomposition"):
-        e0.resolve_settings(source)
+            e0.resolve_settings(cfg, **override)
+    changes = [('prompt', 'template', 'Solve {GSM8K_question}'), ('generation', 'gen_length', 128),
+               ('data', 'sample_seed', 2), ('decoding', 'completion_temperature', 1), ('model', 'dtype', 'float32')]
+    for section, key, value in changes:
+        changed = copy.deepcopy(cfg)
+        changed[section][key] = value
+        with pytest.raises(ValueError):
+            e0.resolve_settings(changed)
+    bad = copy.deepcopy(cfg)
+    bad['decoding']['mcts']['num_candidates'] = 5
+    with pytest.raises(ValueError):
+        e0.resolve_settings(bad)
 
 
-def test_cli_sigterm_flushes_current_forward_count(tmp_path, monkeypatch, prepared):
-    instance, _ = prepared
-    source = tmp_path / "config.yaml"
-    source.write_text(yaml.safe_dump(config(tmp_path)))
-    receipt = tmp_path / "receipt.json"
-    monkeypatch.setattr(e0, "_load_model", lambda _: instance)
-    def terminate(model, ids, *args, **kwargs):
-        with torch.inference_mode():
-            model(ids)
+def test_invalid_manifest_fails_before_model_load(tmp_path, prepared):
+    _, _, loads = prepared
+    changed = get_manifest()
+    changed['examples'][0], changed['examples'][1] = changed['examples'][1], changed['examples'][0]
+    target = tmp_path / 'tampered.json'
+    target.write_text(json.dumps(changed))
+    with pytest.raises(ValueError, match='hash'):
+        e0.run_experiment(source(tmp_path), manifest_path=target)
+    assert not loads
+
+
+def test_real_decoders_use_the_fixed_matrix_and_rebuild_report(tmp_path, monkeypatch):
+    from dlm_project.decoding import confidence, mcts_confidence
+    from tests.decoding.helpers import FakeModel
+    instance, _ = wrapper()
+    model = FakeModel(lambda _: [0, .05, .04, .6, .2, .11])
+    model.config = CounterModel.config
+    instance.model = model
+    monkeypatch.setattr(e0, 'DECODERS', {'confidence': confidence.decode, 'medal': mcts_confidence.decode})
+    threads = torch.get_num_threads()
+    try:
+        torch.set_num_threads(1)
+        directory, summary = e0.run_experiment(source(tmp_path), model_factory=lambda _: instance)
+    finally:
+        torch.set_num_threads(threads)
+    rows = records(directory)
+    assert summary['complete'] and len(rows) == 20
+    assert len(model.seen) == sum(r['total_nfes'] for r in rows) + 1
+    calls_before_reporting = len(model.seen)
+    assert generate_report(directory)['conditions'] == summary['conditions']
+    assert len(model.seen) == calls_before_reporting
+    assert (directory / 'report' / 'compute_allocation.csv').is_file()
+    for row in rows:
+        if row['method'] == 'medal':
+            audit = json.loads((directory / row['search_audit_file']).read_text())
+            assert len(audit['nodes']) == row['search_nfes']
+            assert all(n['state_hash'] and n['evaluation_order'] == i for i, n in enumerate(audit['nodes']))
+            allocation = row['search_audit_metrics']
+            assert sum(allocation['nfes_per_depth'].values()) == row['search_nfes']
+            assert allocation['root_analysis_nfes'] + sum(allocation['nfes_per_root_subtree'].values()) == row['search_nfes']
+            assert allocation['decision_counts'] is None
+            details = row['details']
+            assert row['shortlist_size'] == min(3, row['candidate_count'])
+            assert row['selected_depth'] <= row['max_depth']
+            assert row['selected_depth'] == row['max_depth'] or row['candidate_count'] >= 3
+            assert details['candidate_evaluation_model_calls'] == 0
+            assert details['simulation_decoding_steps'] == 0
+            for position in details['selected_initialization']['committed']:
+                assert row['full_output_ids'][position['output_position']] == position['token_id']
+
+
+@pytest.mark.parametrize('failure', ['exception', 'interrupt'])
+def test_partial_run_preserves_finished_rows_and_active_forward_cost(tmp_path, prepared, monkeypatch, failure):
+    calls = []
+    def fail_second(counter, prompt, mask_id, **kwargs):
+        calls.append(1)
+        if len(calls) == 2:
+            counter(prompt)
+            counter(prompt)
+            if failure == 'interrupt':
+                raise KeyboardInterrupt('controlled interruption')
+            raise RuntimeError('controlled failure')
+        return stub_decode(counter, prompt, mask_id, **kwargs)
+    monkeypatch.setitem(e0.DECODERS, 'confidence', fail_second)
+    receipt = tmp_path / 'receipt.json'
+    with pytest.raises(KeyboardInterrupt if failure == 'interrupt' else RuntimeError):
+        e0.run_experiment(source(tmp_path), run_manifest=receipt)
+    saved = json.loads(receipt.read_text())
+    directory = Path(saved['run_dir'])
+    assert saved['status'] == ('interrupted' if failure == 'interrupt' else 'failed')
+    assert len(records(directory)) == 1
+    summary = generate_report(directory)
+    assert not summary['complete'] and summary['common_n'] == 0
+    assert summary['unfinished_attempt_nfes'] == 2
+    assert summary['observed_conditions'][0]['n'] == 1
+
+
+def test_cli_sigterm_flushes_and_restores_handler(tmp_path, prepared, monkeypatch):
+    def terminated(counter, prompt, mask, **kwargs):
+        counter(prompt)
         signal.raise_signal(signal.SIGTERM)
-    monkeypatch.setitem(e0.DECODERS, "entropy", terminate)
-    monkeypatch.setattr(sys, "argv", ["e0", "--config", str(source), "--run-manifest", str(receipt)])
+    monkeypatch.setitem(e0.DECODERS, 'confidence', terminated)
+    receipt = tmp_path / 'receipt.json'
+    monkeypatch.setattr(sys, 'argv', ['experiment_0_baseline_test.py', '--output-dir', str(tmp_path / 'runs'),
+                                    '--run-manifest', str(receipt)])
     previous = signal.getsignal(signal.SIGTERM)
     with pytest.raises(KeyboardInterrupt):
         e0.main()
     assert signal.getsignal(signal.SIGTERM) == previous
-    saved = json.loads(receipt.read_text())
-    assert saved["status"] == "interrupted"
-    setup = json.loads((Path(saved["run_dir"]) / "setup.json").read_text())
-    assert setup["active_total_nfes"] == 1
+    directory = Path(json.loads(receipt.read_text())['run_dir'])
+    assert generate_report(directory)['unfinished_attempt_nfes'] == 1
 
 
-@pytest.mark.parametrize("label,stage,count", [("Dev", "dev", 5), ("Evaluation", "evaluation", 20),
-                                              ("Testing", "test", 25)])
-def test_notebooks_valid_controls_and_exact_subprocess_receipts(tmp_path, monkeypatch, label, stage, count):
-    notebook = nbformat.read(ROOT / f"notebooks/gsm8k/Experiment_0_Baseline_Test_{label}.ipynb", as_version=4)
+def test_historical_v4_report_and_trailing_partial_record(tmp_path):
+    fixture = json.loads((ROOT / 'tests/fixtures/e0_v4_run.json').read_text())
+    for key in ('config', 'setup', 'manifest'):
+        save_json(tmp_path / (key + '.json'), fixture[key])
+    prediction = tmp_path / 'predictions.jsonl'
+    prediction.write_text(''.join(json.dumps(row) + '\n' for row in fixture['records']))
+    summary = generate_report(tmp_path)
+    assert summary['complete'] and len(summary['conditions']) == 6
+    assert summary['protocol_version'] == 'e0_fixed_budget_v4'
+    assert 'no-search MEDAL control' in (tmp_path / 'report/report.md').read_text()
+    with prediction.open('a') as handle:
+        handle.write('{"interrupted":')
+    assert generate_report(tmp_path)['warnings']
+
+
+def test_offline_report_detects_changed_q_and_selection(tmp_path, prepared):
+    directory, _ = e0.run_experiment(source(tmp_path))
+    saved = json.loads((directory / 'config.json').read_text())
+    rows = records(directory)
+    searched = next(r for r in rows if r['method'] == 'medal')
+    searched['details']['candidate_evaluations'][0]['q_value'] = 999
+    (directory / 'predictions.jsonl').write_text(''.join(json.dumps(r) + '\n' for r in rows))
+    with pytest.raises(ValueError, match='reward'):
+        load_records(directory, saved)
+
+
+@pytest.mark.parametrize('label', ['Dev', 'Evaluation', 'Testing'])
+def test_unchanged_notebooks_are_valid_but_explicitly_legacy(label):
+    notebook = nbformat.read(ROOT / f'notebooks/gsm8k/Experiment_0_Baseline_Test_{label}.ipynb', as_version=4)
     nbformat.validate(notebook)
-    cells = {cell.id: cell.source for cell in notebook.cells}
-    assert len(cells) == len(notebook.cells)
     for cell in notebook.cells:
-        if cell.cell_type == "code":
-            assert cell.outputs == [] and cell.execution_count is None
-            compile(cell.source, cell.id, "exec")
-            assert "from_pretrained(" not in cell.source
-    assert 'BRANCH = "chong"' in cells["e0-source"] and 'SOURCE_MODE = "github"' in cells["e0-source"]
-    assert 'SOURCE_MODE == "upload"' in cells["e0-source"]
-    assert "requirements/llada-colab.txt" in cells["e0-dependencies"]
-    monkeypatch.setenv("HF_DATASETS_CACHE", str(tmp_path / "data"))
-    (tmp_path / "content").mkdir()
-    def path(value):
-        value = Path(value)
-        return tmp_path / value.relative_to("/") if value.is_relative_to("/content") else value
-    scope = {"REPO_DIR": ROOT, "Path": path, "MODEL_PATH": tmp_path / "model", "os": os,
-             "DRIVE_ROOT": tmp_path, "EXPERIMENT_TIMEZONE": "America/Los_Angeles", "profile": get_profile()}
-    exec(cells["e0-config"], scope)
-    assert scope["STAGE"] == stage and scope["NUM_SAMPLES"] == count
-    assert scope["INIT_TOKENS"] == 5 and scope["RUN_QUOTA_COMPARISON"] is False
-    assert scope["SEARCH_BUDGETS"] == [512, 1024, 2048]
-    calls = []
-    def launch(command, **kwargs):
-        calls.append(command)
-        receipt = Path(command[command.index("--run-manifest") + 1])
-        mode = command[command.index("--search-mode") + 1]
-        receipt.write_text(json.dumps({"run_dir": str(tmp_path / f"exact-{mode}-run"), "status": "completed",
-                                      "stage": stage, "search_mode": mode, "protocol_version": e0.PROTOCOL_VERSION}))
-        return SimpleNamespace(stdout=io.StringIO("streamed progress\n"), wait=lambda: 0)
-    monkeypatch.setattr(subprocess, "Popen", launch)
-    exec(cells["e0-run"], scope)
-    assert scope["E0_RUN_DIR"] == tmp_path / "exact-budget-run"
-    assert calls[0][calls[0].index("--init-tokens") + 1] == "5"
-    assert calls[0][calls[0].index("--num-samples") + 1] == str(count)
-    assert "rglob" not in cells["e0-report"] and "--report-only" in cells["e0-report"]
-    assert scope["run_e0"]("candidates") == tmp_path / "exact-candidates-run"
-    assert calls[-1][calls[-1].index("--init-tokens") + 1] == "5"
-
-    def fail(command, **kwargs):
-        receipt = Path(command[command.index("--run-manifest") + 1])
-        receipt.write_text(json.dumps({"run_dir": str(tmp_path / "partial"), "status": "failed"}))
-        return SimpleNamespace(stdout=io.StringIO("actual traceback\n"), wait=lambda: 1)
-    monkeypatch.setattr(subprocess, "Popen", fail)
-    with pytest.raises(subprocess.CalledProcessError):
-        scope["run_e0"]()
-    assert scope["LAST_PARTIAL_RUN_DIR"] == tmp_path / "partial"
+        if cell.cell_type == 'code':
+            compile(cell.source, cell.id, 'exec')
+    cells = {cell.id: cell.source for cell in notebook.cells}
+    assert 'e0_fixed_budget_v4' in cells['e0-run']
+    assert '--init-tokens' in cells['e0-run']
+    with pytest.raises(ValueError, match=r'fixed A/B/C'):
+        e0.resolve_settings(load_config(ROOT / 'configs/gsm8k/experiment_0.yaml'), init_tokens=5)

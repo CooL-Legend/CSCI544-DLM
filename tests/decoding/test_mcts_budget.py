@@ -10,7 +10,7 @@ def tree(**kw):
         'init_tokens':2,'top_k_tokens':2,'top_k_actions':2,'num_candidates':3,**kw}))
 
 
-@pytest.mark.parametrize('cap,depth,children',[(1,0,0),(2,1,1),(3,1,2),(4,2,3),(5,2,4),(6,2,5)])
+@pytest.mark.parametrize('cap,depth,children',[(1,0,0),(2,1,1),(3,1,2),(4,1,3),(5,2,4),(6,2,5)])
 def test_hard_cap_and_deepest_fully_evaluated_fallback(cap,depth,children):
     search=tree(stop_mode='budget',max_model_calls=cap)
     r=search.run()

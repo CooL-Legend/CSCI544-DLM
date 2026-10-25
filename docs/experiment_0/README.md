@@ -1,3 +1,7 @@
+> **Historical E0 v1–v4 reference.** The current script implements v5. Use the
+> [shared protocol and E0 v5 guide](../experiments.md) for current settings and
+> commands. Existing notebooks remain legacy and were not updated.
+
 # Experiment 0: Baseline Test — implementation README
 
 E0 measures how effectively MEDAL uses a fixed search budget on GSM8K. It
@@ -6,21 +10,26 @@ search against three independently initialized MEDAL searches. The matched
 no-search MEDAL condition is the primary control for the effect of search
 initialization.
 
-Protocol version: **`e0_fixed_budget_v3`**. Shared MEDAL implementation:
+Protocol version: **`e0_fixed_budget_v4`**. Shared MEDAL implementation:
 **`medal_reconstruction_v2`**. This experiment preserves the repository's
 immediate-information-gain reconstruction; it does not establish parity with
 the authors' implementation.
 
 ## 1. Conditions and defaults
 
+Evaluation and testing notebooks run the following six conditions, completing
+all selected questions for one method before starting the next. Their search
+caps are **256, 512, 1024**; 2048 is excluded for now. The development notebook
+and shared YAML retain their original 512/1024/2048 caps and per-example order.
+
 | Saved condition ID | Position/token choice | Temperature | Search cap |
 |---|---|---:|---:|
 | `confidence_t0` | Highest-confidence position, argmax token | 0 | None |
 | `entropy_t0` | Lowest-entropy position, argmax token | 0 | None |
-| `medal_no_search_t1` | Standard LLaDA Gumbel proposals and low-confidence remasking | 1 | None |
-| `medal_budget_b512` | MEDAL initialization, then the same completion sampler | 1 | 512 |
-| `medal_budget_b1024` | MEDAL initialization, then the same completion sampler | 1 | 1024 |
-| `medal_budget_b2048` | MEDAL initialization, then the same completion sampler | 1 | 2048 |
+| `medal_no_search_t0` | Standard LLaDA argmax proposals and confidence-based position selection | 0 | None |
+| `medal_budget_b256` | MEDAL initialization, then the same completion decoder | 0 | 256 |
+| `medal_budget_b512` | MEDAL initialization, then the same completion decoder | 0 | 512 |
+| `medal_budget_b1024` | MEDAL initialization, then the same completion decoder | 0 | 1024 |
 
 | Setting | Default and interpretation |
 |---|---|
@@ -36,13 +45,16 @@ the authors' implementation.
 | Search stopping | Actual forward cap or exhausted frontier; no simulation-count cap |
 | Search evaluation | Immediate parent-to-child information gain; no completion rollouts during search |
 | Completion method | `decoding.completion_method: llada`; `medal` opts into the previous adjusted-score sampler |
+| Completion temperature | `decoding.completion_temperature: 0.0`; all E0 conditions use T=0 by default |
 | Base seed / dataset sampling seed | `1 / 1` |
 | Prompt decomposition / demonstrations | Shared three-step template with the two fixed pens/muffins examples |
 
-The authoritative defaults are in
+The shared defaults are in
 [`configs/gsm8k/experiment_0.yaml`](../../configs/gsm8k/experiment_0.yaml).
-Temperatures belong to conditions; a shared `generation.temperature` is
-rejected. The implementation supports smaller equal length/steps/block values
+Notebook controls explicitly override budgets and execution order as described above.
+Greedy temperatures are fixed at zero; `decoding.completion_temperature`
+sets both MEDAL completion paths, defaulting to zero. A shared
+`generation.temperature` is rejected. The implementation supports smaller equal length/steps/block values
 for controlled tests, but the supplied experiment and notebooks use 256.
 The shared `MCTSConfig()` defaults remain `Lc=20`, candidate-quota stopping,
 and no forward/simulation cap for existing callers.
@@ -90,10 +102,16 @@ low-level default remains `"medal"` for existing callers. E0 explicitly selects
 
 A run resolves configuration and its frozen examples, loads the pinned model
 once, validates termination tokens, and performs one separately counted warm-up
-forward. For each example it constructs and tokenizes one prompt, runs each
-condition with a fresh counter/tree, completes the selected state, trims the
-scoring prefix, scores the answer, and flushes a prediction record. The report
-builder then reads those saved artifacts.
+forward. It constructs and tokenizes each question's prompt once, caching those
+inputs for reuse across conditions. Each prediction uses a fresh counter/tree,
+completes the selected state, trims the scoring prefix, scores the answer, and
+flushes a record. `evaluation.run_order: condition` finishes the entire selected
+question list for confidence, then entropy, then no-search MEDAL, then each
+search cap in the supplied order. The default `example` order runs all methods
+per question. Neither order reuses search work. A streamed summary reports each
+finished method's accuracy, parse rate, mean total NFEs, and mean runtime; these
+metrics are also saved in the incremental summary's `observed_conditions`.
+The offline report builder reads the saved artifacts.
 
 ## 3. Prompts, data and reproducibility
 
@@ -140,7 +158,9 @@ injection; the explicit decomposition template above is still active. Custom
 questions and the legacy `prompt.instructions` configuration are rejected for
 new E0 runs. Prompt and token-ID hashes verify identical inputs across conditions.
 
-Protocol v3 changes MEDAL completion to standard LLaDA decoding. Protocol
+Protocol v4 sets all condition temperatures to zero by default and saves the
+no-search control as `medal_no_search_t0`. Protocol v3 changed MEDAL completion
+to standard LLaDA decoding at T=1. Protocol
 v2 introduced this demonstration prompt in place of v1's plain instructions. Existing
 v1 artifacts can still be rebuilt offline using their saved original prompt
 configuration. Keep results from different prompt/completion protocols separate when
@@ -236,19 +256,22 @@ shortlist does not inflate that rate.
 
 **Completion.** Both searched and no-search MEDAL now use `complete_llada`,
 a state adapter around the repository's standard LLaDA confidence decoder.
-Each forward proposes a token for every remaining masked position using
-LLaDA's existing Gumbel sampling helper, then commits the position with highest
+Each forward proposes an argmax token for every remaining masked position at
+T=0 (no Gumbel noise), then commits the position with highest
 native probability for its proposed token (`low_confidence` remasking).
 It does not apply the search entropy/margin score to completion selection.
 
 The shared machinery excludes the mask token, normalizes over eligible tokens,
 and preserves the prompt and all MCTS commitments. Completion uses fresh
 forwards, one per remaining mask, without reusing search logits as a free step.
-E0 keeps T=1 for the matched control and searched conditions. The demo also
-supports T=0 for this decoder. EOS/EOT remain eligible throughout completion.
+All E0 conditions, including both MEDAL paths and the demo, default to T=0.
+The no-search MEDAL control therefore matches confidence greedy decoding under
+identical model outputs. EOS/EOT remain eligible throughout completion.
 
 `decoding.completion_method: medal` selects the previous literal
-`softmax(adjusted_score / T)` sampler, which requires T>0. The original
+`softmax(adjusted_score / T)` sampler, which requires explicitly setting
+`decoding.completion_temperature` above zero. Invalid T=0/sampler combinations
+are rejected before loading weights. The original
 `complete_medal` function and legacy CLI/AB defaults retain that behavior.
 Saved configuration and prediction records identify the selected completion
 method; offline reports state which decoder generated the answers.
@@ -309,22 +332,29 @@ runtime directory. The bundle contains source, configs, tests, documentation
 and the three notebooks, without weights, credentials or `.git`.
 
 Set `NUM_SAMPLES`, `INIT_TOKENS`, and `SEARCH_BUDGETS` in the controls cell.
+All three E0 notebooks set `TEMPERATURE=0.0` and pass it through to both MEDAL
+completion paths; confidence and entropy baselines also use zero. The demo
+reads the same zero default from the shared configuration. Temperature is
+recorded per condition and in every prediction; offline reports use the saved
+temperature so earlier T=1 results retain their original labels.
+Evaluation/testing set `SEARCH_BUDGETS=[256, 512, 1024]` and
+`RUN_ORDER="condition"`. They run both greedy methods first, one at a time,
+followed by no-search MEDAL and then the ascending search caps. All six methods
+share one loaded model. Completed-method metrics appear before the next method
+starts. If interrupted, `observed_summary.csv` retains those per-method results;
+the paired report includes only questions with outcomes under every condition.
 `RUN_QUOTA_COMPARISON=False` is the default. After changing controls, rerun the
 configuration and run cells. Freeze settings on development/evaluation
 questions before viewing final-test answers; testing remains `Lc=5` unless
 changed beforehand.
 
-For a single interactive MEDAL run, use
+For a current single-sample MEDAL run, use
 [`MEDAL_MCTS_Demo.ipynb`](../../notebooks/gsm8k/MEDAL_MCTS_Demo.ipynb).
-Its existing cells use this E0 prompt, search and EOS policy, with `Lc=5` and
-one `SEARCH_BUDGET=512` control (alternatives 1024/2048). A no-search MEDAL
-decoder block runs before MCTS using the same loaded model, prompt and completion
-seed; it displays separate full/scored outputs and metrics, costs 256 forwards
-by default, and is excluded from searched MEDAL's reported totals. Live counters show
-budget use, evaluated depth and candidates. The report includes E0's applicable
-MEDAL metrics and separate pipeline/decoding timings; completion reruns reuse
-the initialization. Its optional batch remains disabled by default. The
-standalone `demo_medal.py` CLI retains its legacy defaults.
+It now follows the [matched MEDAL/AB development workflow](../medal_notebook.md):
+first frozen development question, Lc=10, search budget=256, Confidence T=0,
+common offline metrics and optional parity-validated independent-question
+batching. The historical defaults in this document do not apply to that
+notebook. The standalone `demo_medal.py` CLI retains its legacy interfaces.
 
 ### Command line
 
@@ -335,10 +365,10 @@ python -m pip install -r requirements/llada-colab.txt
 python -m pip install --no-deps -e .
 
 python scripts/experiment_0_baseline_test.py --stage dev
-python scripts/experiment_0_baseline_test.py --stage evaluation
-python scripts/experiment_0_baseline_test.py --stage evaluation --init-tokens 7
-python scripts/experiment_0_baseline_test.py --stage test --num-samples 25
-python scripts/experiment_0_baseline_test.py --stage test --num-samples 100
+python scripts/experiment_0_baseline_test.py --stage evaluation --run-order condition --search-budgets 256 512 1024
+python scripts/experiment_0_baseline_test.py --stage evaluation --init-tokens 7 --run-order condition --search-budgets 256 512 1024
+python scripts/experiment_0_baseline_test.py --stage test --num-samples 25 --run-order condition --search-budgets 256 512 1024
+python scripts/experiment_0_baseline_test.py --stage test --num-samples 100 --run-order condition --search-budgets 256 512 1024
 ```
 
 A cached-model invocation with explicit artifact locations:
@@ -365,6 +395,7 @@ source metadata. An arbitrary checkpoint is rejected.
 | `--init-tokens N` | Target search depth (`Lc`); 5 by default |
 | `--search-mode budget\|candidates` | Primary budget stopping or supplementary strict quota |
 | `--search-budgets B ...` | Distinct positive actual-forward safety caps |
+| `--run-order example\|condition` | All methods per question (default), or all selected questions per method |
 | `--model-path PATH` | Pinned local snapshot or model repository |
 | `--local-files-only` | Disable model download; this does not create an absent dataset manifest |
 | `--cache-dir PATH` | Hugging Face dataset cache |
@@ -382,7 +413,7 @@ The run is a new timestamp, not a resume or overwrite of an earlier experiment.
 
 ```bash
 python scripts/experiment_0_baseline_test.py --stage evaluation \
-  --search-mode candidates --init-tokens 5 --search-budgets 512 1024 2048
+  --search-mode candidates --init-tokens 5 --run-order condition --search-budgets 256 512 1024
 ```
 
 Use the same `Lc` as the associated primary run. This separately reported mode
@@ -405,7 +436,8 @@ search_nfes <= requested_search_budget
 ```
 
 With defaults, each greedy/control output costs 256 forwards. A fully consumed
-search at depth 5 costs `B + 251` total forwards: 763, 1275 or 2299. At depth 7,
+search at depth 5 costs `B + 251` total forwards: 507, 763 or 1275 for the
+evaluation/testing caps (2299 for an explicit B=2048 run). At depth 7,
 completion costs 249. These are accounting examples, not measured results.
 Frontier exhaustion may use less than B; fallback below target depth needs more
 completion forwards. The one warm-up forward is outside all condition totals.

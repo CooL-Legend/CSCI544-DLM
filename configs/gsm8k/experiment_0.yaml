@@ -1,63 +1,13 @@
-# Experiment 0: Baseline Test — Fixed-Budget MEDAL.
-model:
-  family: llada
-  model_path: GSAI-ML/LLaDA-8B-Instruct
-  device: cuda
-  dtype: bfloat16
-  local_files_only: false
-data:
-  revision: null
-  sample_seed: 1
-  cache_dir: null
-  num_samples: null
-prompt:
-  # The fixed examples below replace the repository's automatic demonstrations.
-  medal_decomposition: false
-  template: |-
-    Decompose the question into three steps and solve the math problem following the examples.
-    State the goal of each step clearly.
-    Show your final numerical answer after ####.
-
-    Example 1:
-    Problem: A shop has 12 pens. It buys 4 packs containing 6 pens each and gives away 9 pens. How many pens remain?
-
-    1. Identify how many pens the shop initially has and how many additional pens it buys.
-    2. Calculate the total number of pens after the purchase.
-    3. Subtract the pens given away to find the remaining quantity.
-    #### 27
-
-    Example 2:
-    Problem: A bakery makes 48 muffins. It sells half of them in the morning and another 8 in the afternoon. How many muffins remain?
-
-    1. Identify the total number of muffins and the portion sold in the morning.
-    2. Calculate how many muffins remain after the morning sales.
-    3. Subtract the afternoon sales to determine the final number of muffins.
-    #### 16
-
-    Now solve the following question using the same decomposition format.
-
-    Problem: {GSM8K_question}
-generation:
-  gen_length: 256
-  steps: 256
-  block_length: 256
+# E0 v5: fixed Confidence + MEDAL A/B/C/D matrix.
+# Shared samples, prompt, generation and search dimensions live in one file.
+common_config: configs/gsm8k/experiments_common.yaml
 decoding:
-  seed: 1
-  completion_method: llada  # Standard LLaDA Gumbel proposals + low-confidence remasking.
   mcts:
-    init_tokens: 5
-    num_candidates: 3
-    top_k_tokens: 3
-    top_k_actions: 5
     margin_gamma: 10.0
     exploration_c: 0.01
     epsilon: 1.0e-8
-    max_model_calls: null
-    max_simulations: null
-    stop_mode: budget
 evaluation:
   stage: dev
-  search_mode: budget
-  search_budgets: [512, 1024, 2048]
+  run_order: condition
 experiment_root: results
 experiment_timezone: America/Los_Angeles

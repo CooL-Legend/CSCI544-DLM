@@ -24,7 +24,7 @@ def wrapper():
 
 
 def settings(**kwargs):
-    return ABMEDALConfig(**{"init_tokens": 2, "num_candidates": 3,
+    return ABMEDALConfig(**{"stop_mode": "candidates", "max_model_calls": None, "init_tokens": 2, "num_candidates": 3,
                             "top_k_tokens": 2, "top_k_actions": 2, **kwargs})
 
 
@@ -221,7 +221,7 @@ def test_comparison_shares_loaded_model_prompts_and_seeds_and_retains_partial_re
 def test_default_cuda_failure_happens_before_loading_or_fetching(monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     monkeypatch.setattr(single, "get_manifest", lambda *a, **kw: pytest.fail("Downloaded before checking CUDA"))
-    with pytest.raises(RuntimeError, match="Colab GPU"):
+    with pytest.raises(RuntimeError, match="GPU runtime in Colab"):
         single.main([])
 
 
@@ -231,4 +231,5 @@ def test_script_help_outside_checkout(tmp_path, script):
     completed = subprocess.run([sys.executable, "-I", str(root / "scripts" / script), "--help"],
                                cwd=tmp_path, capture_output=True, text=True, timeout=30)
     assert completed.returncode == 0, completed.stderr
-    assert "--Lc" in completed.stdout and "--prior-tau2" in completed.stdout
+    expected = ("--condition", "--num-samples") if script == "run_ab_medal_single.py" else ("--Lc", "--prior-tau2")
+    assert all(option in completed.stdout for option in expected)

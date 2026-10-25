@@ -16,7 +16,7 @@ from tests.decoding.helpers import FakeModel, MASK, PROMPT
 
 
 def search(**settings):
-    config = ABMEDALConfig(**{"init_tokens": 3, "num_candidates": 2,
+    config = ABMEDALConfig(**{"stop_mode": "candidates", "max_model_calls": None, "init_tokens": 3, "num_candidates": 2,
                               "top_k_tokens": 2, "top_k_actions": 2, **settings})
     return ABMEDALSearch(FakeModel(), PROMPT, MASK, 4, config, seed=1)
 
@@ -41,7 +41,7 @@ def finite_tree(monkeypatch, kind, **settings):
         return md.StateAnalysis((output == mask_id).float(), tuple(actions), tuple(state[0].tolist()))
 
     monkeypatch.setattr(md, "analyze_state", analyze)
-    config = ABMEDALConfig(**{"init_tokens": 20, "num_candidates": 3, **settings})
+    config = ABMEDALConfig(**{"stop_mode": "candidates", "max_model_calls": None, "init_tokens": 20, "num_candidates": 3, **settings})
     return ABMEDALSearch(FakeModel(), PROMPT, MASK, 21, config, seed=1)
 
 
@@ -289,7 +289,7 @@ def test_medal_equivalent_mode_preserves_buffered_sibling_rounds(cap):
                     max_model_calls=cap)
     original = md.MCTSSearch(FakeModel(), PROMPT, MASK, 4, md.MCTSConfig(**settings))
     adaptive = ABMEDALSearch(FakeModel(), PROMPT, MASK, 4,
-                             ABMEDALConfig(**settings, search_policy="medal_equivalent"))
+                             ABMEDALConfig(**settings, stop_mode="candidates", search_policy="medal_equivalent"))
     for tree in (original, adaptive):
         try:
             tree.run()

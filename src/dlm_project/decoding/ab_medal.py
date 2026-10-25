@@ -5,6 +5,7 @@ come from the repository's MEDAL reconstruction. There are no search rollouts.
 """
 
 from collections import Counter
+import copy
 from dataclasses import asdict, dataclass
 from itertools import combinations
 import math
@@ -67,6 +68,9 @@ class GaussianPosterior:
 
 @dataclass(frozen=True)
 class ABMEDALConfig(medal.MCTSConfig):
+    init_tokens: int = 7
+    max_model_calls: int | None = 256
+    stop_mode: str = "budget"
     prior_m: float = 0.0
     prior_kappa: float = 1.0
     prior_nu: float = 1.0
@@ -78,8 +82,6 @@ class ABMEDALConfig(medal.MCTSConfig):
         self.new_posterior()
         if self.search_policy not in ("gaussian", "medal_equivalent"):
             raise ValueError("search_policy must be gaussian or medal_equivalent.")
-        if self.stop_mode != "candidates":
-            raise ValueError("Adaptive MEDAL stops at the candidate target or an explicit cap.")
 
     def new_posterior(self):
         return GaussianPosterior(self.prior_m, self.prior_kappa, self.prior_nu, self.prior_tau2)
@@ -121,7 +123,10 @@ def tree_statistics(search):
     child_counts = Counter(n.parent.node_id for n in evaluated)
     leaves = [n for n in evaluated if n.node_id not in child_counts]
     candidates = []
-    for node in search.candidates.values():
+    selected_candidates = (medal.select_deepest_candidates(search.nodes, search.config.num_candidates)[1]
+                           if search.config.stop_mode == "budget" and search.root.analysis is not None
+                           else search.candidates.values())
+    for node in selected_candidates:
         path = action_path(node)
         commitments = sorted((a["output_position"], a["token_id"]) for a in path)
         candidates.append({"node_id": node.node_id, "depth": node.depth, "action_path": path,
@@ -135,7 +140,7 @@ def tree_statistics(search):
             common += 1
         a, b = (set(map(tuple, row["commitment_set"])) for row in (left, right))
         pairs.append({"candidate_ids": [left["node_id"], right["node_id"]],
-                      "shared_prefix_length": common, "jaccard_distance": 1 - len(a & b) / len(a | b)})
+                      "shared_prefix_length": common, "jaccard_distance": 1 - len(a & b) / len(a | b) if a | b else 0.0})
     shared_prefix = None
     if pairs:
         shared_prefix = min(pair["shared_prefix_length"] for pair in pairs)
@@ -162,6 +167,8 @@ def tree_record(search):
     rows = []
     for node in search.nodes:
         row = {"node_id": node.node_id, "parent_id": node.parent.node_id if node.parent else None,
+               "evaluation_order": node.evaluation_order,
+               "state_hash": medal.candidate_value_record(node)["state_hash"] if node.analysis else None,
                "children": [c.node_id for c in node.children], "depth": node.depth,
                "visits": node.visits, "reward_sum": node.reward_sum, "mean_reward": node.mean_reward,
                "immediate_reward": node.immediate_reward, "expanded": node.expanded, "closed": node.closed,
@@ -179,19 +186,44 @@ def tree_record(search):
     return {"nodes": rows, "statistics": tree_statistics(search)}
 
 
+@dataclass
+class EvaluationRequest:
+    """One independent tree state awaiting an actual model evaluation."""
+    node: medal.Node
+    parent: medal.Node | None
+    path: list
+    decisions: list
+    phase: str
+    attempted: bool = False
+
+
 class ABMEDALSearch(medal.MCTSSearch):
     """One GEN evaluation per step; every traversal starts again at the root."""
 
     def __init__(self, model, prompt_ids, mask_id, gen_length, config=None,
-                 tokenizer=None, on_event=None, *, seed=1):
+                 tokenizer=None, on_event=None, *, seed=1, search_excluded_token_ids=(),
+                 checkpoint_budgets=None):
         config = config if isinstance(config, ABMEDALConfig) else ABMEDALConfig(**(config or {}))
-        super().__init__(model, prompt_ids, mask_id, gen_length, config, tokenizer, on_event, seed=seed)
+        super().__init__(model, prompt_ids, mask_id, gen_length, config, tokenizer, on_event, seed=seed,
+                         search_excluded_token_ids=search_excluded_token_ids,
+                         checkpoint_budgets=checkpoint_budgets)
         self._counted = _SearchModel(model, config.max_model_calls, self._emit)
         self.rng = np.random.default_rng(seed)
         self.posteriors, self.remaining_actions, self.decision_history = {}, {}, {}
         self.history = []
         self.initialization_seconds = 0.0
         self._round = None
+        self._pending = None
+
+    def _snapshot_checkpoint(self, budget, stop_reason="model_call_budget"):
+        snapshot = super()._snapshot_checkpoint(budget, stop_reason=stop_reason)
+        snapshot.update(
+            posteriors={node_id: {k: copy.deepcopy(p) for k, p in models.items()}
+                        for node_id, models in self.posteriors.items()},
+            remaining_actions={node_id: list(actions) for node_id, actions in self.remaining_actions.items()},
+            decision_history={node_id: list(history) for node_id, history in self.decision_history.items()},
+        )
+        return snapshot
 
     def _register(self, node):
         if node.node_id not in self.posteriors:
@@ -266,16 +298,7 @@ class ABMEDALSearch(medal.MCTSSearch):
         return updates, medal.backpropagate(child, reward)
 
     def _finish(self, reason):
-        with self._counted.phase("candidate_evaluation"):
-            for node in self.candidates.values():
-                self._emit("candidate_evaluation", node_id=node.node_id, reward=node.mean_reward, model_calls=0)
-            self.stop_reason = reason
-        # Wall times stay out of deterministic event histories.
-        self._emit("termination", stop_reason=reason, candidate_count=len(self.candidates),
-                   target_reached=len(self.candidates) >= self.config.num_candidates,
-                   audit=tree_statistics(self))
-        if len(self.candidates) < self.config.num_candidates:
-            raise medal.SearchIncompleteError(self.result().stats)
+        super()._finish(reason)
 
     @torch.inference_mode()
     def step(self):
@@ -291,50 +314,95 @@ class ABMEDALSearch(medal.MCTSSearch):
             error.stats = self.result().stats
             raise
 
-    def _step(self):
-        start = len(self.trace)
-        if self._round is None:
-            self.cycle += 1
+    def next_evaluation(self):
+        """Prepare at most one root/child request; never draw ahead of its backup."""
+        if self._pending is not None:
+            return self._pending
+        if self.done:
+            return None
         if self.root.analysis is None:
-            with self._counted.phase("tree_analysis"):
-                self.root.analysis = medal.analyze_state(self._counted, self.root.state, self.prompt_len, self.mask_id, self.config)
-                self._register(self.root)
-            self._emit("initialization", node_id=0, entropy=self.root.analysis.total_entropy,
-                       actions=[medal.action_record(a, self.tokenizer) for a in self.root.analysis.actions],
-                       policy=self.config.search_policy, priors=asdict(self.config.new_posterior()))
+            self.cycle += 1
+            self._root_cycle = True
+            self._pending = EvaluationRequest(self.root, None, [], [], "tree_analysis")
+            return self._pending
         if self._at_cap() or self._at_simulation_cap():
             self._finish("model_call_budget" if self._at_cap() else "simulation_budget")
-            return self.trace[start:]
+            return None
+        if not getattr(self, "_root_cycle", False) and self._round is None:
+            self.cycle += 1
+        self._root_cycle = False
         with self._counted.phase("selection"):
             parent, path, decisions = self._select()
         if parent is None:
             self._finish("frontier_exhausted")
-            return self.trace[start:]
+            return None
         self._emit("selection", node_id=parent.node_id, path=[n.node_id for n in path], decisions=decisions)
         with self._counted.phase("expansion"):
             action = self.remaining_actions[parent.node_id].pop(0)
+            if action.token_id in self.search_excluded_token_ids:
+                raise RuntimeError("Excluded termination token reached search expansion.")
             parent.expanded = True
-            child = medal.expand_node(parent, action, len(self.nodes), self.prompt_len, self.mask_id, self.config.init_tokens)
+            child = medal.expand_node(parent, action, len(self.nodes), self.prompt_len,
+                                      self.mask_id, self.config.init_tokens)
             self.nodes.append(child)
         self._emit("expansion", parent_id=parent.node_id, child_id=child.node_id, depth=child.depth,
                    action=medal.action_record(action, self.tokenizer))
         self.simulations_started += 1
-        try:
-            with self._counted.phase("simulation"):
-                evaluation = medal.evaluate_action(self._counted, parent, child, self.prompt_len, self.mask_id, self.config)
-        except medal.BudgetExhausted:
-            child.closed = True
-            self._emit("simulation_interrupted", child_id=child.node_id)
-            self._finish("model_call_budget")
-            return self.trace[start:]
+        for order, decision in enumerate(decisions if self.config.search_policy == "gaussian" else []):
+            self._emit("adaptive_decision", traversal_id=self.simulations_started, decision_order=order,
+                       decision_node_id=decision["node_id"], decision_type=decision["choice"],
+                       child_id=child.node_id, **decision)
+        self._pending = EvaluationRequest(child, parent, path, decisions, "simulation")
+        return self._pending
+
+    def record_external_forward(self, request, *, invocation_id, batch_size):
+        """Charge one sequence NFE at dispatch, including unsuccessful forwards."""
+        if request is not self._pending or request.attempted:
+            raise ValueError("Expected the current, undispatched evaluation request.")
+        if self._at_cap():
+            raise medal.BudgetExhausted("Search forward cap reached.")
+        request.attempted = True
+        self._counted.calls += 1
+        self._counted.sequence_nfes += 1
+        self._counted.counts[request.phase] += 1
+        self._counted.sequence_counts[request.phase] += 1
+        self._emit("forward", phase=request.phase, invocation_id=invocation_id,
+                   batch_size=batch_size, node_id=request.node.node_id, status="attempted",
+                   **self._counted.costs())
+
+    def submit_evaluation(self, request, *, logits=None, analysis=None):
+        """Consume one result, then apply the identical reward and posterior updates."""
+        if request is not self._pending or not request.attempted:
+            raise ValueError("Expected the current dispatched evaluation request.")
+        if (logits is None) == (analysis is None):
+            raise ValueError("Supply exactly one of logits and analysis.")
+        if analysis is None:
+            analysis = medal.distribution_from_logits(
+                logits, request.node.state, self.prompt_len, self.mask_id, self.config,
+                search_excluded_token_ids=self.search_excluded_token_ids)[0]
+        child, parent = request.node, request.parent
+        if parent is None:
+            self.root.analysis = analysis
+            self._register(self.root)
+            self._record_evaluated(self.root)
+            self._emit("initialization", node_id=0, entropy=analysis.total_entropy,
+                       actions=[medal.action_record(a, self.tokenizer) for a in analysis.actions],
+                       policy=self.config.search_policy, priors=asdict(self.config.new_posterior()))
+            self._pending = None
+            self._check_checkpoint()
+            return
+        evaluation = medal.apply_child_analysis(parent, child, analysis, self.prompt_len,
+                                                 self.mask_id, self.config, signal_nfe=self.model_calls)
         self._register(child)
         self.simulations_completed += 1
+        self._record_evaluated(child)
         self._emit("evaluation", parent_id=parent.node_id, child_id=child.node_id, depth=child.depth,
-                   action=medal.action_record(action, self.tokenizer), **evaluation)
+                   action=medal.action_record(child.action, self.tokenizer), **evaluation)
         with self._counted.phase("backpropagation"):
-            posterior_updates, visits = self._backup(child, parent, path, evaluation["reward"])
+            posterior_updates, visits = self._backup(child, parent, request.path, evaluation["reward"])
         self._emit("backpropagation", child_id=child.node_id, reward=evaluation["reward"],
                    posterior_updates=posterior_updates, updates=visits)
+        self._check_checkpoint()
         if child.depth == self.config.init_tokens:
             key = medal._state_key(child.state)
             duplicate = key in self.candidates
@@ -342,18 +410,22 @@ class ABMEDALSearch(medal.MCTSSearch):
             self._emit("candidate", node_id=child.node_id, duplicate=duplicate,
                        candidate_count=len(self.candidates), score=child.mean_reward)
         record = {"iteration": self.simulations_completed, "parent_id": parent.node_id, "child_id": child.node_id,
-                  "path": [n.node_id for n in path], "decisions": decisions, "reward": evaluation["reward"],
-                  "posterior_updates": posterior_updates, "model_calls": self.model_calls,
-                  "sequence_nfes": self._counted.sequence_nfes, "audit": tree_statistics(self)}
+                  "path": [n.node_id for n in request.path], "decisions": request.decisions,
+                  "reward": evaluation["reward"], "posterior_updates": posterior_updates,
+                  "model_calls": self.model_calls, "sequence_nfes": self._counted.sequence_nfes}
+        # Historical candidate-mode audits remain readable. Fixed-budget runs
+        # calculate structural/diversity summaries offline, once per result.
+        if self.config.stop_mode == "candidates":
+            record["audit"] = tree_statistics(self)
         self.history.append(record)
         self._emit("iteration", **record)
-        # The target wins when it is reached at exactly the NFE cap.
-        if len(self.candidates) >= self.config.num_candidates:
+        self._pending = None
+        if self.config.stop_mode == "candidates" and len(self.candidates) >= self.config.num_candidates:
             self._finish("candidate_quota")
-            return self.trace[start:]
+            return
         if self._at_cap() or self._at_simulation_cap():
             self._finish("model_call_budget" if self._at_cap() else "simulation_budget")
-            return self.trace[start:]
+            return
         if self.config.search_policy == "gaussian":
             self._close_exhausted(child)
         elif not self.remaining_actions[parent.node_id]:
@@ -361,6 +433,21 @@ class ABMEDALSearch(medal.MCTSSearch):
             self._round = None
         if self.root.closed:
             self._finish("frontier_exhausted")
+
+    def _step(self):
+        start = len(self.trace)
+        while not self.done:
+            request = self.next_evaluation()
+            if request is None:
+                break
+            request.attempted = True
+            with self._counted.phase(request.phase):
+                analysis = medal.analyze_state(
+                    self._counted, request.node.state, self.prompt_len, self.mask_id, self.config,
+                    search_excluded_token_ids=self.search_excluded_token_ids)
+            self.submit_evaluation(request, analysis=analysis)
+            if request.parent is not None:
+                break
         return self.trace[start:]
 
     def result(self):
@@ -374,13 +461,18 @@ class ABMEDALSearch(medal.MCTSSearch):
                  "backpropagation": self._counted.seconds["backpropagation"],
                  "candidate_selection": self._counted.seconds["candidate_evaluation"],
                  "full_rollout": 0.0}
-        times["bookkeeping_trace"] = self.initialization_seconds - sum(times.values())
-        result.stats.update(implementation_version="ab_medal_gaussian_v1", search_policy=self.config.search_policy,
+        times["bookkeeping_trace"] = max(0.0, self.initialization_seconds - sum(times.values()))
+        result.stats.update(implementation_version="ab_medal_fixed_budget_v2" if self.config.stop_mode == "budget" else "ab_medal_gaussian_v1", search_policy=self.config.search_policy,
                             evaluation_variant="Adaptive MEDAL (immediate-child IG)",
                             iterations=self.simulations_completed, decision_counts=dict(counts),
                             forced_decisions=sum(d["forced"] for rows in self.decision_history.values() for d in rows),
                             target_reached=len(self.candidates) >= self.config.num_candidates,
+                            requested_depth_success=bool(self.candidates),
                             search_sequence_nfes=self._counted.sequence_nfes,
                             initialization_wall_seconds=self.initialization_seconds,
-                            timing_seconds=times, **tree_statistics(self))
+                            timing_seconds=times,
+                            **(tree_statistics(self) if self.config.stop_mode == "candidates" else {}))
+        if self.config.stop_mode == "budget":
+            result.stats.update(fallback_used=result.selected.depth < self.config.init_tokens,
+                                fallback_reason=self.stop_reason if result.selected.depth < self.config.init_tokens else None)
         return result

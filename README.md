@@ -37,12 +37,14 @@ Install the package with `python -m pip install --no-deps -e .` after installing
 
 ## Experiment 0: fixed-budget GSM8K baseline test
 
-[Experiment 0](docs/experiment_0/README.md) compares greedy confidence, greedy entropy,
-MEDAL with standard LLaDA completion without search at T=1, and MEDAL search caps of 512, 1024 and
-2048 actual forwards. It uses Lc=5, a shared three-step decomposition prompt
-with the fixed pens/muffins examples, search-only EOS/EOT
-filtering, and fallback completion after budget exhaustion. The original
-candidate-quota mode remains available as a separate matched-depth comparison.
+[The shared experiment guide](docs/experiments.md) defines the fixed inputs for
+E0/E1/E2 and the implemented E0 v6 runner. One confidence baseline is compared
+with MEDAL at (Lc, B) = (10, 256), (10, 512), and (10, 1024).
+All conditions use the same two-shot prompt, 256 output tokens, and LLaDA
+Confidence completion at T=0. Search collects distinct states at the deepest depth
+having at least C distinct nodes (falling back to the depth with the most distinct states,
+breaking ties towards deeper depths), ranks by mean backed-up reward, retains up to
+three, and completes only rank 1.
 
 Use the new [development](notebooks/gsm8k/Experiment_0_Baseline_Test_Dev.ipynb),
 [evaluation](notebooks/gsm8k/Experiment_0_Baseline_Test_Evaluation.ipynb), and
@@ -56,14 +58,44 @@ The [implementation README](docs/experiment_0/README.md) explains the exact
 protocol, code interfaces, commands, metrics, saved records, and validation.
 
 ```bash
+python scripts/prepare_gsm8k_experiments.py
 python scripts/experiment_0_baseline_test.py --stage dev
+python scripts/experiment_0_baseline_test.py --stage evaluation
+python scripts/experiment_0_baseline_test.py --stage test
 ```
+
+The existing E0 notebooks are aligned with the v6 protocol. Use the CLI above and
+consult the [v6 guide](docs/experiments.md) for metrics, artifacts, and migration.
+
+## AB-MEDAL development
+
+The updated [AB-MEDAL notebook](notebooks/gsm8k/AB_MEDAL_MCTS_Colab.ipynb) starts
+with the first frozen development question, depth 10, a 256-forward search budget,
+and serial execution. It uses the shared two-shot prompt, immediate IG, deepest
+qualified empirical-Q selection, and LLaDA Confidence at T=0. It displays all search,
+reward, compute-allocation, and decoding metrics from saved traces, followed by
+optional five-question validation and parity-gated batching at sizes 1, 2, and 4.
+
+```bash
+python scripts/run_ab_medal_single.py --condition A --num-samples 1
+python scripts/run_ab_medal_single.py --condition A --num-samples 5
+```
+
+The [implementation guide](docs/ab_medal_walkthrough.md) explains prompting,
+Student-t GEN/CONT selection, posterior updates, completion, offline metrics,
+and the optional batch study. Formal E1/E3 runners remain separate.
 
 ## Single-prompt MEDAL demo
 
-Use [MEDAL_MCTS_Demo.ipynb](notebooks/gsm8k/MEDAL_MCTS_Demo.ipynb) for one E0-style MEDAL run. It loads one model from the runtime, Drive, or the pinned Hub checkpoint and uses the fixed pens/muffins prompt. Before MCTS, the no-search block runs standard LLaDA completion from all masks and displays its independent outputs, NFE/runtime and accuracy metrics. Defaults for searched MEDAL are target depth 5 and a 512-forward search budget; set `SEARCH_BUDGET` to 1024 or 2048 for larger runs. Live counters show actual search NFEs/budget, evaluated depth and candidate count. The existing cells inspect up to three cached candidates or the selected fallback, then complete that state. The control and search share the model, prompt and completion seed; the control's cost is kept separate from searched MEDAL's totals.
-
-The completion cell reuses the same initialization and defaults to `method="llada"` (Gumbel token proposals and low-confidence remasking); `"medal"` selects the prior adjusted-score sampler, and custom callables or `"my_sampler:decode"` remain supported. Each sampler receives a fresh partial-state copy; the helper counts its actual forwards and checks that it preserves the prompt and initialized tokens. Search excludes EOS/EOT; completion fills all positions and retains full outputs while scoring the prefix before the first terminator. Reports include stage costs, search/completion/total NFEs and runtime, budget utilization, depths, shortlist/fallback status, parse success and reference-based accuracy with a Wilson interval. An optional 10-question batch reuses the model and saves aggregate metrics.
+The [MEDAL notebook](notebooks/gsm8k/MEDAL_MCTS_Demo.ipynb) mirrors the
+[AB-MEDAL notebook](notebooks/gsm8k/AB_MEDAL_MCTS_Colab.ipynb): same first frozen
+development question, prompt, settings, candidate selection, Confidence T=0
+completion, metrics and optional batch study. Defaults are n=1, Lc=10, search
+budget=256 and batch size=1. Only initialization changes: MEDAL uses the existing
+UCB search and retained-sibling rounds; AB uses Student-t GEN/CONT. MEDAL's
+GEN/CONT fields are unavailable. Both export identical offline audit schemas.
+See the [notebook alignment guide](docs/medal_notebook.md) for the shared workflow,
+serial validation and parity-gated batching at sizes 1, 2 and 4.
 
 The separate CLI retains its original prompt, depth-20 quota defaults and sampler interface:
 
