@@ -29,13 +29,15 @@ def main(argv=None):
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--local-files-only", action="store_true")
     parser.add_argument("--output-dir", type=Path, default=Path("results/e1_e3"))
+    parser.add_argument("--no-resume", action="store_false", dest="resume", default=True,
+                        help="Disable checkpoint resumption and force re-running all questions from scratch.")
     parser.add_argument("--run-e3", action="store_true", help="Run E3 offline analysis on completion.")
     args = parser.parse_args(argv)
 
     if torch.device(args.device).type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA is requested but unavailable.")
 
-    print(f"Initializing E1 run: stage={args.stage}, methods={args.methods}, budgets={args.budgets}, depth={args.max_depth}")
+    print(f"Initializing E1 run: stage={args.stage}, methods={args.methods}, budgets={args.budgets}, depth={args.max_depth}, resume={args.resume}")
     ctx = context(
         stage=args.stage,
         methods=tuple(args.methods),
@@ -55,6 +57,7 @@ def main(argv=None):
         budgets=tuple(args.budgets),
         max_depth=args.max_depth,
         num_candidates=args.num_candidates,
+        resume=args.resume,
     )
     total_time = perf_counter() - started
 

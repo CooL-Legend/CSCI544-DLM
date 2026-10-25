@@ -109,3 +109,37 @@ def test_e1_run_stage_csv_outputs(tmp_path):
     for row in agg_rows:
         assert 0.0 <= row["accuracy"] <= 1.0
         assert 0.0 <= row["ci_95_low"] <= row["ci_95_high"] <= 1.0
+
+
+def test_e1_incremental_saving_and_resumption(tmp_path):
+    import json
+    w = mock_wrapper()
+    ctx = e1.context(stage="dev", methods=("medal",), num_samples=2)
+    budgets = (2, 4)
+
+    # First run: writes checkpoints and summaries incrementally
+    q_rows_1, agg_rows_1 = e1.run_e1_stage(
+        w, ctx, tmp_path, methods=("medal",), budgets=budgets, max_depth=4, num_candidates=2, resume=True
+    )
+    assert len(q_rows_1) == 4
+    assert len(agg_rows_1) == 2
+
+    # Check that per-question CSV, aggregate CSV, and manifest exist
+    summaries_dir = tmp_path / "summaries"
+    assert (summaries_dir / "e1_dev_per_question.csv").exists()
+    assert (summaries_dir / "e1_dev_aggregate.csv").exists()
+    manifest_data = json.loads((tmp_path / "run_manifest.json").read_text())
+    assert manifest_data["status"] == "completed"
+
+    # Reset calls count on mock model
+    calls_before = len(w.model.calls)
+    assert calls_before > 0
+
+    # Second run with resume=True: verify is_question_complete skips forward passes
+    q_rows_2, agg_rows_2 = e1.run_e1_stage(
+        w, ctx, tmp_path, methods=("medal",), budgets=budgets, max_depth=4, num_candidates=2, resume=True
+    )
+    assert len(q_rows_2) == 4
+    assert len(w.model.calls) == calls_before  # 0 new model calls performed!
+    assert [r["exact_match"] for r in q_rows_1] == [r["exact_match"] for r in q_rows_2]
+
