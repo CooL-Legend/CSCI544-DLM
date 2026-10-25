@@ -1,4 +1,4 @@
-"""Frozen E0 train development/evaluation pools and an ordered held-out test pool."""
+"""Legacy E0 v1-v4 pools; new experiments use experiment_protocol's fixed inputs."""
 
 import json
 from pathlib import Path

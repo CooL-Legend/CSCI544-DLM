@@ -1,4 +1,4 @@
-"""Staged notebook orchestration for the unchanged Adaptive MEDAL search."""
+"""Staged AB search/completion helpers, including explicit legacy quota mode."""
 
 from dataclasses import asdict
 import json
@@ -16,7 +16,7 @@ from dlm_project.experiments.paths import create_run_directory
 
 @torch.inference_mode()
 def run_initialization(model, prompt_ids, mask_id, *, gen_length=256, mcts=None,
-                       seed=1, tokenizer=None):
+                       seed=1, tokenizer=None, search_excluded_token_ids=()):
     """Return complete or capped AB search results without performing decoding.
 
     Only the expected incomplete-search exception is handled here. Model errors
@@ -26,7 +26,8 @@ def run_initialization(model, prompt_ids, mask_id, *, gen_length=256, mcts=None,
     demo._sync(model)
     started = perf_counter()
     search = ABMEDALSearch(model, prompt_ids, mask_id, gen_length, mcts,
-                           tokenizer=tokenizer, seed=seed)
+                           tokenizer=tokenizer, seed=seed,
+                           search_excluded_token_ids=search_excluded_token_ids)
     try:
         search.run()
     except SearchIncompleteError:
@@ -35,20 +36,24 @@ def run_initialization(model, prompt_ids, mask_id, *, gen_length=256, mcts=None,
         demo._sync(model)
     seconds = perf_counter() - started
     result = search.result()
-    status = "complete" if result.stats["target_reached"] else "incomplete"
+    status = "complete" if search.config.stop_mode == "budget" or result.stats["target_reached"] else "incomplete"
     print(f"AB initialization {status}: candidates={len(result.candidates)}/{search.config.num_candidates}; "
           f"stop={search.stop_reason}", flush=True)
     return demo.InitializationResult(search, result, seconds)
 
 
-def run_completion(initialization, *, method="medal", seed=1, temperature=1.0,
-                   tokenizer=None):
-    """Reuse MEDAL's counted sampler and checks, enforcing AB's full quota."""
-    if not initialization.result.stats["target_reached"]:
+def run_completion(initialization, *, method=None, seed=1, temperature=None,
+                   tokenizer=None, termination_token_ids=None):
+    """Confidence completion for budget runs, including deepest-state fallback."""
+    legacy = initialization.search.config.stop_mode == "candidates"
+    if not initialization.search.done:
+        raise ValueError("Finish the search before completing its selected state.")
+    if legacy and not initialization.result.stats["target_reached"]:
         print("Completion and scoring skipped: AB initialization did not reach the candidate target.", flush=True)
         return None
-    return demo.run_completion(initialization, method=method, seed=seed,
-                               temperature=temperature, tokenizer=tokenizer)
+    return demo.run_completion(initialization, method=method or ("medal" if legacy else "llada"), seed=seed,
+                               temperature=(1.0 if legacy else 0.0) if temperature is None else temperature,
+                               tokenizer=tokenizer, termination_token_ids=termination_token_ids)
 
 
 def full_target_dlm_gate(wrapper, initialization):

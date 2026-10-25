@@ -6,6 +6,7 @@ choices are exported in RECONSTRUCTION_ASSUMPTIONS; author-code parity is not
 claimed. Trees retain compact CPU states and never accept reference answers.
 """
 
+import copy
 from dataclasses import asdict, dataclass, field
 import math
 import hashlib
@@ -126,6 +127,7 @@ class Node:
     expanded: bool = False
     closed: bool = False
     immediate_reward: float | None = None
+    evaluation_order: int | None = None
 
     @property
     def mean_reward(self):
@@ -159,6 +161,53 @@ def model_device(model):
 
 def _state_key(state):
     return tuple(state[0].tolist())
+
+
+CANDIDATE_SELECTION_VERSION = "deepest_with_c_distinct_mean_q_v2"
+
+
+def select_candidate_depth(distinct_counts, limit):
+    """Deepest depth with >= limit distinct states, else the most-populated depth.
+
+    distinct_counts maps depth -> number of distinct evaluated states. Fallback
+    ties prefer the deeper depth. Shared by live search and offline audits.
+    """
+    if not distinct_counts or type(limit) is not int or limit < 1:
+        raise ValueError("Depth selection requires distinct-state counts and a positive limit.")
+    qualified = [depth for depth, count in distinct_counts.items() if count >= limit]
+    if qualified:
+        return max(qualified)
+    return max(distinct_counts, key=lambda depth: (distinct_counts[depth], depth))
+
+
+def select_deepest_candidates(nodes, limit=3):
+    """Distinct states at the deepest depth holding >= limit of them; mean-Q ranking.
+
+    limit is C. Depth d* is the deepest depth with at least C distinct evaluated
+    states; when no depth qualifies, d* is the depth with the most distinct
+    states (deeper wins ties). States at d* use first-occurrence deduplication
+    and are ranked by backed-up mean reward. The analyzed root is the only
+    eligible zero-visit state. This helper does not mutate the tree, pool
+    transpositions, or invoke the model.
+    """
+    eligible = [n for n in nodes if n.analysis is not None
+                and (n.parent is None or n.immediate_reward is not None)]
+    if not eligible or type(limit) is not int or limit < 1:
+        raise ValueError("Selection requires evaluated nodes and a positive shortlist limit.")
+    by_depth = {}
+    for node in sorted(eligible, key=lambda n: n.node_id):
+        by_depth.setdefault(node.depth, {}).setdefault(_state_key(node.state), node)
+    depth = select_candidate_depth({d: len(states) for d, states in by_depth.items()}, limit)
+    candidates = list(by_depth[depth].values())
+    shortlist = sorted(candidates, key=lambda n: (-n.mean_reward, n.node_id))[:limit]
+    return candidates, shortlist
+
+
+def candidate_value_record(node):
+    return {"node_id": node.node_id, "depth": node.depth, "visits": node.visits,
+            "reward_sum": node.reward_sum, "q_value": node.mean_reward,
+            "reward": node.mean_reward, "immediate_gain": node.immediate_reward,
+            "state_hash": hashlib.sha256(repr(_state_key(node.state)).encode()).hexdigest()}
 
 
 def _action_order(action):
@@ -210,6 +259,24 @@ def _distribution(model, state, prompt_len, mask_id, config, *, legacy_entropy=F
     prediction = model(state.to(device))
     logits = prediction.logits[0, (positions + prompt_len).to(device)].float()
     del prediction
+    timing = (model.phase("candidate_filtering")
+              if isinstance(model, _SearchModel) and model.current_phase == "simulation" else nullcontext())
+    return distribution_from_logits(logits, state, prompt_len, mask_id, config, masked_only=True,
+                                    legacy_entropy=legacy_entropy,
+                                    search_excluded_token_ids=search_excluded_token_ids,
+                                    filtering_timer=timing)
+
+
+def distribution_from_logits(logits, state, prompt_len, mask_id, config, *,
+                             legacy_entropy=False, search_excluded_token_ids=(),
+                             filtering_timer=None, masked_only=False):
+    """Shared serial/batched analysis; no model call and no retained logits."""
+    state = state.detach().cpu()
+    positions = torch.nonzero(state[0, prompt_len:] == mask_id, as_tuple=False).flatten()
+    entropies = torch.zeros(state.shape[1] - prompt_len)
+    if not positions.numel():
+        return StateAnalysis(entropies, (), _state_key(state)), positions, None, None
+    logits = logits.float() if masked_only else logits[(positions + prompt_len).to(logits.device)].float()
     if not 0 <= mask_id < logits.shape[-1] or logits.shape[-1] < 2:
         raise ValueError("The model vocabulary must contain the mask ID and a non-mask token.")
     probabilities = torch.softmax(logits, dim=-1)
@@ -222,9 +289,7 @@ def _distribution(model, state, prompt_len, mask_id, config, *, legacy_entropy=F
     factors = torch.exp(-h) * torch.sigmoid(config.margin_gamma * margins)
     # Root filtering is already in tree_analysis. Split child filtering out for
     # the demo's stage report; the existing simulation timer stays inclusive.
-    timing = (model.phase("candidate_filtering")
-              if isinstance(model, _SearchModel) and model.current_phase == "simulation" else nullcontext())
-    with timing:
+    with filtering_timer if filtering_timer is not None else nullcontext():
         token_rows = _token_topk(probabilities, config.top_k_tokens, mask_id,
                                 search_excluded_token_ids)
         h_cpu, margins_cpu, factors_cpu = h.cpu(), margins.cpu().tolist(), factors.cpu().tolist()
@@ -472,6 +537,14 @@ def evaluate_action(model, parent, child, prompt_len, mask_id, config, *,
         raise ValueError("Evaluation requires a cached parent and an unevaluated child.")
     analysis = analyze_state(model, child.state, prompt_len, mask_id, config,
                              search_excluded_token_ids=search_excluded_token_ids)
+    return apply_child_analysis(parent, child, analysis, prompt_len, mask_id, config,
+                                signal_nfe=getattr(model, "calls", None))
+
+
+def apply_child_analysis(parent, child, analysis, prompt_len, mask_id, config, *, signal_nfe=None):
+    """Apply a completed evaluation using the same IG rule for every executor."""
+    if parent.analysis is None or child.analysis is not None:
+        raise ValueError("Evaluation requires a cached parent and an unevaluated child.")
     before, after = parent.analysis.total_entropy, analysis.total_entropy
     
     # Any trajectory Based Method --> For experiment 2
@@ -487,7 +560,7 @@ def evaluate_action(model, parent, child, prompt_len, mask_id, config, *,
             "immediate_gain": reward, "reward": reward, "evaluation_model_calls": int(remaining > 0),
             "masked_count": remaining, "mean_token_entropy": after / remaining if remaining else 0.0,
             "mean_confidence_margin": analysis.mean_margin,
-            "signal_nfe": getattr(model, "calls", None), "signal_extra_nfes": 0,
+            "signal_nfe": signal_nfe, "signal_extra_nfes": 0,
             "committed_position_entropy": removed, "context_gain": before - removed - after,
             "entropies_before": parent.analysis.entropies.tolist(),
             "entropies_after": child.analysis.entropies.tolist()}
@@ -535,7 +608,7 @@ class MCTSSearch:
     """One resumable tree; step() evaluates immediate children and backs up gains."""
     def __init__(self, model, prompt_ids, mask_id, gen_length, config=None,
                  tokenizer=None, on_event: Callable[[dict], None] | None = None, *, seed=1,
-                 search_excluded_token_ids=()):
+                 search_excluded_token_ids=(), checkpoint_budgets=None):
         self.config = config if isinstance(config, MCTSConfig) else MCTSConfig(**(config or {}))
         self.config.validate_length(gen_length)
         if prompt_ids.ndim != 2 or prompt_ids.shape[0] != 1 or prompt_ids.dtype != torch.long:
@@ -554,6 +627,8 @@ class MCTSSearch:
         self.trace, self.on_event = [], on_event
         self.cycle, self.stop_reason = 0, None
         self.simulations_started = self.simulations_completed = 0
+        self.checkpoints = {}
+        self.checkpoint_budgets = tuple(checkpoint_budgets) if checkpoint_budgets is not None else getattr(self.config, "checkpoint_budgets", ())
         self._counted = _SearchModel(model, self.config.max_model_calls, self._emit)
 
     @property
@@ -570,6 +645,76 @@ class MCTSSearch:
         if self.on_event:
             self.on_event(event)
 
+    def _snapshot_checkpoint(self, budget, stop_reason="model_call_budget"):
+        evaluated = [copy.deepcopy(n) for n in self.nodes if n.evaluation_order is not None]
+        candidates, shortlist = select_deepest_candidates(evaluated, limit=self.config.num_candidates)
+        selected = shortlist[0]
+        distinct_counts = {}
+        for n in evaluated:
+            distinct_counts.setdefault(n.depth, set()).add(_state_key(n.state))
+        counts = {d: len(states) for d, states in distinct_counts.items()}
+
+        selection_record = {
+            "stage": "search_selection",
+            "trace_schema_version": "search_trace_v1",
+            "requested_depth": self.config.init_tokens,
+            "requested_budget": budget,
+            "candidate_ids": [n.node_id for n in candidates],
+            "shortlist_ids": [n.node_id for n in shortlist],
+            "selected_node_id": selected.node_id,
+            "selected_depth": selected.depth,
+            "stop_reason": stop_reason or "model_call_budget",
+            "fallback": selected.depth < self.config.init_tokens,
+            "candidate_selection_version": CANDIDATE_SELECTION_VERSION,
+            "root_action_count": len(self.root.analysis.actions) if self.root.analysis else 0,
+            "node_statistics": [{"node_id": n.node_id, "visits": n.visits,
+                                 "reward_sum": n.reward_sum, "q_value": n.mean_reward}
+                                for n in evaluated]
+        }
+
+        return {
+            "budget": budget,
+            "model_calls": min(self.model_calls, budget),
+            "nodes": evaluated,
+            "candidates": candidates,
+            "shortlist": shortlist,
+            "selected": selected,
+            "selection": selection_record,
+            "trace": copy.deepcopy(self.trace),
+            "stop_reason": stop_reason or "model_call_budget",
+            "distinct_candidates_by_depth": counts,
+            "max_depth_reached": max(distinct_counts.keys(), default=0),
+            "selected_depth": selected.depth,
+            "selection_depth_gap": max(distinct_counts.keys(), default=0) - selected.depth,
+            "selected_depth_candidate_count": counts.get(selected.depth, 0),
+            "shortlist_node_ids": [n.node_id for n in shortlist],
+            "selected_node_id": selected.node_id,
+            "selected_q": selected.mean_reward,
+            "selected_state_hash": hashlib.sha256(repr(_state_key(selected.state)).encode()).hexdigest(),
+            "reached_target_depth": self.config.init_tokens in distinct_counts,
+            "selection_below_target": selected.depth < self.config.init_tokens,
+            "fallback_used": selected.depth < self.config.init_tokens,
+        }
+
+    def _check_checkpoint(self, stop_reason=None):
+        if not self.checkpoint_budgets:
+            return
+        if self.model_calls in self.checkpoint_budgets and self.model_calls not in self.checkpoints:
+            self.checkpoints[self.model_calls] = self._snapshot_checkpoint(self.model_calls, stop_reason=stop_reason)
+            self._emit("search_checkpoint", budget=self.model_calls,
+                       selected_node_id=self.checkpoints[self.model_calls]["selected_node_id"],
+                       selected_depth=self.checkpoints[self.model_calls]["selected_depth"])
+
+    def _record_evaluated(self, node):
+        """Compact, model-free identity of each successfully evaluated state."""
+        node.evaluation_order = self.simulations_completed if node.parent else 0
+        self._emit("node_evaluated", trace_schema_version="search_trace_v1",
+                   node_id=node.node_id, parent_id=node.parent.node_id if node.parent else None,
+                   depth=node.depth, evaluation_order=node.evaluation_order,
+                   state_hash=candidate_value_record(node)["state_hash"],
+                   immediate_reward=node.immediate_reward,
+                   action=None if node.action is None else asdict(node.action))
+
     def _close_exhausted(self, node):
         while node is not None:
             node.closed = node.depth >= self.config.init_tokens or (
@@ -582,16 +727,44 @@ class MCTSSearch:
     def _at_simulation_cap(self):
         return self.config.max_simulations is not None and self.simulations_completed >= self.config.max_simulations
 
+    def _assumptions(self):
+        assumptions = dict(RECONSTRUCTION_ASSUMPTIONS)
+        if self.config.stop_mode == "budget":
+            assumptions.update(
+                quota="stop at the forward cap or exhausted frontier; no candidate quota",
+                candidate_evaluation=("deepest depth with at least C distinct evaluated states (else the most "
+                                      "populated depth, deeper on ties); first-occurrence deduplication; "
+                                      "cached mean rewards"),
+            )
+        return assumptions
+
     def _finish(self, reason):
         with self._counted.phase("candidate_evaluation"):
-            for node in self.candidates.values():
+            candidates = (select_deepest_candidates(self.nodes, self.config.num_candidates)[0]
+                          if self.config.stop_mode == "budget" else self.candidates.values())
+            for node in candidates:
                 self._emit("candidate_evaluation", phase="candidate_evaluation", node_id=node.node_id,
-                           reward=node.mean_reward, immediate_gain=node.immediate_reward, model_calls=0,
+                           reward=node.mean_reward, immediate_gain=node.immediate_reward,
+                           visits=node.visits, reward_sum=node.reward_sum, q_value=node.mean_reward, model_calls=0,
                            state=state_record(node.state, self.prompt_len, self.mask_id, self.tokenizer))
             self.stop_reason = reason
             result = self.result()
+        for b in self.checkpoint_budgets:
+            if b not in self.checkpoints:
+                self.checkpoints[b] = self._snapshot_checkpoint(b, stop_reason=reason)
         result.stats["candidate_evaluation_latency_seconds"] = self._counted.seconds["candidate_evaluation"]
-        self._emit("termination", **{k:v for k,v in result.stats.items() if not k.endswith("_latency_seconds")},
+        self._emit("search_selection", trace_schema_version="search_trace_v1",
+                   requested_depth=self.config.init_tokens, requested_budget=self.config.max_model_calls,
+                   candidate_ids=result.stats["candidate_ids"],
+                   shortlist_ids=[row["node_id"] for row in result.stats["candidate_shortlist"]],
+                   selected_node_id=result.selected.node_id, selected_depth=result.selected.depth,
+                   stop_reason=reason, fallback=result.selected.depth < self.config.init_tokens,
+                   candidate_selection_version=result.stats["candidate_selection_version"],
+                   root_action_count=len(self.root.analysis.actions),
+                   node_statistics=[{"node_id": n.node_id, "visits": n.visits,
+                                     "reward_sum": n.reward_sum, "q_value": n.mean_reward}
+                                    for n in self.nodes if n.evaluation_order is not None])
+        self._emit("termination", **{k:v for k,v in result.stats.items() if "seconds" not in k},
                    selected_state=state_record(result.selected.state, self.prompt_len, self.mask_id, self.tokenizer))
         if self.config.stop_mode == "candidates" and result.stats["fallback_used"]:
             raise SearchIncompleteError(result.stats)
@@ -607,16 +780,18 @@ class MCTSSearch:
                 self.root.analysis = analyze_state(self._counted, self.root.state, self.prompt_len,
                                                    self.mask_id, self.config,
                                                    search_excluded_token_ids=self.search_excluded_token_ids)
+            self._record_evaluated(self.root)
             self._emit("initialization", node_id=0, entropy=self.root.analysis.total_entropy,
                        masked_count=self.root.state.shape[1] - self.prompt_len,
                        mean_token_entropy=self.root.analysis.total_entropy / (self.root.state.shape[1] - self.prompt_len),
                        mean_confidence_margin=self.root.analysis.mean_margin,
                        signal_nfe=self.model_calls, signal_extra_nfes=0,
-                       implementation_version=IMPLEMENTATION_VERSION, assumptions=RECONSTRUCTION_ASSUMPTIONS,
+                       implementation_version=IMPLEMENTATION_VERSION, assumptions=self._assumptions(),
                        model_device=str(model_device(self.model)), search_state_device="cpu",
                        entropies=self.root.analysis.entropies.tolist(),
                        state=state_record(self.root.state, self.prompt_len, self.mask_id, self.tokenizer),
                        actions=[action_record(a, self.tokenizer) for a in self.root.analysis.actions])
+            self._check_checkpoint()
         if self._at_cap():
             self._finish("model_call_budget")
             return self.trace[start:]
@@ -652,12 +827,14 @@ class MCTSSearch:
                 self._finish("model_call_budget")
                 return self.trace[start:]
             self.simulations_completed += 1
+            self._record_evaluated(child)
             self._emit("evaluation", parent_id=parent.node_id, child_id=child.node_id,
                        depth=child.depth, action=action_record(action, self.tokenizer),
                        child_state=state_record(child.state, self.prompt_len, self.mask_id, self.tokenizer), **evaluation)
             with self._counted.phase("backpropagation"):
                 updates = backpropagate(child, evaluation["reward"])
             self._emit("backpropagation", child_id=child.node_id, reward=evaluation["reward"], updates=updates)
+            self._check_checkpoint()
             if child.depth == self.config.init_tokens:
                 key = _state_key(child.state)
                 duplicate = key in self.candidates
@@ -682,18 +859,22 @@ class MCTSSearch:
         """Read-only snapshot; provisional frontier selection during inspection."""
         if self.root.analysis is None:
             raise RuntimeError("Call step() or run() before requesting a result.")
-        candidates = list(self.candidates.values())
+        target_candidates = list(self.candidates.values())
+        candidates = target_candidates
         evaluated = [node for node in self.nodes if node.immediate_reward is not None]
-        if candidates:
+        if self.config.stop_mode == "budget":
+            candidates, shortlist = select_deepest_candidates(self.nodes, self.config.num_candidates)
+            selected = shortlist[0]
+        elif candidates:
             selected = max(candidates, key=lambda n: n.mean_reward)
         else:
             selected = min(evaluated or [self.root], key=lambda n: (-n.depth, -n.mean_reward, n.node_id))
         score = selected.mean_reward
-        complete = len(candidates) >= self.config.num_candidates
+        complete = len(target_candidates) >= self.config.num_candidates
         fallback = self.done and not complete
         parents = len({node.parent.node_id for node in evaluated})
         stats = {"implementation_version": IMPLEMENTATION_VERSION, "paper_url": PAPER_URL,
-                 "reconstruction_assumptions": dict(RECONSTRUCTION_ASSUMPTIONS),
+                 "reconstruction_assumptions": self._assumptions(),
                  "evaluation_variant": "budget-limited MEDAL reconstruction (immediate-child IG)" if self.config.stop_mode == "budget"
                  else "MEDAL reconstruction (immediate-child IG)",
                  "finished": self.done, "stop_reason": self.stop_reason, "stop_mode": self.config.stop_mode,
@@ -709,23 +890,24 @@ class MCTSSearch:
                  "average_search_depth": sum(n.depth for n in evaluated) / len(evaluated) if evaluated else 0.0,
                  "expanded_nodes": len({_state_key(n.state) for n in evaluated}),
                  "unique_tree_states": len({_state_key(n.state) for n in self.nodes}),
-                 "max_depth": max(n.depth for n in self.nodes), "candidate_target": self.config.num_candidates,
+                 "max_depth": max((n.depth for n in evaluated), default=0), "candidate_target": self.config.num_candidates,
                  "candidate_count": len(candidates), "evaluated_candidates": len(candidates),
+                 "target_depth_candidate_count": len(target_candidates),
                  "evaluated_children": len(evaluated), "expanded_parents": parents,
                  "realized_branching_factor": len(evaluated) / parents if parents else 0.0,
                  "candidate_ids": [n.node_id for n in candidates], "selected_node_id": selected.node_id,
                  "selected_score": score, "fallback_used": fallback,
                  "fallback_reason": self.stop_reason if fallback else None, "budget_exhausted": self._at_cap(),
-                 "candidate_evaluations": [{"node_id": n.node_id, "reward": n.mean_reward,
-                     "immediate_gain": n.immediate_reward, "model_calls": 0,
+                 "candidate_evaluations": [{**candidate_value_record(n), "model_calls": 0,
                      **state_record(n.state, self.prompt_len, self.mask_id, self.tokenizer)} for n in candidates]}
         # Additive metadata: preserve legacy fallback_used (quota shortfall) for
         # old callers. E0 distinguishes that from actually decoding below Lc.
         shortlist = sorted(candidates, key=lambda n: (-n.mean_reward, n.node_id))[:self.config.num_candidates]
-        source = "target_depth" if candidates else "deepest_evaluated" if evaluated else "root"
+        source = ("target_depth" if selected.depth == self.config.init_tokens
+                  else "deepest_evaluated" if evaluated else "root")
         stats.update(search_excluded_token_ids=list(self.search_excluded_token_ids),
-                     candidate_shortlist=[{"node_id": n.node_id, "depth": n.depth,
-                                           "reward": n.mean_reward} for n in shortlist],
+                     candidate_selection_version=CANDIDATE_SELECTION_VERSION if self.config.stop_mode == "budget" else "target_mean_q_v1",
+                     candidate_shortlist=[candidate_value_record(n) for n in shortlist],
                      shortlist_size=len(shortlist), shortlist_underfilled=len(shortlist) < self.config.num_candidates,
                      selection_source=source, fallback_decode_used=source != "target_depth")
         return SearchResult(selected, candidates, stats, list(self.trace))

@@ -1,11 +1,12 @@
-"""Validate one pinned GSM8K example and save the complete Adaptive MEDAL audit.
+"""Run fixed-protocol AB development (default: first dev question, Lc=10, B=256).
 
-Example (CUDA / Colab, target-reaching and uncapped):
-    python scripts/run_ab_medal_single.py --example-index 0 --seed 1 \
-        --Lc 20 --C 3 --K1 3 --K2 5 --output-dir results/ab_medal/single
+Legacy comparison adapters below retain explicit candidate-mode behavior.
 
-Finite synthetic trees test the mechanism on CPU. They do not establish that a
-real DLM reaches the target; metrics.json records that gate separately.
+Example (CUDA / Colab):
+    python scripts/run_ab_medal_single.py --condition A --num-samples 1
+    python scripts/run_ab_medal_single.py --condition A --num-samples 5
+    python scripts/run_ab_medal_single.py --from-result PATH_TO_QUESTION_ARTIFACTS
+
 """
 
 import argparse
@@ -57,6 +58,7 @@ def plot_tree(tree, path, *, max_nodes=120, max_depth=20):
     if max_nodes < 1 or max_depth < 0:
         raise ValueError("Tree plot limits require max_nodes >= 1 and max_depth >= 0.")
     nodes = {n["node_id"]: n for n in tree["nodes"]}
+    adaptive = any(n.get('posteriors') for n in nodes.values())
     visible = []
 
     def visit(node_id):
@@ -108,7 +110,7 @@ def plot_tree(tree, path, *, max_nodes=120, max_depth=20):
         if node["candidate"]:
             label += "\nTERMINAL CANDIDATE"
         text(x, y, label, "#d1fadf" if node["candidate"] else "#eff4ff")
-        if not node["candidate"]:
+        if adaptive and not node["candidate"]:
             for name, offset in (("GEN", -.23), ("CONT", .23)):
                 count = sum(d["choice"] == name for d in node.get("decisions", []))
                 model = models.get(name)
@@ -122,7 +124,8 @@ def plot_tree(tree, path, *, max_nodes=120, max_depth=20):
             action = child["action"]
             reward = child["immediate_reward"]
             label = f"p{action['output_position']}=t{action['token_id']}\nr={reward:+.3g}" if reward is not None else "unevaluated"
-            edge(x + .23, y - 1.1, positions[child_id], -child["depth"] * 3 + .3, label)
+            edge(x + (.23 if adaptive else 0), y - (1.1 if adaptive else .3),
+                 positions[child_id], -child["depth"] * 3 + .3, label)
         omitted_roots = [c for c in node["children"] if c not in shown]
         if omitted_roots:
             pending, omitted = list(omitted_roots), 0
@@ -133,9 +136,10 @@ def plot_tree(tree, path, *, max_nodes=120, max_depth=20):
             text(x, y - 1.65, f"… {omitted} nodes omitted\n(plot limit)", "#fff1f3", 6)
     axis.set_xlim(-.7, max(positions.values()) + .7)
     axis.set_ylim(-depth * 3 - 2.3, 1)
-    axis.set_title(f"Adaptive MEDAL: {len(visible)}/{len(nodes)} states shown; "
-                   "GEN generates one action, CONT chooses an existing child\n"
-                   "m = posterior location; green = distinct terminal candidate; full tree in tree.json", fontsize=10)
+    mechanism = ('Adaptive MEDAL: GEN/CONT; m = posterior location' if adaptive
+                 else 'MEDAL: UCB selection and retained-sibling expansion rounds')
+    axis.set_title(f"{mechanism}\n{len(visible)}/{len(nodes)} states shown; "
+                   "green = distinct deepest candidate; full tree in tree.json", fontsize=10)
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     FigureCanvasAgg(figure).print_png(str(path))
@@ -272,7 +276,7 @@ def add_common_arguments(parser):
 
 
 def search_config(args, max_nfe=None, *, adaptive=True):
-    settings = dict(init_tokens=args.Lc, num_candidates=args.C, top_k_tokens=args.K1,
+    settings = dict(stop_mode="candidates", init_tokens=args.Lc, num_candidates=args.C, top_k_tokens=args.K1,
                     top_k_actions=args.K2, max_model_calls=max_nfe)
     if adaptive:
         settings.update(prior_m=args.prior_m, prior_kappa=args.prior_kappa, prior_nu=args.prior_nu,
@@ -301,7 +305,7 @@ def load_inputs(args):
                                "model_load_count": 1, "warmup_model_calls": 0, "warmup_wall_seconds": 0.0}
 
 
-def main(argv=None):
+def legacy_main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     add_common_arguments(parser)
     parser.add_argument("--example-index", type=int, default=0, help="Zero-based pinned GSM8K test index.")
@@ -330,6 +334,12 @@ def main(argv=None):
                          plot_max_nodes=args.plot_max_nodes, plot_max_depth=args.plot_max_depth)
     print(f"Full-target DLM gate: {'observed' if report['full_target_dlm_gate'] else 'NOT satisfied'}", flush=True)
     return 0 if report["status"] == "complete" else 2
+
+
+def main(argv=None):
+    """Current entry point; legacy adapters above serve historical comparisons."""
+    from dlm_project.tasks.gsm8k.ab_development import main as development_main
+    return development_main(argv)
 
 
 if __name__ == "__main__":

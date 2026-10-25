@@ -1,3 +1,7 @@
+> **Historical E0 v1–v4 reference.** The current script implements v5. Use the
+> [shared protocol and E0 v5 guide](../experiments.md) for current settings and
+> commands. Existing notebooks remain legacy and were not updated.
+
 # Experiment 0: Baseline Test — implementation README
 
 E0 measures how effectively MEDAL uses a fixed search budget on GSM8K. It
@@ -344,17 +348,13 @@ configuration and run cells. Freeze settings on development/evaluation
 questions before viewing final-test answers; testing remains `Lc=5` unless
 changed beforehand.
 
-For a single interactive MEDAL run, use
+For a current single-sample MEDAL run, use
 [`MEDAL_MCTS_Demo.ipynb`](../../notebooks/gsm8k/MEDAL_MCTS_Demo.ipynb).
-Its existing cells use this E0 prompt, search and EOS policy, with `Lc=5` and
-one `SEARCH_BUDGET=512` control (alternatives 1024/2048). A no-search MEDAL
-decoder block runs before MCTS using the same loaded model, prompt and completion
-seed; it displays separate full/scored outputs and metrics, costs 256 forwards
-by default, and is excluded from searched MEDAL's reported totals. Live counters show
-budget use, evaluated depth and candidates. The report includes E0's applicable
-MEDAL metrics and separate pipeline/decoding timings; completion reruns reuse
-the initialization. Its optional batch remains disabled by default. The
-standalone `demo_medal.py` CLI retains its legacy defaults.
+It now follows the [matched MEDAL/AB development workflow](../medal_notebook.md):
+first frozen development question, Lc=10, search budget=256, Confidence T=0,
+common offline metrics and optional parity-validated independent-question
+batching. The historical defaults in this document do not apply to that
+notebook. The standalone `demo_medal.py` CLI retains its legacy interfaces.
 
 ### Command line
 

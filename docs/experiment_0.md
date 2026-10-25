@@ -1,5 +1,6 @@
-# Experiment 0: Baseline Test
+# Experiment 0: fixed-budget baseline
 
-See the [Experiment 0 implementation README](experiment_0/README.md) for the
-protocol, implementation map, Colab notebooks, command-line options, result
-schemas, metrics, and validation runbook.
+See the [shared experiment protocol and E0 v5 guide](experiments.md) for the
+frozen samples, exact prompt, candidate selection, condition matrix, metrics,
+commands, and validation. The [historical implementation guide](experiment_0/README.md)
+records v1–v4 behavior and legacy notebooks.

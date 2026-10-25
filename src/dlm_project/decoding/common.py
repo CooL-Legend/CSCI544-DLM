@@ -53,6 +53,41 @@ def initialize_state(prompt_ids, mask_id, gen_length, device, initial_state=None
     return initial_state.detach().to(device).clone()
 
 
+def commit_from_logits(state, logits, prompt_len, mask_id, positions, count, *,
+                       selection_rule="token_probability", temperature=0.0):
+    """One shared serial/batched commitment operation; never invokes the model."""
+    unresolved = torch.nonzero(state[0, prompt_len:] == mask_id, as_tuple=False).flatten() + prompt_len
+    signals = masked_state_signals(logits, unresolved)
+    positions = positions.to(logits.device)
+    local = logits[positions].float().clone()
+    if local.shape[-1] < 2 or mask_id >= local.shape[-1]:
+        raise ValueError("Model vocabulary must contain mask_id and a legal token.")
+    local[:, mask_id] = -torch.inf
+    probabilities = local.softmax(dim=-1)
+    if not torch.isfinite(probabilities).all():
+        raise ValueError("Non-finite model probabilities in masked decoding.")
+    shifted = local - local.max(dim=-1, keepdim=True).values
+    proposed = add_gumbel_noise(shifted, temperature).argmax(dim=-1)
+    proposed_probabilities = probabilities.gather(-1, proposed[:, None]).squeeze(-1)
+    if selection_rule == "random_position":
+        scores = torch.rand(positions.numel(), device=logits.device)
+    elif selection_rule == "token_probability":
+        scores = proposed_probabilities
+    elif selection_rule == "lowest_entropy":
+        scores = -torch.special.entr(probabilities).sum(dim=-1)
+    elif selection_rule == "top_two_margin":
+        top_two = probabilities.topk(2, dim=-1).values
+        scores = top_two[:, 0] - top_two[:, 1]
+    else:
+        raise ValueError(f"Unknown position selection rule: {selection_rule}")
+    chosen = torch.argsort(scores, descending=True, stable=True)[:count]
+    state[0, positions[chosen].to(state.device)] = proposed[chosen].to(state.device)
+    actions = [{"output_position": int(positions[i].item()) - prompt_len,
+                "token_id": int(proposed[i].item()), "selection_score": float(scores[i].item()),
+                "token_probability": float(proposed_probabilities[i].item())} for i in chosen.tolist()]
+    return actions, signals
+
+
 @torch.inference_mode()
 def decode_masked(model, prompt_ids, mask_id, *, selection_rule, gen_length=256,
                   steps=256, block_length=128, temperature=1.0, seed=1,
@@ -86,35 +121,10 @@ def decode_masked(model, prompt_ids, mask_id, *, selection_rule, gen_length=256,
             positions = torch.nonzero(state[0, start:end] == mask_id, as_tuple=False).flatten() + start
             prediction = model(state)
             calls += 1
-            unresolved = torch.nonzero(state[0, prompt_len:] == mask_id, as_tuple=False).flatten() + prompt_len
-            signals = masked_state_signals(prediction.logits[0], unresolved)
-            logits = prediction.logits[0, positions].float().clone()
+            actions, signals = commit_from_logits(
+                state, prediction.logits[0], prompt_len, mask_id, positions, count,
+                selection_rule=selection_rule, temperature=temperature)
             del prediction
-            if logits.shape[-1] < 2 or mask_id >= logits.shape[-1]:
-                raise ValueError("Model vocabulary must contain mask_id and a legal token.")
-            logits[:, mask_id] = -torch.inf
-            probabilities = logits.softmax(dim=-1)
-            if not torch.isfinite(probabilities).all():
-                raise ValueError("Non-finite model probabilities in masked decoding.")
-            shifted = logits - logits.max(dim=-1, keepdim=True).values
-            proposed = add_gumbel_noise(shifted, temperature).argmax(dim=-1)
-            proposed_probabilities = probabilities.gather(-1, proposed[:, None]).squeeze(-1)
-            if selection_rule == "random_position":
-                scores = torch.rand(positions.numel(), device=device)
-            elif selection_rule == "token_probability":
-                scores = proposed_probabilities
-            elif selection_rule == "lowest_entropy":
-                scores = -torch.special.entr(probabilities).sum(dim=-1)
-            else:
-                top_two = probabilities.topk(2, dim=-1).values
-                scores = top_two[:, 0] - top_two[:, 1]
-            chosen = torch.argsort(scores, descending=True, stable=True)[:count]
-            state[0, positions[chosen]] = proposed[chosen]
-            actions = [{"output_position": int(positions[i].item()) - prompt_len,
-                        "token_id": int(proposed[i].item()),
-                        "selection_score": float(scores[i].item()),
-                        "token_probability": float(proposed_probabilities[i].item())}
-                       for i in chosen.tolist()]
             if selection_rule == "top_two_margin":
                 selected_margins.extend(action["selection_score"] for action in actions)
             trace.append({"stage": "commit", "block": block, "step": step,
