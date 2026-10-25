@@ -3,7 +3,8 @@
 Immediate parent-to-child information gain, cached candidate ranking,
 and literal adjusted-score softmax completion. The interpretation
 choices are exported in RECONSTRUCTION_ASSUMPTIONS; author-code parity is not
-claimed. Trees retain compact CPU states and never accept reference answers.
+claimed. Optional AdaLook-inspired confidence rewards and temporary adaptive
+rollout are explicitly configured; trees never accept reference answers.
 """
 
 import copy
@@ -30,8 +31,28 @@ class MCTSConfig:
     exploration_c: float = 0.01
     epsilon: float = 1e-8
     stop_mode: str = "candidates"
+    reward_mode: str = "ig"
+    adalook_alpha: float = 0.1
+    adalook_confidence_threshold: float = 0.8
+    adalook_max_depth: int = 2
+    adalook_variance_threshold: float = 0.01
+    adalook_trigger_threshold: float = 0.2
+    adalook_min_masks: int = 2
 
     def __post_init__(self):
+        if self.reward_mode not in ("ig", "adalook_one_step", "adalook_adaptive"):
+            raise ValueError("Unknown MCTS reward_mode.")
+        if self.reward_mode == "adalook_adaptive" and self.stop_mode != "budget":
+            raise ValueError("Adaptive AdaLook requires budget stopping.")
+        for name in ("adalook_max_depth", "adalook_min_masks"):
+            if type(getattr(self, name)) is not int or getattr(self, name) < 1:
+                raise ValueError(f"{name} must be a positive integer.")
+        for name in ("adalook_alpha", "adalook_confidence_threshold", "adalook_variance_threshold", "adalook_trigger_threshold"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+                raise ValueError(f"Invalid {name}.")
+        if not 0 < self.adalook_confidence_threshold <= 1 or self.adalook_trigger_threshold > 1:
+            raise ValueError("AdaLook confidence thresholds must be probabilities.")
         if self.stop_mode not in ("candidates", "budget"):
             raise ValueError("mcts.stop_mode must be candidates or budget.")
         for name in ("init_tokens", "num_candidates", "top_k_tokens",
@@ -106,6 +127,10 @@ class StateAnalysis:
     actions: tuple[Action, ...]
     state_key: tuple[int, ...]
     mean_margin: float | None = None
+    positions: torch.Tensor | None = None
+    confidences: torch.Tensor | None = None
+    proposed_tokens: torch.Tensor | None = None
+    confidence_mass: float = 0.0
 
     @property
     def total_entropy(self):
@@ -128,6 +153,7 @@ class Node:
     closed: bool = False
     immediate_reward: float | None = None
     evaluation_order: int | None = None
+    ig_reward: float | None = None
 
     @property
     def mean_reward(self):
@@ -206,7 +232,7 @@ def select_deepest_candidates(nodes, limit=3):
 def candidate_value_record(node):
     return {"node_id": node.node_id, "depth": node.depth, "visits": node.visits,
             "reward_sum": node.reward_sum, "q_value": node.mean_reward,
-            "reward": node.mean_reward, "immediate_gain": node.immediate_reward,
+            "reward": node.mean_reward, "immediate_gain": node.ig_reward if node.ig_reward is not None else node.immediate_reward,
             "state_hash": hashlib.sha256(repr(_state_key(node.state)).encode()).hexdigest()}
 
 
@@ -300,8 +326,18 @@ def distribution_from_logits(logits, state, prompt_len, mask_id, config, *,
                 actions.append(Action(position, token_id, probability * factors_cpu[row],
                                       probability, h_cpu[row].item(), margins_cpu[row]))
         actions.sort(key=_action_order)
-    return (StateAnalysis(entropies, tuple(actions[:config.top_k_actions]), _state_key(state), margins.mean().item()),
-            positions, probabilities, factors)
+    analysis = StateAnalysis(entropies, tuple(actions[:config.top_k_actions]), _state_key(state), margins.mean().item())
+    if config.reward_mode != "ig":
+        confidence, tokens = probabilities.max(dim=-1)
+        legal = tokens != mask_id
+        for token in search_excluded_token_ids:
+            legal &= tokens != token
+        analysis.positions = positions.cpu()
+        analysis.confidences = confidence.detach().cpu()
+        analysis.proposed_tokens = tokens.detach().cpu()
+        eligible = legal & (confidence >= config.adalook_confidence_threshold)
+        analysis.confidence_mass = confidence[eligible].double().sum().item()
+    return analysis, positions, probabilities, factors
 
 
 @torch.inference_mode()
@@ -403,7 +439,7 @@ class _SearchModel:
         self.model, self.cap, self.emit = model, cap, emit
         self.calls = 0
         self.current_phase = "tree_analysis"
-        self.counts = {name: 0 for name in ("tree_analysis", "simulation", "candidate_evaluation")}
+        self.counts = {name: 0 for name in ("tree_analysis", "simulation", "candidate_evaluation", "adalook_rollout")}
         self.seconds = dict.fromkeys((*self.counts, "selection", "candidate_filtering",
                                      "expansion", "backpropagation"), 0.0)
 
@@ -547,31 +583,23 @@ def apply_child_analysis(parent, child, analysis, prompt_len, mask_id, config, *
         raise ValueError("Evaluation requires a cached parent and an unevaluated child.")
     before, after = parent.analysis.total_entropy, analysis.total_entropy
 
-    # Any trajectory Based Method --> For experiment 2
-    # AdaLook-inspired score with R=1, not adaptive multi-step rollout.
-    # Reuse the child forward; its state and native probabilities stay unchanged.
-    alpha = 0.1
-    confidence_threshold = 0.8  # Local experiment setting, not a paper default.
-    confidence_mass = 0.0
-    if probabilities is not None:
-        confidence, proposed_tokens = probabilities.max(dim=-1)
-        eligible = (confidence >= confidence_threshold) & (proposed_tokens != mask_id)
-        for token_id in search_excluded_token_ids:
-            eligible &= proposed_tokens != token_id
-        confidence_mass = confidence[eligible].double().sum().item()
-    reward = (alpha * math.log(max(child.action.probability, config.epsilon))
-              + math.log(max(confidence_mass, config.epsilon)))
+    gain = information_gain(before, after, config.epsilon)
+    reward = gain
+    if config.reward_mode != "ig":
+        from dlm_project.decoding.adalook_rollout import score
+        reward = score(child.action.probability, analysis.confidence_mass, config)
 
     if not math.isfinite(reward):
         raise ValueError("Non-finite child reward.")
     child.analysis, child.immediate_reward = analysis, reward
+    child.ig_reward = gain
     remaining = int((child.state[0, prompt_len:] == mask_id).sum().item())
     removed = parent.analysis.entropies[child.action.output_position].item()
     return {"entropy_before": before, "entropy_after": after,
             "immediate_gain": information_gain(before, after, config.epsilon),
-            "reward": reward, "reward_method": "adalook_one_step",
-            "reward_alpha": alpha, "reward_confidence_threshold": confidence_threshold,
-            "reward_confidence_mass": confidence_mass,
+            "reward": reward, "reward_method": config.reward_mode,
+            "reward_alpha": config.adalook_alpha, "reward_confidence_threshold": config.adalook_confidence_threshold,
+            "reward_confidence_mass": analysis.confidence_mass,
             "evaluation_model_calls": int(remaining > 0),
             "masked_count": remaining, "mean_token_entropy": after / remaining if remaining else 0.0,
             "mean_confidence_margin": analysis.mean_margin,
@@ -645,6 +673,7 @@ class MCTSSearch:
         self.checkpoints = {}
         self.checkpoint_budgets = tuple(checkpoint_budgets) if checkpoint_budgets is not None else getattr(self.config, "checkpoint_budgets", ())
         self._counted = _SearchModel(model, self.config.max_model_calls, self._emit)
+        self._adalook_driver = None
 
     @property
     def model_calls(self):
@@ -728,6 +757,7 @@ class MCTSSearch:
                    depth=node.depth, evaluation_order=node.evaluation_order,
                    state_hash=candidate_value_record(node)["state_hash"],
                    immediate_reward=node.immediate_reward,
+                   immediate_gain=node.ig_reward, reward_mode=self.config.reward_mode,
                    action=None if node.action is None else asdict(node.action))
 
     def _close_exhausted(self, node):
@@ -744,6 +774,10 @@ class MCTSSearch:
 
     def _assumptions(self):
         assumptions = dict(RECONSTRUCTION_ASSUMPTIONS)
+        if self.config.reward_mode != "ig":
+            assumptions.update(reward=self.config.reward_mode,
+                simulation="MEDAL actions; AdaLook-inspired confidence scoring; temporary adaptive rollout only when enabled",
+                adalook="MCTS hybrid, not a reproduction of the ETE/block decoder; global masked frontier")
         if self.config.stop_mode == "budget":
             assumptions.update(
                 quota="stop at the forward cap or exhausted frontier; no candidate quota",
@@ -759,7 +793,7 @@ class MCTSSearch:
                           if self.config.stop_mode == "budget" else self.candidates.values())
             for node in candidates:
                 self._emit("candidate_evaluation", phase="candidate_evaluation", node_id=node.node_id,
-                           reward=node.mean_reward, immediate_gain=node.immediate_reward,
+                           reward=node.mean_reward, immediate_gain=node.ig_reward,
                            visits=node.visits, reward_sum=node.reward_sum, q_value=node.mean_reward, model_calls=0,
                            state=state_record(node.state, self.prompt_len, self.mask_id, self.tokenizer))
             self.stop_reason = reason
@@ -786,6 +820,21 @@ class MCTSSearch:
 
     @torch.inference_mode()
     def step(self):
+        if self.config.reward_mode == "adalook_adaptive":
+            start = len(self.trace)
+            cycle = self.cycle
+            while not self.done:
+                request = self.next_evaluation()
+                if request is None:
+                    break
+                self.record_external_forward(request, invocation_id=self.model_calls + 1, batch_size=1)
+                with self._counted.phase(request.phase):
+                    output = self.model(request.node.state.to(model_device(self.model)))
+                self.submit_evaluation(request, logits=output.logits[0])
+                del output
+                if self.cycle > cycle:
+                    break
+            return self.trace[start:]
         if self.done:
             return []
         start = len(self.trace)
@@ -925,7 +974,29 @@ class MCTSSearch:
                      candidate_shortlist=[candidate_value_record(n) for n in shortlist],
                      shortlist_size=len(shortlist), shortlist_underfilled=len(shortlist) < self.config.num_candidates,
                      selection_source=source, fallback_decode_used=source != "target_depth")
+        groups = [e for e in self.trace if e['stage'] == 'adalook_group']
+        if self.config.reward_mode != 'ig':
+            stats['evaluation_variant'] = 'MEDAL + ' + self.config.reward_mode + ' (hybrid)'
+        stats.update(reward_mode=self.config.reward_mode,
+                     reward_version="ig" if self.config.reward_mode == 'ig' else "medal_adalook_hybrid_v1",
+                     adalook_config={k: v for k, v in asdict(self.config).items() if k.startswith('adalook_')},
+                     adalook_extra_nfes=self._counted.counts['adalook_rollout'],
+                     adalook_groups=groups,
+                     adalook_mean_depth=sum(g['rollout_depth'] for g in groups) / len(groups) if groups else 1.0,
+                     selected_ig_reward=selected.ig_reward)
         return SearchResult(selected, candidates, stats, list(self.trace))
+
+    def next_evaluation(self):
+        from dlm_project.decoding.adalook_rollout import AdaptiveDriver
+        if self._adalook_driver is None:
+            self._adalook_driver = AdaptiveDriver(self)
+        return self._adalook_driver.next_evaluation()
+
+    def record_external_forward(self, request, *, invocation_id, batch_size):
+        return self._adalook_driver.record_external_forward(request, invocation_id, batch_size)
+
+    def submit_evaluation(self, request, *, logits):
+        return self._adalook_driver.submit_evaluation(request, logits)
 
     def run(self):
         while not self.done:

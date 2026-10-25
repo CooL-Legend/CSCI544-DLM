@@ -4,6 +4,12 @@ Evaluate **LLaDA-8B-Instruct**, **iLLaDA-8B-Instruct**, and **LLaDA-8B-BGPO-sudo
 
 The **LLaDA and iLLaDA GSM8K notebooks** evaluate four shared decoding methods and display accuracy, inference cost, and randomly selected saved answers. LLaDA also includes the documented MEDAL reconstruction with immediate-child information gain, cached candidate ranking, and adjusted-score sampling.
 
+For offline sequential LLaDA/MCTS comparisons, see the [local AdaLook experiment guide](docs/gsm8k_local_experiments.md).
+`scripts/run_gsm8k_experiments.py` reads `.env` and supports `--reward-mode ig`,
+`adalook_one_step`, or `adalook_adaptive`, with per-question saves and strict resume.
+The MEDAL Demo exposes the same reward configuration. AdaLook here is a MEDAL
+hybrid with temporary adaptive rollout, not a reproduction of the paper's block decoder.
+
 | Model | Notebook on `chong` | Dependency profile |
 | --- | --- | --- |
 | LLaDA | [Open LLaDA in Colab](https://colab.research.google.com/github/CooL-Legend/CSCI544-DLM/blob/chong/notebooks/sudoku/LLaDA_Sudoku_Colab.ipynb) | Transformers 4.38.2 |
@@ -34,6 +40,52 @@ docs/                       # Structure guide and MCTS walkthrough
 ```
 
 Install the package with `python -m pip install --no-deps -e .` after installing a dependency profile. The Colab notebooks do this automatically. See [the structure guide](docs/project_structure.md) for file locations, imports, and commands. Model weights and run artifacts stay outside the source package.
+
+## Local GSM8K evaluation: LLaDA vs MEDAL + AdaLook
+
+Run from the repository root in your prepared LLaDA environment. If `.env` does
+not exist, copy `.env.example` to `.env`, then set `MODEL_CACHE_DIR`, `DATASET_DIR`,
+and `RESULTS_DIR` to your local paths. The runner uses cached model weights and
+the checked-in frozen question manifest; it does not download models or data.
+
+```bash
+# Check paths and effective settings without loading model weights.
+python scripts/run_gsm8k_experiments.py --dry-run \
+  --method both --reward-mode adalook_adaptive
+
+# Compare pure LLaDA with MEDAL + adaptive AdaLook on the same five test questions.
+python scripts/run_gsm8k_experiments.py \
+  --method both --reward-mode adalook_adaptive \
+  --stage test --num-samples 5 --search-budget 256
+
+# Run original MEDAL (IG) separately on the same questions and budget.
+python scripts/run_gsm8k_experiments.py \
+  --method mcts --reward-mode ig \
+  --stage test --num-samples 5 --search-budget 256
+
+# Optional score-only ablation, without adaptive multi-step rollout.
+python scripts/run_gsm8k_experiments.py \
+  --method mcts --reward-mode adalook_one_step \
+  --stage test --num-samples 5 --search-budget 256
+```
+
+`--method both` loads the model once, runs pure LLaDA first, then the selected
+MCTS variant. It produces a **two-method comparison**, not an automatic three-way
+comparison with original MEDAL. Separate invocations have separate reports.
+Use `--stage dev` for parameter calibration; the five-question run is a smoke
+test, not evidence of an accuracy improvement. AdaLook rollout evaluations count
+toward `--search-budget`.
+
+Each run prints its output directory under
+`RESULTS_DIR/LLaDA/GSM8K/llada_vs_mcts/<method>/<stage>/budget-lc10/<timestamp>/`
+(`10` is the default `--lc`). Results include `predictions.jsonl`, `traces/`,
+`summary.json`, and the comparison files `report/report.md`, `report/summary.csv`,
+and `report/comparison.png`. Predictions are saved after each question.
+
+To resume, repeat the exact command and add `--resume /path/to/run-directory`.
+Completed questions are skipped; settings and implementation must match.
+See the [full guide](docs/gsm8k_local_experiments.md) for parameters, saved metrics,
+and notebook usage.
 
 ## Experiment 0: fixed-budget GSM8K baseline test
 

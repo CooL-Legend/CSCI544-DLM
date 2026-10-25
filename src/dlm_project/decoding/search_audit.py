@@ -123,7 +123,7 @@ def from_events(events, *, prompt_ids=None, mask_id, gen_length, requested_depth
                                   depth=expanded["depth"], evaluation_order=len(nodes), state_hash=None,
                                   immediate_reward=event["reward"], action=expanded["action"]))
     nodes = [{key: row.get(key) for key in ("node_id", "parent_id", "depth", "evaluation_order",
-              "state_hash", "immediate_reward", "action")} for row in nodes]
+              "state_hash", "immediate_reward", "immediate_gain", "reward_mode", "action")} for row in nodes]
     by_id = {row["node_id"]: row for row in nodes}
     for row in nodes:
         row.update(visits=0, reward_sum=0.0, q_value=0.0)
@@ -156,11 +156,13 @@ def from_events(events, *, prompt_ids=None, mask_id, gen_length, requested_depth
                  search_nfes=search_nfes, nodes=nodes, selection=selection,
                  root_action_count=final["root_action_count"] if final else len(root_event.get("actions", [])),
                  decisions=[copy.deepcopy(e) for e in events if e.get("stage") == "adaptive_decision"] if adaptive else None,
-                 forwards=[copy.deepcopy(e) for e in events if e.get("stage") == "forward" and e.get("phase") in ("tree_analysis", "simulation", "candidate_evaluation")],
+                 adalook_groups=[copy.deepcopy(e) for e in events if e.get('stage') == 'adalook_group'],
+                 rollout_nfes=sum(e.get('stage') == 'forward' and e.get('phase') == 'adalook_rollout' for e in events),
+                 forwards=[copy.deepcopy(e) for e in events if e.get("stage") == "forward" and e.get("phase") in ("tree_analysis", "simulation", "candidate_evaluation", "adalook_rollout")],
                  availability={"explicit_state_hashes": modern, "explicit_evaluation_order": modern,
                                "final_selection": final is not None, "adaptive_decisions": adaptive})
     reconstruct(audit, prompt_ids)
-    if final is not None and len(nodes) != search_nfes:
+    if final is not None and len(nodes) + audit['rollout_nfes'] != search_nfes:
         raise ValueError("Successful search NFEs differ from evaluated root plus children.")
     return audit
 
@@ -186,7 +188,10 @@ def metrics(audit):
     unique = len(identities)
     duplicates = len(nodes) - unique
     rewards = [row["immediate_reward"] for row in children]
-    negative = sum(r < 0 for r in rewards)
+    gains = [row.get('immediate_gain') if row.get('immediate_gain') is not None else
+             row['immediate_reward'] if row.get('reward_mode') in (None, 'ig') else None for row in children]
+    gains = [g for g in gains if g is not None]
+    negative = sum(g < 0 for g in gains)
     deepest = max(depths, default=0)
     target = {tuple(sorted(paths[r["node_id"]])) for r in nodes if r["depth"] == audit["requested_depth"]}
     candidate_depth = selection["selected_depth"] if selection else deepest
@@ -226,12 +231,14 @@ def metrics(audit):
         root_subtree_coverage=len(subtrees) / audit["root_action_count"] if audit["root_action_count"] else None,
         deepest_candidate_root_subtrees=sorted({root_child[i] for i in candidate_representatives.values() if i != 0}),
         shortlist_root_subtrees=sorted({root_child[i] for i in shortlist if i != 0}),
-        negative_ig_count=negative, negative_ig_percentage=100 * negative / len(rewards) if rewards else None,
-        ig_min=min(rewards) if rewards else None, ig_mean=_mean(rewards), ig_max=max(rewards) if rewards else None,
+        negative_ig_count=negative, negative_ig_percentage=100 * negative / len(gains) if gains else None,
+        ig_min=min(gains) if gains else None, ig_mean=_mean(gains), ig_max=max(gains) if gains else None,
+        reward_min=min(rewards) if rewards else None, reward_mean=_mean(rewards), reward_max=max(rewards) if rewards else None,
+        adalook_extra_nfes=audit.get('rollout_nfes', 0), adalook_groups=audit.get('adalook_groups', []),
         selected_q=by_id[selection["selected_node_id"]]["q_value"] if selection else None,
         nfes_per_depth={str(k): v for k, v in sorted(depths.items())},
         nfes_per_root_subtree={str(k): v for k, v in sorted(subtrees.items())},
-        root_analysis_nfes=depths.get(0, 0), uncompleted_evaluation_nfes=nfe - len(nodes),
+        root_analysis_nfes=depths.get(0, 0), uncompleted_evaluation_nfes=nfe - len(nodes) - audit.get('rollout_nfes', 0),
         requested_depth_success=bool(target), fallback=selection["fallback"] if selection else None,
         fallback_rate=float(selection["fallback"]) if selection else None,
         stop_reason=selection["stop_reason"] if selection else None,
@@ -247,7 +254,8 @@ def metrics(audit):
                                 shared_prefix_length=min((p["shared_prefix_length"] for p in pairs), default=None)),
         state_hashes_available=hashes_available,
     )
-    if selection and (sum(depths.values()) != nfe or depths.get(0, 0) + sum(subtrees.values()) != nfe):
+    tree_nfes = nfe - audit.get('rollout_nfes', 0)
+    if selection and (sum(depths.values()) != tree_nfes or depths.get(0, 0) + sum(subtrees.values()) != tree_nfes):
         raise ValueError("Depth/subtree NFE allocation does not reconcile.")
     return result
 

@@ -201,7 +201,7 @@ def show_candidates(initialization, *, tokenizer=None, limit=3):
     rows = candidate_summaries(initialization, tokenizer=tokenizer, limit=limit)
     stats = initialization.result.stats
     print(f"Top {len(rows)} of {len(initialization.result.candidates)} initialization candidates")
-    print("Q = cached mean tree reward; target-depth leaves use last-edge normalized entropy reduction.")
+    print(f"Q = cached mean tree reward; reward mode: {initialization.result.stats.get('reward_mode', 'ig')}.")
     if rows and rows[0]["is_fallback"]:
         source = stats.get("selection_source", "root" if rows[0]["depth"] == 0 else "deepest_evaluated")
         print(f"No target-depth candidates. Selected {source} fallback at depth {rows[0]['depth']}.")

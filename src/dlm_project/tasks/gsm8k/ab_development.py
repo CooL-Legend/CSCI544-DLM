@@ -28,7 +28,7 @@ from dlm_project.tasks.gsm8k.evaluation import score_answer
 IMPLEMENTATION_VERSION = 'ab_medal_fixed_budget_v2'
 
 
-def context(*, stage='dev', condition='A', indices=(0,), method='ab_medal'):
+def context(*, stage='dev', condition='A', indices=(0,), method='ab_medal', reward_options=None):
     """Validate frozen inputs before loading a model. Subsets are diagnostics."""
     common = load_shared_protocol()
     manifest = get_manifest(common=common)
@@ -43,14 +43,22 @@ def context(*, stage='dev', condition='A', indices=(0,), method='ab_medal'):
     if method not in ('medal', 'ab_medal'):
         raise ValueError('Initialization method must be medal or ab_medal.')
     config_class = ABMEDALConfig if method == 'ab_medal' else MCTSConfig
+    reward_options = dict(reward_options or {})
+    allowed = {'reward_mode', 'exploration_c', 'adalook_alpha', 'adalook_confidence_threshold',
+               'adalook_max_depth', 'adalook_variance_threshold', 'adalook_trigger_threshold', 'adalook_min_masks'}
+    if set(reward_options) - allowed:
+        raise ValueError('Unknown reward experiment setting.')
+    if method != 'medal' and reward_options:
+        raise ValueError('AdaLook development variants are MEDAL-only.')
     config = config_class(**common['decoding']['mcts'], init_tokens=selected['depth'],
-                          max_model_calls=selected['budget'], stop_mode='budget')
+                          max_model_calls=selected['budget'], stop_mode='budget', **reward_options)
     return dict(implementation_version=IMPLEMENTATION_VERSION if method == 'ab_medal' else 'medal_fixed_budget_v6',
                 method=method, common=common,
                 common_protocol_hash=digest(common), prompt_template_hash=digest(common['prompt']['template']),
                 stage=stage, condition=condition, search=asdict(config),
                 examples=[examples[i] for i in indices], run_type='development_diagnostic',
-                manifest_hash=digest(manifest), setup={})
+                manifest_hash=digest(manifest), setup={}, reward_options=reward_options,
+                variant_hash=digest(asdict(config)))
 
 
 def search_config(ctx):
@@ -76,9 +84,9 @@ def validate_context(ctx):
             raise ValueError('Development samples must retain their frozen contents and identities.')
         indices.append(rows.index(example))
     expected = context(stage=ctx['stage'], condition=ctx['condition'], indices=tuple(indices),
-                       method=ctx.get('method', 'ab_medal'))
+                       method=ctx.get('method', 'ab_medal'), reward_options=ctx.get('reward_options'))
     for key in ('implementation_version', 'common', 'common_protocol_hash', 'prompt_template_hash',
-                'search', 'examples', 'manifest_hash', 'run_type'):
+                'search', 'examples', 'manifest_hash', 'run_type', 'reward_options', 'variant_hash'):
         if ctx[key] != expected[key]:
             raise ValueError(f'Frozen development setting changed: {key}.')
 
@@ -255,6 +263,7 @@ def export_question(wrapper, prepared, ctx, search, completion, directory, *,
     if search.model_calls > ctx['search']['max_model_calls']:
         raise RuntimeError('Search exceeded its forward budget.')
     record = dict(**metrics, method=ctx.get('method', 'ab_medal'),
+        reward_mode=ctx['search'].get('reward_mode', 'ig'), variant_hash=ctx.get('variant_hash'),
         example_id=prepared['example']['example_id'], condition=ctx['condition'],
         common_protocol_hash=ctx['common_protocol_hash'], prompt_ids_hash=prepared['prompt_ids_hash'],
         prompt_hash=prepared['prompt_hash'], prompt_template_hash=prepared['prompt_template_hash'],
@@ -317,7 +326,9 @@ def show_metrics(record):
         'Candidates': ['candidate_count', 'target_depth_candidate_count', 'shortlist_size'],
         'Exploration': ['unique_evaluated_states', 'duplicate_state_count', 'duplicate_state_percentage',
                         'evaluated_root_subtrees', 'root_subtree_coverage', 'deepest_candidate_root_subtrees', 'shortlist_root_subtrees', 'candidate_diversity'],
-        'Rewards': ['negative_ig_count', 'negative_ig_percentage', 'ig_min', 'ig_mean', 'ig_max', 'selected_q'],
+        'Rewards': ['reward_mode', 'negative_ig_count', 'negative_ig_percentage', 'ig_min', 'ig_mean', 'ig_max',
+                    'reward_min', 'reward_mean', 'reward_max', 'selected_q'],
+        'AdaLook': ['adalook_extra_nfes', 'adalook_groups'],
         'Allocation': ['nfes_per_depth', 'root_analysis_nfes', 'nfes_per_root_subtree'],
         'Adaptive decisions': ['decision_counts', 'decision_percentages', 'forced_decisions', 'forced_decision_counts', 'forced_decision_percentages', 'forced_decision_percentage'],
         'Efficiency': ['requested_depth_success', 'fallback', 'fallback_rate', 'stop_reason', 'budget_utilization'],
@@ -340,13 +351,15 @@ def plot_metrics(directory):
     from scripts.run_ab_medal_single import plot_tree
     directory = Path(directory)
     metrics = search_audit.load(directory)
-    figure = Figure(figsize=(11, 4), constrained_layout=True)
-    axes = figure.subplots(1, 2)
+    figure = Figure(figsize=(14, 4), constrained_layout=True)
+    axes = figure.subplots(1, 3)
     for axis, key, label in zip(axes, ('nfes_per_depth', 'nfes_per_root_subtree'), ('Evaluated depth', 'Root-child node ID')):
         values = metrics[key]
         axis.bar(list(values), list(values.values()))
-        axis.set(xlabel=label, ylabel='Search sequence NFEs')
-    figure.suptitle('Search compute allocation (root analysis separate from subtrees)')
+        axis.set(xlabel=label, ylabel='Tree evaluation NFEs')
+    axes[2].bar(['Tree', 'AdaLook rollout'], [sum(metrics['nfes_per_depth'].values()), metrics.get('adalook_extra_nfes', 0)])
+    axes[2].set(ylabel='Sequence NFEs')
+    figure.suptitle('Search compute allocation (temporary rollouts shown separately)')
     FigureCanvasAgg(figure).print_png(str(directory / 'compute_allocation.png'))
     tree = json.loads((directory / 'tree.json').read_text())
     if tree['nodes']:

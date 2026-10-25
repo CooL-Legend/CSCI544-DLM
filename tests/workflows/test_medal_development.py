@@ -18,7 +18,7 @@ from tests.decoding.test_ab_batch import BatchModel
 BOOKS = ('AB_MEDAL_MCTS_Colab.ipynb', 'MEDAL_MCTS_Demo.ipynb')
 
 
-def test_notebooks_have_identical_code_except_initialization_selector():
+def test_notebooks_share_execution_steps_with_explicit_medal_reward_controls():
     ab, medal = [nbformat.read(Path('notebooks/gsm8k') / name, as_version=4) for name in BOOKS]
     for book in (ab, medal):
         nbformat.validate(book)
@@ -26,14 +26,19 @@ def test_notebooks_have_identical_code_except_initialization_selector():
     for left, right in zip(ab.cells, medal.cells):
         assert (left.id, left.cell_type) == (right.id, right.cell_type)
         if left.cell_type == 'code':
-            assert left.source.replace('METHOD = "ab_medal"', 'METHOD = "medal"') == right.source
-            assert left.outputs == right.outputs == []
-            assert left.execution_count is right.execution_count is None
-        elif left.id not in ('ab-introduction', 'ab-search-explanation'):
+            if left.id not in ('05cd374e', 'ab-settings', 'ab-candidates', 'ab-metrics', 'ab-serial-dev', 'ab-batch'):
+                assert left.source.replace('METHOD = "ab_medal"', 'METHOD = "medal"') == right.source
+            compile(right.source, right.id, 'exec')
+            assert right.outputs == []
+            assert right.execution_count is None
+        elif left.id not in ('ab-introduction', 'ab-search-explanation', 'ab-metrics-explanation'):
             assert left.source == right.source
+    settings = next(c.source for c in medal.cells if c.id == 'ab-settings')
+    assert 'reward_mode="adalook_adaptive"' in settings
+    assert 'dev.context(reward_options=REWARD_OPTIONS' in settings
 
 
-@pytest.mark.parametrize('condition', ['A', 'B', 'C'])
+@pytest.mark.parametrize('condition', [c['label'] for c in dev.load_shared_protocol()['search']['conditions']])
 def test_all_common_inputs_and_configurations_match_ab(condition):
     ab = dev.context(condition=condition)
     medal = dev.context(condition=condition, method='medal')
@@ -67,7 +72,7 @@ def test_execute_both_actual_notebooks_same_inputs_decoder_metrics(tmp_path, mon
                 active |= cell.id == 'ab-settings'
                 if active:
                     exec(cell.source, scope)
-        assert len(loads) == 1 and scope['METHOD'] == method
+        assert len(loads) == 1 and scope['ctx']['method'] == method
         assert type(scope['initialization'].search) is (ABMEDALSearch if method == 'ab_medal' else MCTSSearch)
         assert scope['record']['total_nfes'] == len(w.model.calls) - 1
         assert scope['record']['completion_nfes'] == 256 - scope['record']['selected_depth']

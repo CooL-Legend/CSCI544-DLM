@@ -21,6 +21,8 @@ class CooperativeMEDALSearch(medal.MCTSSearch):
         self._root_cycle = False
 
     def next_evaluation(self):
+        if self.config.reward_mode == 'adalook_adaptive':
+            return super().next_evaluation()
         if self._pending is not None:
             return self._pending
         if self.done:
@@ -69,6 +71,8 @@ class CooperativeMEDALSearch(medal.MCTSSearch):
         return self._pending
 
     def record_external_forward(self, request, *, invocation_id, batch_size):
+        if self.config.reward_mode == 'adalook_adaptive':
+            return super().record_external_forward(request, invocation_id=invocation_id, batch_size=batch_size)
         if request is not self._pending or request.attempted:
             raise ValueError('Expected the current, undispatched evaluation request.')
         if self._at_cap():
@@ -81,6 +85,8 @@ class CooperativeMEDALSearch(medal.MCTSSearch):
                    **self._counted.costs())
 
     def submit_evaluation(self, request, *, logits):
+        if self.config.reward_mode == 'adalook_adaptive':
+            return super().submit_evaluation(request, logits=logits)
         if request is not self._pending or not request.attempted:
             raise ValueError('Expected the current dispatched evaluation request.')
         analysis = medal.distribution_from_logits(logits, request.node.state, self.prompt_len,

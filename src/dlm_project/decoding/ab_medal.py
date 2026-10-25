@@ -79,6 +79,8 @@ class ABMEDALConfig(medal.MCTSConfig):
 
     def __post_init__(self):
         super().__post_init__()
+        if self.reward_mode == 'adalook_adaptive':
+            raise ValueError('AdaLook adaptive rollout is available for MEDAL, not AB-MEDAL.')
         self.new_posterior()
         if self.search_policy not in ("gaussian", "medal_equivalent"):
             raise ValueError("search_policy must be gaussian or medal_equivalent.")
