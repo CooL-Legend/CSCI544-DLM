@@ -177,6 +177,7 @@ for pkg in [*site.getsitepackages(), site.getusersitepackages()]:
     site.addsitedir(pkg)
 
 from dlm_project.tasks.gsm8k.candidate_history import (
+    compute_negative_ig_allocation,
     extract_distinct_candidates,
     extract_candidate_progression,
     load_question_comparison,
@@ -230,39 +231,112 @@ if not q_rows:
     print(f"No completed question checkpoints found in {RESULTS_STAGE_DIR} for budget {BUDGET}.")
     print("Verify that DATA_DIR contains evaluated results.")
 else:
-    # Build clean Per-Question DataFrame
+    # Build clean Per-Question DataFrame with Candidate IG and Negative IG Allocation
     table_rows = []
+    neg_ig_alloc_rows = []
+    all_candidate_igs = {"medal": [], "ab_medal": []}
+    all_tree_neg_stats = {"medal": [], "ab_medal": []}
+
     for r in q_rows:
+        ex_id = r["example_id"]
         m_correct = r.get("medal_exact_match")
         ab_correct = r.get("ab_medal_exact_match")
         m_sym = "✓" if m_correct else ("✗" if m_correct is False else "-")
         ab_sym = "✓" if ab_correct else ("✗" if ab_correct is False else "-")
-        
+
+        # Extract Candidate IG stats & Negative IG Compute Allocation from tree.json
+        row_ig_stats = {}
+        row_neg_alloc = {}
+        for m in ("medal", "ab_medal"):
+            tree_path = RESULTS_STAGE_DIR / m / ex_id / "checkpoints" / str(BUDGET) / "tree.json"
+            sel_path = RESULTS_STAGE_DIR / m / ex_id / "checkpoints" / str(BUDGET) / "selection.json"
+
+            c_min_ig, c_max_ig, c_mean_ig = None, None, None
+            tree_alloc = None
+            if tree_path.is_file():
+                try:
+                    tree_data = json.loads(tree_path.read_text())
+                    sel_data = json.loads(sel_path.read_text()) if sel_path.is_file() else {}
+                    c_stats = extract_distinct_candidates(tree_data, min_c=MIN_C, selection_record=sel_data)
+                    igs = [
+                        c["immediate_reward"] for c in c_stats["candidates"]
+                        if c.get("immediate_reward") is not None
+                    ]
+                    if igs:
+                        c_min_ig = min(igs)
+                        c_max_ig = max(igs)
+                        c_mean_ig = sum(igs) / len(igs)
+                        all_candidate_igs[m].extend(igs)
+
+                    tree_alloc = compute_negative_ig_allocation(tree_data)
+                    all_tree_neg_stats[m].append(tree_alloc)
+                except Exception:
+                    pass
+
+            row_ig_stats[m] = {"min": c_min_ig, "max": c_max_ig, "mean": c_mean_ig}
+            row_neg_alloc[m] = tree_alloc
+
         table_rows.append({
-            "Example ID": r["example_id"],
+            "Example ID": ex_id,
             "Ref Answer": r.get("reference_answer"),
             "MEDAL Pred": f"{m_sym} {r.get('medal_predicted') or '-'}",
             "MEDAL Score": r.get("medal_score"),
             "MEDAL Depth (d*)": r.get("medal_selected_depth"),
+            "MEDAL Cand Min IG": f"{row_ig_stats['medal']['min']:.4f}" if row_ig_stats['medal']['min'] is not None else "-",
+            "MEDAL Cand Mean IG": f"{row_ig_stats['medal']['mean']:.4f}" if row_ig_stats['medal']['mean'] is not None else "-",
+            "MEDAL Cand Max IG": f"{row_ig_stats['medal']['max']:.4f}" if row_ig_stats['medal']['max'] is not None else "-",
             "MEDAL NFEs": r.get("medal_total_nfes"),
             "AB-MEDAL Pred": f"{ab_sym} {r.get('ab_medal_predicted') or '-'}",
             "AB-MEDAL Score": r.get("ab_medal_score"),
             "AB-MEDAL Depth (d*)": r.get("ab_medal_selected_depth"),
+            "AB-MEDAL Cand Min IG": f"{row_ig_stats['ab_medal']['min']:.4f}" if row_ig_stats['ab_medal']['min'] is not None else "-",
+            "AB-MEDAL Cand Mean IG": f"{row_ig_stats['ab_medal']['mean']:.4f}" if row_ig_stats['ab_medal']['mean'] is not None else "-",
+            "AB-MEDAL Cand Max IG": f"{row_ig_stats['ab_medal']['max']:.4f}" if row_ig_stats['ab_medal']['max'] is not None else "-",
             "AB-MEDAL NFEs": r.get("ab_medal_total_nfes"),
             "Outcome": r.get("outcome"),
         })
-    
+
+        m_alloc = row_neg_alloc.get("medal") or {}
+        ab_alloc = row_neg_alloc.get("ab_medal") or {}
+        neg_ig_alloc_rows.append({
+            "Example ID": ex_id,
+            "MEDAL Neg States": f"{m_alloc.get('neg_direct_nfes', '-')}/{m_alloc.get('total_child_nfes', '-')}",
+            "MEDAL Neg State %": f"{m_alloc.get('neg_direct_pct', 0):.1f}%" if "neg_direct_pct" in m_alloc else "-",
+            "MEDAL Neg Expansions": m_alloc.get("neg_expansions", "-"),
+            "MEDAL Downstream NFEs Wasted": m_alloc.get("neg_downstream_nfes", "-"),
+            "AB-MEDAL Neg States": f"{ab_alloc.get('neg_direct_nfes', '-')}/{ab_alloc.get('total_child_nfes', '-')}",
+            "AB-MEDAL Neg State %": f"{ab_alloc.get('neg_direct_pct', 0):.1f}%" if "neg_direct_pct" in ab_alloc else "-",
+            "AB-MEDAL Neg Expansions": ab_alloc.get("neg_expansions", "-"),
+            "AB-MEDAL Downstream NFEs Wasted": ab_alloc.get("neg_downstream_nfes", "-"),
+        })
+
     df_questions = pd.DataFrame(table_rows)
     display(Markdown(f"### Per-Question Selected Candidate Comparison (Budget B={BUDGET})"))
     display(df_questions)
-    
-    # 2. Display Aggregate Analysis
+
+    # 2. Display Negative IG Compute Allocation Table
+    df_neg_alloc = pd.DataFrame(neg_ig_alloc_rows)
+    display(Markdown(f"### Compute Allocation: Negative IG States vs Non-Negative IG States (Budget B={BUDGET})"))
+    display(Markdown(
+        "This table reveals search efficiency by showing how many negative IG states were discovered and whether "
+        "the search policy wasted compute expanding below them vs pruning/avoiding them."
+    ))
+    display(df_neg_alloc)
+
+    # 3. Display Aggregate Analysis
     display(Markdown(f"### Aggregate Performance & Efficiency Summary"))
-    
+
     agg_table = []
     for m in ("medal", "ab_medal"):
         if m in agg_summary.get("methods", {}):
             s = agg_summary["methods"][m]
+            igs = all_candidate_igs.get(m, [])
+            tree_stats = all_tree_neg_stats.get(m, [])
+
+            avg_neg_pct = (sum(st["neg_direct_pct"] for st in tree_stats) / len(tree_stats)) if tree_stats else 0.0
+            total_neg_expansions = sum(st["neg_expansions"] for st in tree_stats) if tree_stats else 0
+            total_neg_downstream = sum(st["neg_downstream_nfes"] for st in tree_stats) if tree_stats else 0
+
             agg_table.append({
                 "Method": m.upper(),
                 "Sample Count": s["sample_count"],
@@ -271,12 +345,17 @@ else:
                 "95% Wilson CI": f"[{s['ci_95_low']*100:.1f}%, {s['ci_95_high']*100:.1f}%]",
                 "Mean Selected Depth (d*)": f"{s['mean_selected_depth']:.2f}",
                 "Mean Selected Q": f"{s['mean_selected_q']:.4f}",
+                "Cand Min IG": f"{min(igs):.4f}" if igs else "-",
+                "Cand Mean IG": f"{sum(igs)/len(igs):.4f}" if igs else "-",
+                "Cand Max IG": f"{max(igs):.4f}" if igs else "-",
+                "Mean Neg IG States %": f"{avg_neg_pct:.1f}%",
+                "Total Downstream NFEs on Neg States": total_neg_downstream,
                 "Mean Total NFEs": f"{s['mean_total_nfes']:.1f}",
             })
-    
+
     if agg_table:
         display(pd.DataFrame(agg_table))
-    
+
     h2h = agg_summary.get("head_to_head", {})
     display(Markdown(f"**Head-to-Head Breakdown (N={h2h.get('compared_count', 0)})**: "
                      f"AB-MEDAL Wins: **{h2h.get('ab_medal_wins', 0)}** | "

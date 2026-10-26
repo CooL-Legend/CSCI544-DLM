@@ -184,6 +184,119 @@ def extract_candidate_progression(tree_data: Dict[str, Any]) -> List[Dict[str, A
     return progression
 
 
+def compute_negative_ig_allocation(tree_data: Dict[str, Any]) -> Dict[str, Any]:
+    """Compute NFE/forward compute allocation to negative IG states vs non-negative states.
+
+    In the MCTS search tree:
+    - Root (depth 0) has no incoming edge/IG and counts as 1 root analysis forward.
+    - Each evaluated child node (parent_id is not None) corresponds to 1 forward evaluation
+      with an immediate reward (information gain, IG).
+    - An evaluated child can have negative IG (immediate_reward < 0) or non-negative IG (immediate_reward >= 0).
+    - If a state has negative IG, does the search continue expanding below it?
+      We calculate the subtrees rooted at negative IG nodes to determine the downstream
+      forward compute (children NFEs) expended exploring negative paths.
+
+    Returns:
+        Dict containing:
+        - total_nodes: Total evaluated nodes in the tree (B).
+        - total_child_nfes: Total evaluated non-root nodes (B - 1).
+        - neg_direct_nfes: Number of evaluated nodes with immediate_reward < 0.
+        - pos_direct_nfes: Number of evaluated nodes with immediate_reward >= 0.
+        - neg_direct_pct: Percentage of child NFEs with negative IG.
+        - pos_direct_pct: Percentage of child NFEs with non-negative IG.
+        - neg_expansions: Number of negative IG nodes that were subsequently expanded (had children).
+        - pos_expansions: Number of non-negative IG nodes that were subsequently expanded.
+        - neg_subtree_nfes: Total NFEs expended inside subtrees originating from negative IG states.
+        - pos_subtree_nfes: Total NFEs expended inside subtrees originating from non-negative IG states.
+        - neg_subtree_pct: Percentage of search compute allocated to negative IG branches.
+        - neg_avg_visits: Mean MCTS visit count of negative IG states.
+        - pos_avg_visits: Mean MCTS visit count of non-negative IG states.
+        - neg_avg_q: Mean backed-up Q-value of negative IG states.
+        - pos_avg_q: Mean backed-up Q-value of non-negative IG states.
+    """
+    nodes = tree_data.get("nodes", [])
+    if not nodes:
+        return {
+            "total_nodes": 0, "total_child_nfes": 0,
+            "neg_direct_nfes": 0, "pos_direct_nfes": 0,
+            "neg_direct_pct": 0.0, "pos_direct_pct": 0.0,
+            "neg_expansions": 0, "pos_expansions": 0,
+            "neg_subtree_nfes": 0, "pos_subtree_nfes": 0, "neg_subtree_pct": 0.0,
+            "neg_avg_visits": 0.0, "pos_avg_visits": 0.0,
+            "neg_avg_q": 0.0, "pos_avg_q": 0.0,
+        }
+
+    children = [n for n in nodes if n.get("parent_id") is not None]
+    total_child = len(children)
+    if total_child == 0:
+        return {
+            "total_nodes": len(nodes), "total_child_nfes": 0,
+            "neg_direct_nfes": 0, "pos_direct_nfes": 0,
+            "neg_direct_pct": 0.0, "pos_direct_pct": 0.0,
+            "neg_expansions": 0, "pos_expansions": 0,
+            "neg_subtree_nfes": 0, "pos_subtree_nfes": 0, "neg_subtree_pct": 0.0,
+            "neg_avg_visits": 0.0, "pos_avg_visits": 0.0,
+            "neg_avg_q": 0.0, "pos_avg_q": 0.0,
+        }
+
+    node_by_id = {n["node_id"]: n for n in nodes}
+    child_map: Dict[int, List[int]] = defaultdict(list)
+    for c in children:
+        child_map[c["parent_id"]].append(c["node_id"])
+
+    neg_nodes = [c for c in children if c.get("immediate_reward") is not None and c["immediate_reward"] < 0]
+    pos_nodes = [c for c in children if c.get("immediate_reward") is not None and c["immediate_reward"] >= 0]
+
+    neg_direct = len(neg_nodes)
+    pos_direct = len(pos_nodes)
+
+    neg_expanded = sum(1 for n in neg_nodes if len(child_map.get(n["node_id"], [])) > 0)
+    pos_expanded = sum(1 for n in pos_nodes if len(child_map.get(n["node_id"], [])) > 0)
+
+    # Calculate downstream compute (descendants) spawned below negative vs non-negative states
+    def count_descendants(node_id: int) -> int:
+        desc = 0
+        queue = list(child_map.get(node_id, []))
+        while queue:
+            curr = queue.pop(0)
+            desc += 1
+            queue.extend(child_map.get(curr, []))
+        return desc
+
+    # Downstream NFEs performed below negative IG nodes
+    neg_downstream = sum(count_descendants(n["node_id"]) for n in neg_nodes)
+    pos_downstream = sum(count_descendants(n["node_id"]) for n in pos_nodes)
+
+    # Total NFEs associated with negative states: direct evaluation + subsequent descendants
+    neg_total_branch_nfes = neg_direct + neg_downstream
+    pos_total_branch_nfes = pos_direct + pos_downstream
+
+    neg_visits = sum(n.get("visits", 0) for n in neg_nodes) / neg_direct if neg_direct else 0.0
+    pos_visits = sum(n.get("visits", 0) for n in pos_nodes) / pos_direct if pos_direct else 0.0
+
+    neg_q = sum(n.get("mean_reward", n.get("q_value", 0.0)) or 0.0 for n in neg_nodes) / neg_direct if neg_direct else 0.0
+    pos_q = sum(n.get("mean_reward", n.get("q_value", 0.0)) or 0.0 for n in pos_nodes) / pos_direct if pos_direct else 0.0
+
+    return {
+        "total_nodes": len(nodes),
+        "total_child_nfes": total_child,
+        "neg_direct_nfes": neg_direct,
+        "pos_direct_nfes": pos_direct,
+        "neg_direct_pct": (neg_direct / total_child) * 100.0,
+        "pos_direct_pct": (pos_direct / total_child) * 100.0,
+        "neg_expansions": neg_expanded,
+        "pos_expansions": pos_expanded,
+        "neg_downstream_nfes": neg_downstream,
+        "pos_downstream_nfes": pos_downstream,
+        "neg_branch_total_nfes": neg_total_branch_nfes,
+        "pos_branch_total_nfes": pos_total_branch_nfes,
+        "neg_avg_visits": neg_visits,
+        "pos_avg_visits": pos_visits,
+        "neg_avg_q": neg_q,
+        "pos_avg_q": pos_q,
+    }
+
+
 def load_question_comparison(
     results_dir: Union[str, Path],
     stage: str = "dev",

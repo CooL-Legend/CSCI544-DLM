@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from dlm_project.tasks.gsm8k.candidate_history import (
+    compute_negative_ig_allocation,
     extract_distinct_candidates,
     extract_candidate_progression,
     load_question_comparison,
@@ -105,3 +106,31 @@ def test_load_question_comparison(tmp_path):
     assert agg["head_to_head"]["both_correct_ties"] == 1
     assert agg["methods"]["medal"]["accuracy"] == 0.5
     assert agg["methods"]["ab_medal"]["accuracy"] == 1.0
+
+
+def test_compute_negative_ig_allocation():
+    data = {
+        "nodes": [
+            {"node_id": 0, "parent_id": None, "depth": 0, "visits": 5, "immediate_reward": None, "mean_reward": 0.0},
+            # Child 1: positive IG (+0.4)
+            {"node_id": 1, "parent_id": 0, "depth": 1, "visits": 3, "immediate_reward": 0.4, "mean_reward": 0.5},
+            # Child 2: negative IG (-0.3)
+            {"node_id": 2, "parent_id": 0, "depth": 1, "visits": 1, "immediate_reward": -0.3, "mean_reward": -0.2},
+            # Grandchild 3: under child 1 (positive branch)
+            {"node_id": 3, "parent_id": 1, "depth": 2, "visits": 1, "immediate_reward": 0.2, "mean_reward": 0.3},
+            # Grandchild 4: under child 1 (positive branch)
+            {"node_id": 4, "parent_id": 1, "depth": 2, "visits": 1, "immediate_reward": 0.1, "mean_reward": 0.2},
+        ]
+    }
+    alloc = compute_negative_ig_allocation(data)
+    assert alloc["total_nodes"] == 5
+    assert alloc["total_child_nfes"] == 4
+    assert alloc["neg_direct_nfes"] == 1  # Node 2
+    assert alloc["pos_direct_nfes"] == 3  # Nodes 1, 3, 4
+    assert alloc["neg_direct_pct"] == 25.0
+    assert alloc["pos_direct_pct"] == 75.0
+    assert alloc["neg_expansions"] == 0   # Node 2 has 0 children (search stopped exploring it)
+    assert alloc["pos_expansions"] == 1   # Node 1 was expanded (had 2 children)
+    assert alloc["neg_downstream_nfes"] == 0  # 0 NFEs wasted below node 2
+    assert alloc["pos_downstream_nfes"] == 2  # Nodes 3 and 4 were evaluated below node 1
+
