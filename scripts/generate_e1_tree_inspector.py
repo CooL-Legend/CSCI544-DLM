@@ -27,28 +27,87 @@ It requires **zero GPU, model weights, or inference passes**—it runs 100% offl
 
     # Cell 2: Setup Repo and Environment
     c2_code = """from pathlib import Path
+import getpass
 import os
 import subprocess
 import sys
+import tempfile
 
-# Detect environment
+REPOSITORY = "CooL-Legend/CSCI544-DLM"
+BRANCH = "adi"
+REPO_URL = f"https://github.com/{REPOSITORY}.git"
 IN_COLAB = Path("/content").is_dir()
 REPO_DIR = Path("/content/CSCI544-DLM") if IN_COLAB else next(
     path for path in (Path.cwd(), *Path.cwd().parents)
     if (path / "src/dlm_project").is_dir()
 )
 
-if IN_COLAB and not (REPO_DIR / "src/dlm_project").is_dir():
-    print("Cloning repository in Colab...")
-    subprocess.run(["git", "clone", "https://github.com/CooL-Legend/CSCI544-DLM.git", str(REPO_DIR)], check=True)
+def run_git(args, token=None):
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+    with tempfile.TemporaryDirectory() as tmp:
+        if token:
+            askpass = Path(tmp) / "askpass.py"
+            askpass.write_text(
+                "#!/usr/bin/env python3\\nimport os, sys\\n"
+                "print('x-access-token' if 'username' in sys.argv[1].lower() else os.environ['COLAB_GH_TOKEN'])\\n"
+            )
+            askpass.chmod(0o700)
+            env.update(GIT_ASKPASS=str(askpass), COLAB_GH_TOKEN=token)
+        return subprocess.run(["git", "-c", "credential.helper=", *args], env=env, capture_output=True, text=True)
 
+def remote_git(args):
+    result = run_git(args)
+    if result.returncode:
+        try:
+            from google.colab import userdata
+            token = userdata.get("GITHUB_TOKEN")
+        except Exception:
+            token = None
+        if not token:
+            token = getpass.getpass("GitHub token with read access to private repo CooL-Legend/CSCI544-DLM: ")
+        try:
+            result = run_git(args, token)
+        finally:
+            del token
+    if result.returncode:
+        raise RuntimeError(result.stderr.strip() or "GitHub clone/update failed.")
+
+def ensure_checkout():
+    def local_git(*args):
+        return subprocess.check_output(["git", "-C", str(REPO_DIR), *args], text=True).strip()
+
+    if REPO_DIR.exists():
+        if not (REPO_DIR / ".git").is_dir():
+            raise RuntimeError(f"{REPO_DIR} exists but is not a Git checkout.")
+        fetch_specs = local_git("config", "--get-all", "remote.origin.fetch").splitlines()
+        branch_ref = f"refs/heads/{BRANCH}:refs/remotes/origin/{BRANCH}"
+        if not any(spec.lstrip("+") in (branch_ref, "refs/heads/*:refs/remotes/origin/*") for spec in fetch_specs):
+            local_git("remote", "set-branches", "--add", "origin", BRANCH)
+        remote_git(["-C", str(REPO_DIR), "fetch", "origin", branch_ref])
+        exists = subprocess.run(["git", "-C", str(REPO_DIR), "show-ref", "--verify", "--quiet", f"refs/heads/{BRANCH}"]).returncode == 0
+        if exists:
+            local_git("switch", BRANCH)
+        else:
+            local_git("switch", "--create", BRANCH, "--track", f"origin/{BRANCH}")
+        local_git("merge", "--ff-only", f"origin/{BRANCH}")
+    else:
+        remote_git(["clone", "--branch", BRANCH, "--single-branch", REPO_URL, str(REPO_DIR)])
+    print(f"Code ready: {REPO_DIR} | branch: {BRANCH} | commit: {local_git('rev-parse', '--short', 'HEAD')}")
+
+if IN_COLAB:
+    ensure_checkout()
+else:
+    print(f"Using local repository checkout: {REPO_DIR}")
+
+os.chdir(REPO_DIR)
 if str(REPO_DIR) not in sys.path:
     sys.path.insert(0, str(REPO_DIR))
 
-# Install plotting and analysis dependencies
+# Install dependencies and editable package
+subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-e", str(REPO_DIR)], check=True)
 subprocess.run([sys.executable, "-m", "pip", "install", "-q", "matplotlib", "pandas", "seaborn"], check=True)
 
-print(f"✓ Codebase ready at: {REPO_DIR}")
+print(f"✓ Dependencies installed and codebase ready at: {REPO_DIR}")
 """
     nb.cells.append(nbf.v4.new_code_cell(c2_code))
 
