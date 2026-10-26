@@ -107,6 +107,12 @@ if str(REPO_DIR) not in sys.path:
 subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-e", str(REPO_DIR)], check=True)
 subprocess.run([sys.executable, "-m", "pip", "install", "-q", "matplotlib", "pandas", "seaborn"], check=True)
 
+import site
+for pkg in [*site.getsitepackages(), site.getusersitepackages()]:
+    site.addsitedir(pkg)
+if (REPO_DIR / "src").is_dir() and str(REPO_DIR / "src") not in sys.path:
+    sys.path.insert(0, str(REPO_DIR / "src"))
+
 print(f"✓ Dependencies installed and codebase ready at: {REPO_DIR}")
 """
     nb.cells.append(nbf.v4.new_code_cell(c2_code))
@@ -153,8 +159,22 @@ print(f"Resolved Stage Dir:  {RESULTS_STAGE_DIR} (exists: {RESULTS_STAGE_DIR.exi
     # Cell 4: Auxiliary & Helper Functions
     c4_code = """import json
 from pathlib import Path
+import site
+import sys
 import pandas as pd
 from typing import Dict, Any, List
+
+# Ensure repository root and src directory are on sys.path
+for candidate_dir in (Path.cwd(), Path("/content/CSCI544-DLM"), *Path.cwd().parents):
+    if (candidate_dir / "src/dlm_project").is_dir():
+        if str(candidate_dir / "src") not in sys.path:
+            sys.path.insert(0, str(candidate_dir / "src"))
+        if str(candidate_dir) not in sys.path:
+            sys.path.insert(0, str(candidate_dir))
+        break
+
+for pkg in [*site.getsitepackages(), site.getusersitepackages()]:
+    site.addsitedir(pkg)
 
 from dlm_project.tasks.gsm8k.candidate_history import (
     extract_distinct_candidates,
