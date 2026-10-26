@@ -34,30 +34,38 @@ docs/                       # Structure guide and MCTS walkthrough
 
 Install the package with `python -m pip install --no-deps -e .` after installing a dependency profile. The Colab notebooks do this automatically. See [the structure guide](docs/project_structure.md) for file locations, imports, and commands. Model weights and run artifacts stay outside the source package.
 
-## Experiment 0: fixed-budget GSM8K baseline test
+## Experiment 0: GSM8K search-free baseline test
 
 [The shared experiment guide](docs/experiments.md) defines the fixed inputs for
-E0/E1/E2 and the implemented E0 v6 runner. One confidence baseline is compared
-with MEDAL at (Lc, B) = (10, 256), (10, 512), and (10, 1024).
-All conditions use the same two-shot prompt, 256 output tokens, and LLaDA
-Confidence completion at T=0. Search collects distinct states at the deepest depth
-having at least C distinct nodes (falling back to the depth with the most distinct states,
-breaking ties towards deeper depths), ranks by mean backed-up reward, retains up to
-three, and completes only rank 1.
+E0/E1/E2 and the implemented E0 baseline runner. Experiment 0 establishes the
+search-free baseline suite: standard **LLaDA Confidence** (`confidence_t0`, 256 NFEs, $T=0$)
+with an optional **LLaDA Entropy** baseline (`entropy_t0`, 256 NFEs, $T=0$).
+All tree search conditions (MEDAL vs. AB-MEDAL across budgets 256, 512, 1024)
+are unified in Experiment 1 (`scripts/run_e1_e3.py`).
 
-The checked-in manifest freezes 5 dev and 20 evaluation questions from train
-and 200 test questions. All stages load these same inputs offline. The common
-settings are in [experiments_common.yaml](configs/gsm8k/experiments_common.yaml).
+All baselines use the exact same two-shot decomposition prompt from
+[experiments_common.yaml](configs/gsm8k/experiments_common.yaml), 256 output tokens,
+and greedy decoding at $T=0$.
+
+The checked-in manifest ([experiment_samples.json](configs/gsm8k/experiment_samples.json))
+freezes 5 dev and 20 evaluation questions from train and 200 test questions.
+Slicing via `--num-samples` is supported for rapid local testing and development.
 
 ```bash
 python scripts/prepare_gsm8k_experiments.py
 python scripts/experiment_0_baseline_test.py --stage dev
 python scripts/experiment_0_baseline_test.py --stage evaluation
 python scripts/experiment_0_baseline_test.py --stage test
+
+# Optional: include the entropy baseline or test a prefix slice
+python scripts/experiment_0_baseline_test.py --stage test --include-entropy --num-samples 25
 ```
 
-The existing E0 notebooks are aligned with the v6 protocol. Use the CLI above and
-consult the [v6 guide](docs/experiments.md) for metrics, artifacts, and migration.
+The E0 notebooks ([Dev](notebooks/gsm8k/Experiment_0_Baseline_Test_Dev.ipynb),
+[Evaluation](notebooks/gsm8k/Experiment_0_Baseline_Test_Evaluation.ipynb), and
+[Testing](notebooks/gsm8k/Experiment_0_Baseline_Test_Testing.ipynb)) are aligned with
+this clean baseline protocol. Use the CLI above and consult [docs/experiments.md](docs/experiments.md)
+for metrics, artifacts, and protocol specifications.
 
 ## AB-MEDAL development
 

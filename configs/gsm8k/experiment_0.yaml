@@ -1,13 +1,10 @@
-# E0 v5: fixed Confidence + MEDAL A/B/C/D matrix.
-# Shared samples, prompt, generation and search dimensions live in one file.
+# Experiment 0: Search-free LLaDA Baselines (Confidence primary, optional Entropy)
+# Shared samples, prompt, and generation parameters reside in experiments_common.yaml
 common_config: configs/gsm8k/experiments_common.yaml
-decoding:
-  mcts:
-    margin_gamma: 10.0
-    exploration_c: 0.01
-    epsilon: 1.0e-8
 evaluation:
   stage: dev
   run_order: condition
+  methods:
+    - confidence
 experiment_root: results
 experiment_timezone: America/Los_Angeles

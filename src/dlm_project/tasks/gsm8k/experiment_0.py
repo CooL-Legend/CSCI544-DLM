@@ -1,6 +1,7 @@
-"""E0: one confidence baseline and the frozen three-condition MEDAL budget matrix (Lc = 10)."""
+"""E0: LLaDA Confidence primary baseline and optional LLaDA Entropy baseline."""
 
 import argparse
+import copy
 import json
 from pathlib import Path
 import signal
@@ -9,10 +10,9 @@ from time import perf_counter
 
 import torch
 
-from dlm_project.decoding import confidence, mcts_confidence
+from dlm_project.decoding import confidence, entropy
 from dlm_project.decoding.common import validate_generation
 from dlm_project.decoding.decoder_result import CountingModel
-from dlm_project.decoding.mcts_decoding import MCTSConfig
 from dlm_project.experiments.artifacts import save_json
 from dlm_project.experiments.config import load_config
 from dlm_project.experiments.manifests import digest
@@ -28,11 +28,9 @@ from dlm_project.tasks.gsm8k.evaluation import score_answer
 
 
 PROTOCOL_VERSION = "e0_fixed_budget_v6"
-DECODERS = {"confidence": confidence.decode, "medal": mcts_confidence.decode}
-E0_MCTS = {"margin_gamma": 10.0, "exploration_c": 0.01, "epsilon": 1e-8,
-           "stop_mode": "budget", "max_simulations": None}
-MIGRATION = ("E0 v6 uses the fixed A/B/C budget matrix at Lc=10. Remove single-depth, "
-             "search_budgets and candidate-quota settings; see docs/experiments.md.")
+DECODERS = {"confidence": confidence.decode, "entropy": entropy.decode}
+MIGRATION = ("E0 focuses on search-free baselines (LLaDA Confidence, optional Entropy). "
+             "MEDAL search has migrated to Experiment 1 (scripts/run_e1_e3.py).")
 
 
 def resolve_settings(source, **overrides):
@@ -46,20 +44,24 @@ def resolve_settings(source, **overrides):
         raise ValueError("E0 run_order must be example or condition.")
     if ("search_budgets" in evaluation or overrides.get("search_budgets") is not None
             or overrides.get("init_tokens") is not None
-            or overrides.get("search_mode", "budget") != "budget"
-            or evaluation.get("search_mode", "budget") != "budget"):
+            or overrides.get("search_mode", "none") not in ("none", "budget")
+            or evaluation.get("search_mode", "none") not in ("none", "budget")):
         raise ValueError(MIGRATION)
-    evaluation["search_mode"] = "budget"
-    if set(evaluation) - {"stage", "run_order", "search_mode"}:
+    evaluation["search_mode"] = "none"
+    if set(evaluation) - {"stage", "run_order", "search_mode", "methods"}:
         raise ValueError("Unknown E0 evaluation setting.")
     data = config["data"]
-    for key in ("cache_dir", "dataset_revision", "num_samples"):
+    for key in ("cache_dir", "dataset_revision"):
         if overrides.get(key) is not None:
             data["revision" if key == "dataset_revision" else key] = overrides[key]
     count = STAGE_COUNTS[evaluation["stage"]]
-    if data.get("num_samples") is not None and (type(data["num_samples"]) is not int or data["num_samples"] != count):
-        raise ValueError(f"Frozen {evaluation['stage']} stage requires exactly {count} samples.")
-    data["num_samples"] = count
+    requested_samples = overrides.get("num_samples") if overrides.get("num_samples") is not None else data.get("num_samples")
+    if requested_samples is not None:
+        if type(requested_samples) is not int or not 1 <= requested_samples <= count:
+            raise ValueError(f"num_samples must be an integer between 1 and {count} for stage {evaluation['stage']}.")
+        data["num_samples"] = requested_samples
+    else:
+        data["num_samples"] = count
     if (data["revision"] != common["data"]["revision"] or type(data["sample_seed"]) is not int
             or data["sample_seed"] != common["data"]["sample_seed"]
             or set(data) - {"revision", "sample_seed", "num_samples", "cache_dir"}):
@@ -77,13 +79,6 @@ def resolve_settings(source, **overrides):
     if set(decoding) - {"seed", "completion_method", "completion_temperature", "mcts"}:
         raise ValueError("Unknown E0 decoding setting.")
     validate_generation(**config["generation"], temperature=decoding["completion_temperature"], seed=decoding["seed"])
-    options = {**E0_MCTS, **decoding.get("mcts", {})}
-    if "init_tokens" in options or "max_model_calls" in options:
-        raise ValueError(MIGRATION)
-    expected = {**E0_MCTS, **common["decoding"]["mcts"]}
-    if options != expected:
-        raise ValueError("E0 MCTS settings differ from the fixed protocol. " + MIGRATION)
-    decoding["mcts"] = options
     model = config["model"]
     for key in ("model_path", "device", "dtype", "local_files_only"):
         if overrides.get(key) is not None:
@@ -92,20 +87,26 @@ def resolve_settings(source, **overrides):
     if (model["family"] != "llada" or model["dtype"] != common["model"]["dtype"]
             or set(model) - {"family", "model_path", "device", "dtype", "local_files_only"}):
         raise ValueError("E0 requires the pinned LLaDA checkpoint with bfloat16 weights.")
-    conditions = [{"id": "confidence_t0", "method": "confidence", "temperature": 0.0,
-                   "search_budget": 0, "requested_depth": None, "completion_method": "llada"}]
-    for item in common["search"]["conditions"]:
-        depth, budget = item["depth"], item["budget"]
-        MCTSConfig(**options, init_tokens=depth, max_model_calls=budget).validate_length(256)
-        conditions.append({"id": f"medal_lc{depth}_b{budget}", "configuration": item["label"], "method": "medal",
-                           "temperature": 0.0, "search_budget": budget, "requested_depth": depth,
-                           "completion_method": "llada"})
-    if "conditions" in source and source["conditions"] != conditions:
-        raise ValueError(MIGRATION)
+
+    raw_methods = overrides.get("methods") or evaluation.get("methods", ["confidence"])
+    if isinstance(raw_methods, str):
+        methods = [raw_methods]
+    else:
+        methods = list(raw_methods)
+    if overrides.get("include_entropy") and "entropy" not in methods:
+        methods.append("entropy")
+
+    conditions = []
+    for m in methods:
+        if m not in DECODERS:
+            raise ValueError(f"Unknown E0 baseline method: {m}. Must be 'confidence' or 'entropy'.")
+        conditions.append({"id": f"{m}_t0", "method": m, "temperature": 0.0,
+                           "search_budget": 0, "requested_depth": None, "completion_method": "llada"})
     config.update(protocol_version=PROTOCOL_VERSION, conditions=conditions,
                   common_protocol=common, common_protocol_hash=digest(common),
                   prompt_template_hash=digest(common["prompt"]["template"]))
     return config
+
 
 
 def _sync(device):
@@ -149,9 +150,8 @@ def run_experiment(source, *, manifest_path=None, output_dir=None, run_manifest=
     root = Path(config.get("experiment_root", "results")).expanduser()
     root = root if root.is_absolute() else PROJECT_ROOT / root
     manifest = get_manifest(manifest_path, common=config["common_protocol"])
-    examples = select_examples(manifest, config["evaluation"]["stage"])
+    examples = select_examples(manifest, config["evaluation"]["stage"])[:config["data"]["num_samples"]]
     config["data"]["revision"] = manifest["dataset"]["revision"]
-    m = config["decoding"]["mcts"]
     parent = Path(output_dir) if output_dir else root / "LLaDA/GSM8K/experiment_0"
     parent = parent / config["evaluation"]["stage"] / "fixed-matrix-v6"
     directory, _ = create_run_directory({"output_dir": str(parent),
@@ -181,7 +181,7 @@ def run_experiment(source, *, manifest_path=None, output_dir=None, run_manifest=
             save_json(receipt, {"run_dir": str(directory), "status": setup["status"],
                                "protocol_version": PROTOCOL_VERSION,
                                "common_protocol_hash": config["common_protocol_hash"],
-                               "stage": config["evaluation"]["stage"], "search_mode": m["stop_mode"],
+                               "stage": config["evaluation"]["stage"], "search_mode": "none",
                                "run_order": config["evaluation"]["run_order"],
                                "condition_ids": [condition["id"] for condition in config["conditions"]],
                                "model_family": "llada"})
@@ -247,25 +247,13 @@ def run_experiment(source, *, manifest_path=None, output_dir=None, run_manifest=
                              active_total_nfes=0, active_trace_file=trace_file)
                 progress()
                 kwargs = {**config["generation"], "temperature": condition["temperature"], "seed": seed}
-                def emit(event):
-                    events.append(_compact_event(event))
-                    if event["stage"] == "forward" and counter.calls % 128 == 0:
-                        print(f"{example['example_id']} | {condition['id']} | "
-                              f"{counter.calls} actual forwards | {event.get('phase', 'search')}", flush=True)
-                if condition["method"] == "medal":
-                    kwargs.update(mcts={**m, "max_model_calls": condition["search_budget"],
-                                        "init_tokens": condition["requested_depth"]},
-                                  tokenizer=wrapper.tokenizer, on_event=emit,
-                                  completion_method=condition["completion_method"])
-                if condition["method"] == "medal":
-                    kwargs["search_excluded_token_ids"] = config["termination"]["token_ids"]
                 _sync(wrapper.device)
                 started = perf_counter()
                 result, details, status = None, {}, "completed"
                 try:
                     result = DECODERS[condition["method"]](counter, prompt_ids.clone(), wrapper.mask_id, **kwargs)
-                    details = result.details
-                    if condition["method"] == "confidence":
+                    details = getattr(result, "details", {})
+                    if hasattr(result, "trace"):
                         events.extend(_compact_event(event) for event in result.trace)
                 finally:
                     _sync(wrapper.device)
@@ -379,16 +367,20 @@ def run_experiment(source, *, manifest_path=None, output_dir=None, run_manifest=
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Experiment 0: Baseline Test — Fixed-Budget MEDAL")
+    parser = argparse.ArgumentParser(description="Experiment 0: Baseline Test — Search-Free LLaDA Baselines")
     parser.add_argument("--config", type=Path, default=PROJECT_ROOT / "configs/gsm8k/experiment_0.yaml")
-    parser.add_argument("--stage", choices=tuple(STAGE_COUNTS))
-    parser.add_argument("--num-samples", type=int, help="Must match the frozen stage count: 5 dev, 20 evaluation, 200 test.")
-    parser.add_argument("--init-tokens", type=int, help="Legacy option: rejected by the fixed-matrix protocol.")
-    parser.add_argument("--search-mode", choices=("budget", "candidates"))
-    parser.add_argument("--search-budgets", type=int, nargs="+", help="Legacy option: rejected by the fixed-matrix protocol.")
-    parser.add_argument("--run-order", choices=("example", "condition"),
+    parser.add_argument("--stage", choices=tuple(STAGE_COUNTS), default="dev")
+    parser.add_argument("--num-samples", type=int, help="Optional prefix count for testing (up to stage maximum: 5 dev, 20 evaluation, 200 test).")
+    parser.add_argument("--include-entropy", action="store_true", help="Include optional LLaDA Entropy baseline.")
+    parser.add_argument("--methods", nargs="+", choices=("confidence", "entropy"), default=["confidence"],
+                        help="Baselines to run (default: confidence).")
+    parser.add_argument("--init-tokens", type=int, help="Legacy option: rejected by the fixed protocol.")
+    parser.add_argument("--search-mode", choices=("budget", "candidates", "none"))
+    parser.add_argument("--search-budgets", type=int, nargs="+", help="Legacy option: rejected by the fixed protocol.")
+    parser.add_argument("--run-order", choices=("example", "condition"), default="condition",
                         help="Finish all conditions per example, or all examples per condition.")
     parser.add_argument("--model-path", type=Path)
+    parser.add_argument("--device", default=None)
     parser.add_argument("--local-files-only", action="store_true", default=None)
     parser.add_argument("--cache-dir", type=Path)
     parser.add_argument("--dataset-revision")
@@ -414,3 +406,4 @@ def main():
                        run_manifest=args.run_manifest)
     finally:
         signal.signal(signal.SIGTERM, previous)
+

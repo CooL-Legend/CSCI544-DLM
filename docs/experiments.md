@@ -178,29 +178,24 @@ In E2, changing R changes both search guidance and final candidate selection.
 Accuracy differences therefore measure their combined effect. A separate
 common-ranking ablation may later distinguish the two effects.
 
-## 4. E0: baseline evaluation
+## 4. E0: search-free baseline evaluation
 
 ### Objective and conditions
 
-Establish paired LLaDA and MEDAL performance on the frozen questions, preserving
-MEDAL's current UCB selection and immediate information-gain reward.
+Establish pure search-free LLaDA baseline performance on the frozen GSM8K questions.
+All MCTS search conditions (MEDAL vs. AB-MEDAL across budgets 256, 512, 1024) are unified
+and evaluated in Experiment 1 (`scripts/run_e1_e3.py`).
 
-| Condition | ID | Lc | Search B | Completion NFEs at Lc | Total NFEs at full B and Lc |
-|---|---|---:|---:|---:|---:|
-| LLaDA Confidence | `confidence_t0` | — | 0 | 256 | 256 |
-| MEDAL A | `medal_lc10_b256` | 10 | 256 | 246 | 502 |
-| MEDAL B | `medal_lc10_b512` | 10 | 512 | 246 | 758 |
-| MEDAL C | `medal_lc10_b1024` | 10 | 1024 | 246 | 1270 |
+| Condition | ID | Search B | Completion NFEs | Total NFEs | Default Status |
+|---|---|---:|---:|---:|---|
+| LLaDA Confidence | `confidence_t0` | 0 | 256 | 256 | **Enabled** (Primary baseline) |
+| LLaDA Entropy | `entropy_t0` | 0 | 256 | 256 | Optional (`--include-entropy`) |
 
-The last two columns are accounting examples, not measured results. Frontier
-exhaustion can use less search budget; fallback changes completion cost. The
-confidence baseline runs once per question. Entropy and no-search MEDAL
-controls are not part of E0 v5.
+Both conditions perform standard search-free LLaDA decoding across 256 steps at $T=0$ using
+the shared two-shot decomposition prompt.
+By default, the runner runs `confidence_t0`. When `--include-entropy` (or `--methods confidence entropy`)
+is passed, both baselines run under one loaded model.
 
-Load one model for the whole stage. Every searched condition receives a fresh
-independent tree. By default run Confidence across the stage, then A, B, C.
-`--run-order example` instead runs all four conditions per question. Both orders
-reuse the same prompts and seeds.
 
 ### Retained MEDAL behavior
 
@@ -315,11 +310,11 @@ python scripts/experiment_0_baseline_test.py --stage test \
 ```
 
 `--config`, `--run-order`, stage, cache/artifact locations and a validated local
-model snapshot remain configurable. `--num-samples` is accepted only if it
-matches the stage's exact count. `--dataset-revision` must match the frozen
-revision. Old `--init-tokens`, `--search-budgets`, and candidate-quota settings
-are rejected with migration guidance. There is no supported way to silently
-change the matrix under v5.
+model snapshot remain configurable. `--num-samples` accepts a prefix slice (up to the stage's
+frozen count: 5 for dev, 20 for evaluation, 200 for test) for rapid debugging and validation.
+`--include-entropy` (or `--methods confidence entropy`) enables the optional search-free
+entropy baseline. `--dataset-revision` must match the frozen revision. Old `--init-tokens`,
+`--search-budgets`, and candidate-quota settings are rejected with migration guidance.
 
 ### Saved artifacts
 
