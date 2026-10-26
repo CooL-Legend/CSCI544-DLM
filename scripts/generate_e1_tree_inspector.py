@@ -7,8 +7,10 @@ import nbformat as nbf
 def generate_notebook(output_path: Path):
     nb = nbf.v4.new_notebook()
 
-    # Cell 1: Title and Documentation
-    c1_md = """# Experiment 1 & 3: Tree Structure & Candidate Inspector
+    # Cell 1: Title and Documentation with Colab badge
+    c1_md = """<a href="https://colab.research.google.com/github/CooL-Legend/CSCI544-DLM/blob/adi/notebooks/gsm8k/E1_Tree_Inspector.ipynb" target="_parent"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open in Colab"/></a>
+
+# Experiment 1 & 3: Tree Structure & Candidate Inspector
 ### Offline AB-MCTS Tree Visualization & Candidate Analysis for MEDAL and AB-MEDAL on GSM8K
 
 This notebook inspects saved **Experiment 1 (E1)** and **Experiment 3 (E3)** search trees and candidate evaluations stored on **Google Drive** or locally.
