@@ -134,3 +134,24 @@ def test_compute_negative_ig_allocation():
     assert alloc["neg_downstream_nfes"] == 0  # 0 NFEs wasted below node 2
     assert alloc["pos_downstream_nfes"] == 2  # Nodes 3 and 4 were evaluated below node 1
 
+    # Nested negative nodes test to ensure NO double counting:
+    # Root -> Node 1 (neg) -> Node 2 (neg) -> Node 3 (pos)
+    # Both 1 and 2 are negative. Descendants of 1 are {2, 3}. Descendants of 2 are {3}.
+    # Without deduplication: 2 + 1 = 3 (even though total non-root nodes = 3).
+    # With deduplication: unique descendants = {2, 3} -> exactly 2.
+    nested_data = {
+        "nodes": [
+            {"node_id": 0, "parent_id": None, "depth": 0, "immediate_reward": None},
+            {"node_id": 1, "parent_id": 0, "depth": 1, "immediate_reward": -0.4},
+            {"node_id": 2, "parent_id": 1, "depth": 2, "immediate_reward": -0.2},
+            {"node_id": 3, "parent_id": 2, "depth": 3, "immediate_reward": 0.5},
+        ]
+    }
+    nested_alloc = compute_negative_ig_allocation(nested_data)
+    assert nested_alloc["total_child_nfes"] == 3
+    assert nested_alloc["neg_direct_nfes"] == 2  # Nodes 1 and 2
+    assert nested_alloc["neg_downstream_nfes"] == 2  # Unique descendants {2, 3} - NOT double counted
+    assert nested_alloc["neg_branch_total_nfes"] == 3  # All 3 nodes lie in negative branches
+    assert nested_alloc["pos_branch_total_nfes"] == 0  # 0 pure positive nodes
+
+

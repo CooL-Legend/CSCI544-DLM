@@ -253,23 +253,32 @@ def compute_negative_ig_allocation(tree_data: Dict[str, Any]) -> Dict[str, Any]:
     neg_expanded = sum(1 for n in neg_nodes if len(child_map.get(n["node_id"], [])) > 0)
     pos_expanded = sum(1 for n in pos_nodes if len(child_map.get(n["node_id"], [])) > 0)
 
-    # Calculate downstream compute (descendants) spawned below negative vs non-negative states
-    def count_descendants(node_id: int) -> int:
-        desc = 0
-        queue = list(child_map.get(node_id, []))
+    # Calculate unique downstream compute (descendants) spawned below negative states without double counting
+    neg_descendant_ids = set()
+    for n in neg_nodes:
+        queue = list(child_map.get(n["node_id"], []))
         while queue:
             curr = queue.pop(0)
-            desc += 1
-            queue.extend(child_map.get(curr, []))
-        return desc
+            if curr not in neg_descendant_ids:
+                neg_descendant_ids.add(curr)
+                queue.extend(child_map.get(curr, []))
 
-    # Downstream NFEs performed below negative IG nodes
-    neg_downstream = sum(count_descendants(n["node_id"]) for n in neg_nodes)
-    pos_downstream = sum(count_descendants(n["node_id"]) for n in pos_nodes)
+    pos_descendant_ids = set()
+    for n in pos_nodes:
+        queue = list(child_map.get(n["node_id"], []))
+        while queue:
+            curr = queue.pop(0)
+            if curr not in pos_descendant_ids:
+                pos_descendant_ids.add(curr)
+                queue.extend(child_map.get(curr, []))
 
-    # Total NFEs associated with negative states: direct evaluation + subsequent descendants
-    neg_total_branch_nfes = neg_direct + neg_downstream
-    pos_total_branch_nfes = pos_direct + pos_downstream
+    # Number of unique NFEs evaluated in branches below at least one negative IG node
+    neg_downstream = len(neg_descendant_ids)
+    pos_downstream = len(pos_descendant_ids)
+
+    # Unique nodes impacted by negative IG (either negative IG themselves OR evaluated under a negative state)
+    neg_impacted_ids = set(n["node_id"] for n in neg_nodes) | neg_descendant_ids
+    pos_pure_ids = set(n["node_id"] for n in children) - neg_impacted_ids
 
     neg_visits = sum(n.get("visits", 0) for n in neg_nodes) / neg_direct if neg_direct else 0.0
     pos_visits = sum(n.get("visits", 0) for n in pos_nodes) / pos_direct if pos_direct else 0.0
@@ -288,8 +297,8 @@ def compute_negative_ig_allocation(tree_data: Dict[str, Any]) -> Dict[str, Any]:
         "pos_expansions": pos_expanded,
         "neg_downstream_nfes": neg_downstream,
         "pos_downstream_nfes": pos_downstream,
-        "neg_branch_total_nfes": neg_total_branch_nfes,
-        "pos_branch_total_nfes": pos_total_branch_nfes,
+        "neg_branch_total_nfes": len(neg_impacted_ids),
+        "pos_branch_total_nfes": len(pos_pure_ids),
         "neg_avg_visits": neg_visits,
         "pos_avg_visits": pos_visits,
         "neg_avg_q": neg_q,
