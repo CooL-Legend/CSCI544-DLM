@@ -1,4 +1,4 @@
-"""Paired notebooks share every executable setting except initialization method."""
+"""Shared walkthrough behavior; MEDAL also has a default comparison mode."""
 
 import json
 from pathlib import Path
@@ -18,21 +18,19 @@ from tests.decoding.test_ab_batch import BatchModel
 BOOKS = ('AB_MEDAL_MCTS_Colab.ipynb', 'MEDAL_MCTS_Demo.ipynb')
 
 
-def test_notebooks_share_execution_steps_with_explicit_medal_reward_controls():
+def test_notebooks_are_valid_with_shared_checkout_and_medal_reward_controls():
     ab, medal = [nbformat.read(Path('notebooks/gsm8k') / name, as_version=4) for name in BOOKS]
     for book in (ab, medal):
         nbformat.validate(book)
-    assert len(ab.cells) == len(medal.cells)
-    for left, right in zip(ab.cells, medal.cells):
-        assert (left.id, left.cell_type) == (right.id, right.cell_type)
-        if left.cell_type == 'code':
-            if left.id not in ('05cd374e', 'ab-settings', 'ab-candidates', 'ab-metrics', 'ab-serial-dev', 'ab-batch'):
-                assert left.source.replace('METHOD = "ab_medal"', 'METHOD = "medal"') == right.source
-            compile(right.source, right.id, 'exec')
-            assert right.outputs == []
-            assert right.execution_count is None
-        elif left.id not in ('ab-introduction', 'ab-search-explanation', 'ab-metrics-explanation'):
-            assert left.source == right.source
+    for cell in medal.cells:
+        if cell.cell_type == 'code':
+            compile(cell.source, cell.id, 'exec')
+            assert cell.outputs == []
+            assert cell.execution_count is None
+    # Dependency installation remains shared; the MEDAL flow now includes a
+    # comparison runner, explicit snapshot preparation and guarded demo cells.
+    assert next(c.source for c in ab.cells if c.id == '2bda1f2f') == next(
+        c.source for c in medal.cells if c.id == '2bda1f2f')
     settings = next(c.source for c in medal.cells if c.id == 'ab-settings')
     assert 'reward_mode="adalook_adaptive"' in settings
     assert 'dev.context(reward_options=REWARD_OPTIONS' in settings
@@ -63,7 +61,10 @@ def test_execute_both_actual_notebooks_same_inputs_decoder_metrics(tmp_path, mon
             loads.append(ctx)
             return w
         monkeypatch.setattr(dev, 'load_model', load)
-        scope = dict(Path=Path, DRIVE_ROOT=tmp_path, display=lambda *a: None)
+        from dlm_project.models import cache
+        monkeypatch.setattr(cache, 'cache_model', lambda **kw: tmp_path / 'model')
+        scope = dict(Path=Path, DRIVE_ROOT=tmp_path, REPO_DIR=Path.cwd(), IN_COLAB=False,
+                     display=lambda *a: None)
         book = nbformat.read(Path('notebooks/gsm8k') / name, as_version=4)
         active = False
         for cell in book.cells:
@@ -71,7 +72,7 @@ def test_execute_both_actual_notebooks_same_inputs_decoder_metrics(tmp_path, mon
                 compile(cell.source, cell.id, 'exec')
                 active |= cell.id == 'ab-settings'
                 if active:
-                    exec(cell.source, scope)
+                    exec(cell.source.replace('NOTEBOOK_MODE = "comparison"', 'NOTEBOOK_MODE = "demo"'), scope)
         assert len(loads) == 1 and scope['ctx']['method'] == method
         assert type(scope['initialization'].search) is (ABMEDALSearch if method == 'ab_medal' else MCTSSearch)
         assert scope['record']['total_nfes'] == len(w.model.calls) - 1

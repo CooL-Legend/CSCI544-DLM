@@ -7,7 +7,8 @@ The **LLaDA and iLLaDA GSM8K notebooks** evaluate four shared decoding methods a
 For offline sequential LLaDA/MCTS comparisons, see the [local AdaLook experiment guide](docs/gsm8k_local_experiments.md).
 `scripts/run_gsm8k_experiments.py` reads `.env` and supports `--reward-mode ig`,
 `adalook_one_step`, or `adalook_adaptive`, with per-question saves and strict resume.
-The MEDAL Demo exposes the same reward configuration. AdaLook here is a MEDAL
+The MEDAL Demo now runs the same two-method comparison directly in Colab, with
+Drive caching and reports; no `.env` is needed. AdaLook here is a MEDAL
 hybrid with temporary adaptive rollout, not a reproduction of the paper's block decoder.
 
 | Model | Notebook on `chong` | Dependency profile |
@@ -137,17 +138,46 @@ The [implementation guide](docs/ab_medal_walkthrough.md) explains prompting,
 Student-t GEN/CONT selection, posterior updates, completion, offline metrics,
 and the optional batch study. Formal E1/E3 runners remain separate.
 
-## Single-prompt MEDAL demo
+## Colab comparison in the MEDAL MCTS Demo
 
-The [MEDAL notebook](notebooks/gsm8k/MEDAL_MCTS_Demo.ipynb) mirrors the
-[AB-MEDAL notebook](notebooks/gsm8k/AB_MEDAL_MCTS_Colab.ipynb): same first frozen
-development question, prompt, settings, candidate selection, Confidence T=0
-completion, metrics and optional batch study. Defaults are n=1, Lc=10, search
-budget=256 and batch size=1. Only initialization changes: MEDAL uses the existing
-UCB search and retained-sibling rounds; AB uses Student-t GEN/CONT. MEDAL's
-GEN/CONT fields are unavailable. Both export identical offline audit schemas.
-See the [notebook alignment guide](docs/medal_notebook.md) for the shared workflow,
-serial validation and parity-gated batching at sizes 1, 2 and 4.
+Open the updated [MEDAL notebook](notebooks/gsm8k/MEDAL_MCTS_Demo.ipynb) on
+`chong`, select a GPU runtime supporting bfloat16 with enough memory for the
+8B model, and run all cells. Authorize GitHub and Google Drive when prompted.
+Local changes must be pushed to `chong` first; an older notebook saved in Drive
+does not automatically update. No CARC paths or `.env` are required.
+
+The settings cell defaults to:
+
+```python
+NOTEBOOK_MODE = "comparison"
+STAGE = "test"
+NUM_SAMPLES = 5
+CONDITION = "A"  # Lc=10, search budget=256; B uses budget=512
+RESUME_RUN = None
+COPY_MODEL_TO_RUNTIME = True
+# REWARD_OPTIONS selects reward_mode="adalook_adaptive".
+```
+
+The notebook downloads/reuses the pinned model under
+`MyDrive/CSCI544-DLM/models/LLaDA-8B-Instruct`, optionally copies it to runtime
+disk, and loads it once. It runs pure LLaDA Confidence T=0 followed by
+AdaLook-MCTS on identical frozen questions, prompts and seeds, with 256 output
+tokens, K1=3, K2=5 and C=3. The report and chart appear in the notebook.
+This is the same two-method comparison as `--method both`, not an automatic
+three-way comparison with original MEDAL. Set `reward_mode="ig"` for a separate
+control run. Use `STAGE="dev"` for tuning; five questions are only a smoke test.
+
+Results persist under
+`MyDrive/CSCI544-DLM/results/LLaDA/GSM8K/llada_vs_mcts/both/<stage>/budget-lc10/<timestamp>/`:
+`predictions.jsonl`, `traces/`, `summary.json`, `report/report.md`,
+`report/summary.csv` and `report/comparison.png`. The report includes accuracy,
+mean total NFE and mean decoding time. Predictions are saved after each question.
+To resume after a disconnect, set `RESUME_RUN` to the printed directory and run
+the notebook again with identical settings and code. Completed pairs are skipped.
+
+Set `NOTEBOOK_MODE="demo"` for the original single-development-question tree,
+completion and offline metrics. Optional serial validation and batch studies
+remain disabled by default. See the [notebook guide](docs/medal_notebook.md).
 
 The separate CLI retains its original prompt, depth-20 quota defaults and sampler interface:
 

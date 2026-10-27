@@ -149,10 +149,16 @@ metrics distinguish physical model invocations from evaluated sequences.
 ## Notebook
 
 `notebooks/gsm8k/MEDAL_MCTS_Demo.ipynb` checks out `chong` and exposes
-`REWARD_OPTIONS` in its settings cell. Its default selects `adalook_adaptive`.
-Set `reward_mode="ig"` for the baseline or `"adalook_one_step"` for the ablation.
-Restart the kernel and run from setup after changing source code. Single-question,
-optional five-question and optional batching sections retain the same variant.
+`REWARD_OPTIONS` in its settings cell. Its default selects `adalook_adaptive`
+and `NOTEBOOK_MODE="comparison"`: run all cells to download/reuse the model on
+Drive, run the same `both` comparison on five frozen test questions, and display
+the saved report and plot. It passes one loaded model to the shared runner and
+does not read `.env`. Set `STAGE`, `NUM_SAMPLES`, `CONDITION` and `RESUME_RUN` in
+the settings cell; see the [Colab guide](medal_notebook.md) for output paths.
+Set `reward_mode="ig"` for a separate LLaDA-versus-IG control or
+`"adalook_one_step"` for the ablation. Restart the kernel and run from setup after
+changing source code. `NOTEBOOK_MODE="demo"` enables the original single-question,
+optional five-question and optional batching sections with the same variant.
 The shared protocol hash identifies the frozen inputs; `variant_hash` identifies
 the search configuration. AB-MEDAL's development workflow remains IG-only.
 

@@ -1,11 +1,38 @@
-# Matched MEDAL and AB-MEDAL notebooks
+# MEDAL Colab comparison and optional walkthrough
 
-[MEDAL_MCTS_Demo.ipynb](../notebooks/gsm8k/MEDAL_MCTS_Demo.ipynb) and
-[AB_MEDAL_MCTS_Colab.ipynb](../notebooks/gsm8k/AB_MEDAL_MCTS_Colab.ipynb)
-share their executable cells. The sole code difference is the initialization
-selector: `METHOD = "medal"` versus `METHOD = "ab_medal"`.
-Both call the same development helpers, retaining the historical
-`ab_development` module name for compatibility.
+[MEDAL_MCTS_Demo.ipynb](../notebooks/gsm8k/MEDAL_MCTS_Demo.ipynb) defaults to
+`NOTEBOOK_MODE="comparison"`: run all cells to compare pure LLaDA Confidence
+against MEDAL with `adalook_adaptive`, using five frozen test questions, Lc=10,
+budget=256 and 256 output tokens. It reuses the CLI's configuration builder and
+`local_experiments.run_experiments`, passing the already-loaded model. No `.env`
+is read and no cluster paths are needed. Only one model is loaded per full run.
+
+Setup mounts Drive, downloads/reuses the pinned snapshot with `cache_model`,
+optionally stages it on runtime disk, and warms up the model before measurement.
+GSM8K questions come from the checked-in manifest. Keep roughly 20 GB of free
+Drive storage for the snapshot. Use a fresh runtime with bfloat16 GPU support
+and enough memory for the model. Push changes to `chong` before using Colab.
+
+The comparison displays the saved Markdown report and PNG chart. Full outputs
+are under `MyDrive/CSCI544-DLM/results/LLaDA/GSM8K/llada_vs_mcts/both/` with stage,
+Lc and timestamp subdirectories. They include config, manifest, selection,
+per-question predictions/traces, summary JSON, CSV, Markdown and PNG reports.
+Answers are saved after each question. Set `RESUME_RUN` to the printed directory
+and rerun setup after a runtime reset; keep code and configuration identical.
+Completed condition/question pairs are skipped and interrupted questions retry.
+The saved report can also be displayed independently without model inference.
+
+`STAGE` and `NUM_SAMPLES` control the frozen subset (dev: 5, evaluation: 20,
+test: 200 available). Use dev for tuning; a five-question run is a smoke test.
+`CONDITION="B"` raises the search budget to 512. `REWARD_OPTIONS` selects the
+MCTS reward. A comparison includes two methods; set `reward_mode="ig"` for a
+separate original-MEDAL control. AdaLook rollout NFEs consume the search budget,
+and total NFEs also include final completion.
+
+Set `NOTEBOOK_MODE="demo"` to enable the single-question walkthrough below.
+The [AB-MEDAL notebook](../notebooks/gsm8k/AB_MEDAL_MCTS_Colab.ipynb) retains its
+single-question default. Both walkthroughs call the shared `ab_development`
+helpers. To compare initialization policies alone, set MEDAL's reward to `ig`.
 
 ## Shared inputs and decoding
 
@@ -18,9 +45,9 @@ Both call the same development helpers, retaining the historical
 | Seed | Shared per-question seed, `(1 + 5 * row_id) % 2**63` |
 | Initial output | 256 masks |
 | Default | Condition A: Lc=10, search budget=256, batch size=1 |
-| Other conditions | B=(10,512), C=(10,1024) |
+| Other enabled condition | B=(10,512) |
 | Retained actions | K1=3, K2=5; identical probability/entropy/margin scoring |
-| Reward | Immediate normalized information gain, including negative rewards |
+| Reward | AB: immediate normalized IG; MEDAL: selectable IG/AdaLook, default adaptive |
 | Stopping | Forward budget or frontier exhaustion; root forward counts |
 | Final selection | Depth with >= C distinct states (fallback to most distinct, deeper on ties), first occurrence, empirical Q, top 3, best 1 |
 | Fallback | Selected depth below Lc; valid root-only and short shortlists complete |
@@ -33,7 +60,7 @@ and hashes. Reference answers are used only for scoring. The complete template
 and metric definitions are in [the shared protocol](experiments.md) and
 [the implementation guide](ab_medal_walkthrough.md).
 
-## Initialization is the only algorithmic change
+## Initialization policies (with MEDAL reward set to IG)
 
 MEDAL's single-sample section calls the existing `MCTSSearch`. It selects
 eligible children using
@@ -52,19 +79,19 @@ AB-MEDAL uses its existing Student-t GEN/CONT policy, one child per traversal,
 and Bayesian updates in addition to ordinary visits and reward sums. Its full
 algorithm is described in [the AB guide](ab_medal_walkthrough.md).
 
-Neither initializer performs full rollouts or final-ranking forwards. Their
+In IG mode neither initializer performs full rollouts or final-ranking forwards. Their
 selected states, answers and measured metric values can differ because their
 trees differ; input settings, decoder and metric definitions match.
 
-## Identical walkthrough and artifacts
+## Single-question walkthrough and artifacts
 
-Run each notebook from the beginning:
+Set MEDAL to demo mode, then run each notebook from the beginning:
 
 1. Check out the repository, install the pinned dependency profile, and configure
    the existing Drive/model cache.
 2. Validate frozen inputs, then load one model and perform a separate warm-up.
 3. Display the exact prompt and run one initialization.
-4. Inspect every deepest candidate ranked by empirical Q, the shortlist and
+4. Inspect candidates at the selected depth ranked by empirical Q, the shortlist and
    selected commitments.
 5. Complete the best state and score it.
 6. Reconstruct metrics offline and display the tree, depth-allocation and
@@ -83,7 +110,14 @@ so one method cannot overwrite the other. Tree PNG names follow the method;
 all other artifact names and offline reconstruction are shared. Interrupted
 runs save partial evidence. The old notebook's independent no-search control,
 custom-question defaults and alternate decoder section have been replaced by
-this matched workflow. Historical low-level helpers and CLI interfaces remain.
+this walkthrough. The new default comparison mode provides the no-search control
+through the shared sequential runner. Historical low-level helpers and CLI interfaces remain.
+
+In adaptive mode, temporary rollout states are outside the outer tree. Tree
+depth/subtree allocations plus rollout NFEs equal total search NFEs; the demo
+checks this accounting explicitly. Candidate selection still uses the deepest
+depth with at least C distinct states, with the fallback described above; this
+change does not switch to unconditional maximum-depth selection.
 
 ## Optional batching
 
