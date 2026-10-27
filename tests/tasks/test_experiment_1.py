@@ -41,7 +41,7 @@ def test_e1_context_validation():
     assert ctx["max_depth"] == 10
 
 
-@pytest.mark.parametrize("method", ["medal", "ab_medal"])
+@pytest.mark.parametrize("method", ["medal", "medal_de", "ab_medal"])
 def test_e1_run_question_checkpoints_and_artifacts(tmp_path, method):
     w = mock_wrapper()
     ctx = e1.context(stage="dev", methods=(method,), num_samples=1)
@@ -143,3 +143,45 @@ def test_e1_incremental_saving_and_resumption(tmp_path):
     assert len(w.model.calls) == calls_before  # 0 new model calls performed!
     assert [r["exact_match"] for r in q_rows_1] == [r["exact_match"] for r in q_rows_2]
 
+
+
+
+def test_e1_medal_de_uses_denoising_entropy_reward():
+    wrapper = mock_wrapper()
+    ctx = e1.context(
+        stage="dev",
+        methods=("medal_de",),
+        budgets=(2,),
+        num_samples=1,
+    )
+    prepared = e1.prepare(wrapper, ctx)[0]
+
+    search, _ = e1.execute_search_checkpointed(
+        wrapper,
+        prepared,
+        ctx,
+        "medal_de",
+        budgets=(2,),
+        max_depth=4,
+        num_candidates=2,
+    )
+
+    assert search.config.reward_type == "denoising_entropy"
+
+    evaluations = [
+        event
+        for event in search.trace
+        if event.get("stage") == "evaluation"
+    ]
+
+    assert evaluations
+    assert all(
+        event["reward_type"] == "denoising_entropy"
+        for event in evaluations
+    )
+    assert all(
+        event["reward"] == pytest.approx(
+            event["denoising_entropy_reward"]
+        )
+        for event in evaluations
+    )

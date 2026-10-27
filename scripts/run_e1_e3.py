@@ -20,7 +20,12 @@ from dlm_project.tasks.gsm8k.experiment_1 import (
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--stage", choices=("dev", "evaluation", "test"), default="dev")
-    parser.add_argument("--methods", nargs="+", choices=("medal", "ab_medal"), default=["medal", "ab_medal"])
+    parser.add_argument(
+        "--methods",
+        nargs="+",
+        choices=("medal", "medal_de", "ab_medal"),
+        default=["medal", "ab_medal"],
+    )
     parser.add_argument("--budgets", nargs="+", type=int, default=list(CHECKPOINT_BUDGETS))
     parser.add_argument("--max-depth", type=int, default=MAX_SEARCH_DEPTH)
     parser.add_argument("--num-candidates", type=int, default=MIN_CANDIDATES)

@@ -16,6 +16,10 @@ from typing import Callable
 
 import torch
 
+from dlm_project.decoding.denoising_entropy_reward import (
+    compute_denoising_entropy_reward,
+)
+
 
 @dataclass(frozen=True)
 class MCTSConfig:
@@ -29,11 +33,16 @@ class MCTSConfig:
     margin_gamma: float = 10.0
     exploration_c: float = 0.01
     epsilon: float = 1e-8
+    reward_type: str = "information_gain"
     stop_mode: str = "candidates"
 
     def __post_init__(self):
         if self.stop_mode not in ("candidates", "budget"):
             raise ValueError("mcts.stop_mode must be candidates or budget.")
+        if self.reward_type not in ("information_gain", "denoising_entropy"):
+            raise ValueError(
+                "mcts.reward_type must be information_gain or denoising_entropy."
+            )
         for name in ("init_tokens", "num_candidates", "top_k_tokens",
                      "top_k_actions"):
             if type(getattr(self, name)) is not int or getattr(self, name) < 1:
@@ -546,24 +555,50 @@ def apply_child_analysis(parent, child, analysis, prompt_len, mask_id, config, *
     if parent.analysis is None or child.analysis is not None:
         raise ValueError("Evaluation requires a cached parent and an unevaluated child.")
     before, after = parent.analysis.total_entropy, analysis.total_entropy
-    
-    # Any trajectory Based Method --> For experiment 2
-    reward = information_gain(before, after, config.epsilon)
-    
+    immediate_gain = information_gain(before, after, config.epsilon)
+
+    denoising = compute_denoising_entropy_reward(
+        parent,
+        child.state,
+        analysis,
+        prompt_len,
+        mask_id,
+        config.epsilon,
+    )
+
+    if config.reward_type == "denoising_entropy":
+        reward = denoising.reward
+    else:
+        reward = immediate_gain
 
     if not math.isfinite(reward):
-        raise ValueError("Non-finite child information gain.")
+        raise ValueError("Non-finite child reward.")
+
     child.analysis, child.immediate_reward = analysis, reward
     remaining = int((child.state[0, prompt_len:] == mask_id).sum().item())
     removed = parent.analysis.entropies[child.action.output_position].item()
-    return {"entropy_before": before, "entropy_after": after,
-            "immediate_gain": reward, "reward": reward, "evaluation_model_calls": int(remaining > 0),
-            "masked_count": remaining, "mean_token_entropy": after / remaining if remaining else 0.0,
-            "mean_confidence_margin": analysis.mean_margin,
-            "signal_nfe": signal_nfe, "signal_extra_nfes": 0,
-            "committed_position_entropy": removed, "context_gain": before - removed - after,
-            "entropies_before": parent.analysis.entropies.tolist(),
-            "entropies_after": child.analysis.entropies.tolist()}
+
+    return {
+        "entropy_before": before,
+        "entropy_after": after,
+        "reward_type": config.reward_type,
+        "immediate_gain": immediate_gain,
+        "denoising_entropy_reward": denoising.reward,
+        "path_denoising_entropy": denoising.path_entropy,
+        "root_state_entropy": denoising.root_entropy,
+        "trajectory_state_entropies": list(denoising.state_entropies),
+        "reward": reward,
+        "evaluation_model_calls": int(remaining > 0),
+        "masked_count": remaining,
+        "mean_token_entropy": after / remaining if remaining else 0.0,
+        "mean_confidence_margin": analysis.mean_margin,
+        "signal_nfe": signal_nfe,
+        "signal_extra_nfes": 0,
+        "committed_position_entropy": removed,
+        "context_gain": before - removed - after,
+        "entropies_before": parent.analysis.entropies.tolist(),
+        "entropies_after": child.analysis.entropies.tolist(),
+    }
 
 
 # 4. BACKPROPAGATION: update tree values; no gradients or weight updates occur.

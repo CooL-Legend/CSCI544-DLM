@@ -67,8 +67,10 @@ def context(*, stage="dev", methods=("medal", "ab_medal"), budgets=None,
         raise ValueError(f"No examples found for stage {stage}.")
 
     for m in methods:
-        if m not in ("medal", "ab_medal"):
-            raise ValueError(f"Unknown method {m}. Must be 'medal' or 'ab_medal'.")
+        if m not in ("medal", "medal_de", "ab_medal"):
+            raise ValueError(
+                f"Unknown method {m}. Must be medal, medal_de, or ab_medal."
+            )
 
     return {
         "protocol_version": PROTOCOL_VERSION,
@@ -120,11 +122,18 @@ def execute_search_checkpointed(wrapper, prepared_item, ctx, method: str,
                                  num_candidates: int = MIN_CANDIDATES):
     """Execute continuous search up to max(budgets) capturing checkpoints."""
     max_budget = max(budgets)
+    reward_type = (
+        "denoising_entropy"
+        if method == "medal_de"
+        else "information_gain"
+    )
+
     cfg_kwargs = dict(
         init_tokens=max_depth,
         num_candidates=num_candidates,
         top_k_tokens=ctx["common"]["decoding"]["mcts"]["top_k_tokens"],
         top_k_actions=ctx["common"]["decoding"]["mcts"]["top_k_actions"],
+        reward_type=reward_type,
         stop_mode="budget",
         max_model_calls=max_budget,
     )
@@ -332,6 +341,7 @@ def run_question_e1(wrapper, prepared_item, ctx, method: str,
 
         checkpoint_row = {
             "method": method,
+            "reward_type": search.config.reward_type,
             "search_budget": budget,
             "example_id": prepared_item["example"]["example_id"],
             "row_id": prepared_item["example"]["row_id"],
