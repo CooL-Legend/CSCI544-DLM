@@ -1,12 +1,12 @@
 """Unified verification script for MEDAL and AB-MEDAL cooperative batch processing.
 
 Tests padding probe parity, full-run tree parity, discrete decisions, and speedups
-across batch sizes (e.g. 1, 2, 4) taking reference from both base notebooks:
+across batch sizes (e.g. 1, 4) with search budget B = 256 taking reference from both base notebooks:
   - notebooks/gsm8k/MEDAL_MCTS_Demo.ipynb
   - notebooks/gsm8k/AB_MEDAL_MCTS_Colab.ipynb
 
 Example usage:
-    python scripts/verify_batch_processing.py --device cuda --methods medal ab_medal --batch-sizes 2 4
+    python scripts/verify_batch_processing.py --device cuda --methods medal ab_medal --batch-sizes 4 --condition A
     python scripts/verify_batch_processing.py --fast --device cuda
 """
 
@@ -170,9 +170,9 @@ def format_summary_table(all_results: Dict[str, Any]) -> str:
 def run_verification(
     wrapper,
     methods: Sequence[str] = ("medal", "ab_medal"),
-    batch_sizes: Sequence[int] = (2,),
-    num_samples: int = 3,
-    condition: str = "B",
+    batch_sizes: Sequence[int] = (4,),
+    num_samples: int = 4,
+    condition: str = "A",
     output_dir: Path = Path("results/batch_verification"),
 ) -> Tuple[Dict[str, Any], bool]:
     """Execute batch verification across both methods and compile full diagnostics."""
@@ -219,18 +219,18 @@ def run_verification(
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--methods", nargs="+", choices=("medal", "ab_medal"), default=["medal", "ab_medal"])
-    parser.add_argument("--batch-sizes", nargs="+", type=int, default=[2])
-    parser.add_argument("--num-samples", type=int, default=3, help="Number of frozen dev questions (default: 3)")
-    parser.add_argument("--condition", choices=("A", "B", "C"), default="B", help="Condition A=(10,256), B=(10,512), C=(10,1024)")
+    parser.add_argument("--batch-sizes", nargs="+", type=int, default=[4])
+    parser.add_argument("--num-samples", type=int, default=4, help="Number of frozen dev questions (default: 4)")
+    parser.add_argument("--condition", choices=("A", "B", "C"), default="A", help="Condition A=(10,256), B=(10,512), C=(10,1024)")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--model-path", help="Local model directory or HuggingFace repo ID.")
     parser.add_argument("--local-files-only", action="store_true")
     parser.add_argument("--output-dir", type=Path, default=Path("results/batch_verification"))
-    parser.add_argument("--fast", action="store_true", help="Fast diagnostic mode with 3 samples and batch_size 2.")
+    parser.add_argument("--fast", action="store_true", help="Fast diagnostic mode with 2 samples and batch_size 2.")
     args = parser.parse_args(argv)
 
     if args.fast:
-        args.num_samples = min(args.num_samples, 3)
+        args.num_samples = min(args.num_samples, 2)
         args.batch_sizes = [2]
 
     if torch.device(args.device).type == "cuda" and not torch.cuda.is_available():

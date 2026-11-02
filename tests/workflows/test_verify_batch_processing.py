@@ -99,6 +99,36 @@ def test_verify_batch_processing_notebook_validity():
     for idx, cell in enumerate(code_cells):
         compile(cell.source, f"cell_{idx}", "exec")
 
+    # Verify configuration cell specifies batch of 4 and Condition A (B=256)
+    config_cell = nb.cells[10].source
+    assert "BATCH_SIZES = [4]" in config_cell
+    assert "NUM_QUESTIONS = 4" in config_cell
+    assert 'CONDITION = "A"' in config_cell
+
+
+@pytest.mark.parametrize("method", ["medal", "ab_medal"])
+def test_verify_batch_of_4_condition_a_synthetic(tmp_path, method):
+    w = mock_wrapper()
+    ctx = dev.context(stage="dev", condition="A", indices=(0, 1, 2, 3), method=method)
+    prepared = dev.prepare(w, ctx)
+
+    results = verify_method_batching(
+        w,
+        method=method,
+        prepared=prepared,
+        base_ctx=ctx,
+        output_dir=tmp_path,
+        batch_sizes=(4,),
+    )
+
+    assert results["all_passed"]
+    assert results["method"] == method
+    assert "4" in results["batches"]
+    batch_res = results["batches"]["4"]
+    assert batch_res["padding_probe_passed"]
+    assert batch_res["parity_passed"]
+    assert (tmp_path / method / "verification_results.json").is_file()
+
 
 def test_verify_batch_processing_cli_help():
     import subprocess
