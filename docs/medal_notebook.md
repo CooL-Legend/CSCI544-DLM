@@ -30,9 +30,10 @@ separate original-MEDAL control. AdaLook rollout NFEs consume the search budget,
 and total NFEs also include final completion.
 
 Set `NOTEBOOK_MODE="demo"` to enable the single-question walkthrough below.
-The [AB-MEDAL notebook](../notebooks/gsm8k/AB_MEDAL_MCTS_Colab.ipynb) retains its
-single-question default. Both walkthroughs call the shared `ab_development`
-helpers. To compare initialization policies alone, set MEDAL's reward to `ig`.
+The [AB-MEDAL notebook](../notebooks/gsm8k/AB_MEDAL_MCTS_Colab.ipynb) defaults to
+paired AB-MEDAL IG versus AB-MEDAL + AdaLook experiments, with its own optional
+`demo` mode. Both walkthroughs call the shared `ab_development` helpers. To compare
+initialization policies alone, use `ig` for both and match stage, questions and budget.
 
 ## Shared inputs and decoding
 
@@ -47,7 +48,7 @@ helpers. To compare initialization policies alone, set MEDAL's reward to `ig`.
 | Default | Condition A: Lc=10, search budget=256, batch size=1 |
 | Other enabled condition | B=(10,512) |
 | Retained actions | K1=3, K2=5; identical probability/entropy/margin scoring |
-| Reward | AB: immediate normalized IG; MEDAL: selectable IG/AdaLook, default adaptive |
+| Reward | Both support IG, one-step confidence scoring and adaptive AdaLook; AB uses temporary sibling comparisons |
 | Stopping | Forward budget or frontier exhaustion; root forward counts |
 | Final selection | Depth with >= C distinct states (fallback to most distinct, deeper on ties), first occurrence, empirical Q, top 3, best 1 |
 | Fallback | Selected depth below Lc; valid root-only and short shortlists complete |

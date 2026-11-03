@@ -47,49 +47,8 @@ class Hypothesis:
         return self.committed_mass + self.analysis.confidence_mass
 
 
-class AdaptiveDriver:
-    def __init__(self, search):
-        self.search = search
-        self.pending = None
-        self.generator = self._run()
-        self.exhausted = False
-
-    def next_evaluation(self):
-        if self.pending is None and not self.exhausted:
-            self._advance()
-        return self.pending
-
-    def _advance(self, analysis=None):
-        try:
-            self.pending = self.generator.send(analysis)
-        except StopIteration:
-            self.pending = None
-            self.exhausted = True
-
-    def record_external_forward(self, request, invocation_id, batch_size):
-        from .mcts_decoding import BudgetExhausted
-        s = self.search
-        if request is not self.pending or request.attempted:
-            raise ValueError("Expected current undispatched AdaLook request.")
-        if s._at_cap():
-            raise BudgetExhausted("Search forward cap reached.")
-        request.attempted = True
-        s._counted.calls += 1
-        s._counted.counts[request.phase] += 1
-        s._emit('forward', phase=request.phase, invocation_id=invocation_id,
-                batch_size=batch_size, node_id=request.node.node_id,
-                status='attempted', **s._counted.costs())
-
-    def submit_evaluation(self, request, logits):
-        from .mcts_decoding import distribution_from_logits
-        s = self.search
-        if request is not self.pending or not request.attempted:
-            raise ValueError("Expected current dispatched AdaLook request.")
-        analysis = distribution_from_logits(logits, request.node.state, s.prompt_len,
-            s.mask_id, s.config, search_excluded_token_ids=s.search_excluded_token_ids)[0]
-        s._emit('adalook_forward_result', phase=request.phase, node_id=request.node.node_id)
-        self.pending = None
-        self._advance(analysis)
+class ConfidenceRefinement:
+    """Shared temporary-hypothesis evaluator; never selects or backs up tree nodes."""
 
     def _boundary(self):
         s = self.search
@@ -186,6 +145,51 @@ class AdaptiveDriver:
                         score_variance=pvariance(final_scores) if len(final_scores) > 1 else 0.0,
                         branch_actions=branch_events)
         return values, metadata
+
+
+class AdaptiveDriver(ConfidenceRefinement):
+    def __init__(self, search):
+        self.search = search
+        self.pending = None
+        self.generator = self._run()
+        self.exhausted = False
+
+    def next_evaluation(self):
+        if self.pending is None and not self.exhausted:
+            self._advance()
+        return self.pending
+
+    def _advance(self, analysis=None):
+        try:
+            self.pending = self.generator.send(analysis)
+        except StopIteration:
+            self.pending = None
+            self.exhausted = True
+
+    def record_external_forward(self, request, invocation_id, batch_size):
+        from .mcts_decoding import BudgetExhausted
+        s = self.search
+        if request is not self.pending or request.attempted:
+            raise ValueError("Expected current undispatched AdaLook request.")
+        if s._at_cap():
+            raise BudgetExhausted("Search forward cap reached.")
+        request.attempted = True
+        s._counted.calls += 1
+        s._counted.counts[request.phase] += 1
+        s._emit('forward', phase=request.phase, invocation_id=invocation_id,
+                batch_size=batch_size, node_id=request.node.node_id,
+                status='attempted', **s._counted.costs())
+
+    def submit_evaluation(self, request, logits):
+        from .mcts_decoding import distribution_from_logits
+        s = self.search
+        if request is not self.pending or not request.attempted:
+            raise ValueError("Expected current dispatched AdaLook request.")
+        analysis = distribution_from_logits(logits, request.node.state, s.prompt_len,
+            s.mask_id, s.config, search_excluded_token_ids=s.search_excluded_token_ids)[0]
+        s._emit('adalook_forward_result', phase=request.phase, node_id=request.node.node_id)
+        self.pending = None
+        self._advance(analysis)
 
     def _finish_group(self, parent, children, analyses, values, metadata):
         from .mcts_decoding import apply_child_analysis, backpropagate, action_record, _state_key

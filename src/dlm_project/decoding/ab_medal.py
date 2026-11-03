@@ -1,7 +1,7 @@
 """Adaptive MEDAL with identical Student-t predictive models for GEN and CONT.
 
-States, action filtering, immediate information gain and final candidate ranking
-come from the repository's MEDAL reconstruction. There are no search rollouts.
+States, action filtering and final candidate ranking come from MEDAL. Optional
+AdaLook evaluates temporary hypotheses before a single real-child backup.
 """
 
 from collections import Counter
@@ -79,8 +79,8 @@ class ABMEDALConfig(medal.MCTSConfig):
 
     def __post_init__(self):
         super().__post_init__()
-        if self.reward_mode == 'adalook_adaptive':
-            raise ValueError('AdaLook adaptive rollout is available for MEDAL, not AB-MEDAL.')
+        if self.reward_mode == 'adalook_adaptive' and self.search_policy != 'gaussian':
+            raise ValueError('AB AdaLook requires the gaussian GEN/CONT search policy.')
         self.new_posterior()
         if self.search_policy not in ("gaussian", "medal_equivalent"):
             raise ValueError("search_policy must be gaussian or medal_equivalent.")
@@ -94,6 +94,8 @@ class _SearchModel(medal._SearchModel):
 
     def __init__(self, *args):
         super().__init__(*args)
+        self.counts['adalook_comparison'] = 0
+        self.seconds['adalook_comparison'] = 0.0
         self.sequence_nfes = 0
         self.sequence_counts = dict.fromkeys(self.counts, 0)
 
@@ -216,6 +218,9 @@ class ABMEDALSearch(medal.MCTSSearch):
         self.initialization_seconds = 0.0
         self._round = None
         self._pending = None
+        self._refinement = None
+        self._refinement_request = None
+        self._refinement_analysis = None
 
     def _snapshot_checkpoint(self, budget, stop_reason="model_call_budget"):
         snapshot = super()._snapshot_checkpoint(budget, stop_reason=stop_reason)
@@ -382,6 +387,12 @@ class ABMEDALSearch(medal.MCTSSearch):
             analysis = medal.distribution_from_logits(
                 logits, request.node.state, self.prompt_len, self.mask_id, self.config,
                 search_excluded_token_ids=self.search_excluded_token_ids)[0]
+        if self._refinement is not None:
+            self._emit('adalook_forward_result', phase=request.phase,
+                       node_id=request.node.node_id,
+                       real_child_id=self._refinement_request.node.node_id)
+            self._advance_refinement(analysis)
+            return
         child, parent = request.node, request.parent
         if parent is None:
             self.root.analysis = analysis
@@ -393,8 +404,42 @@ class ABMEDALSearch(medal.MCTSSearch):
             self._pending = None
             self._check_checkpoint()
             return
+        if self.config.reward_mode == 'adalook_adaptive':
+            from .ab_adalook_rollout import ABConfidenceRefinement
+            self._refinement_request = request
+            self._refinement_analysis = analysis
+            self._refinement = ABConfidenceRefinement(self, request, analysis).run()
+            self._advance_refinement()
+            return
+        self._finalize_child(request, analysis)
+
+    def _advance_refinement(self, analysis=None):
+        """Do not make another AB decision until the real child's reward is final."""
+        try:
+            temporary = self._refinement.send(analysis)
+        except StopIteration as finished:
+            reward, metadata = finished.value
+            request, base = self._refinement_request, self._refinement_analysis
+            self._refinement = self._refinement_request = self._refinement_analysis = None
+            self._finalize_child(request, base, reward=reward, metadata=metadata)
+        else:
+            self._pending = EvaluationRequest(temporary.node, temporary.parent, [], [], temporary.phase)
+
+    def _finalize_child(self, request, analysis, *, reward=None, metadata=None):
+        child, parent = request.node, request.parent
         evaluation = medal.apply_child_analysis(parent, child, analysis, self.prompt_len,
                                                  self.mask_id, self.config, signal_nfe=self.model_calls)
+        if reward is not None:
+            if not math.isfinite(reward):
+                raise ValueError('Non-finite AB AdaLook reward.')
+            one_step_reward = evaluation['reward']
+            child.immediate_reward = reward
+            evaluation.update(reward=reward, one_step_reward=one_step_reward,
+                              signal_extra_nfes=metadata['extra_nfes'] + metadata['comparison_nfes'],
+                              **{f'adalook_{k}': v for k, v in metadata.items()})
+            self._emit('adalook_group', parent_id=parent.node_id, child_ids=[child.node_id],
+                       real_child_id=child.node_id, one_step_reward=one_step_reward,
+                       final_reward=reward, **metadata)
         self._register(child)
         self.simulations_completed += 1
         self._record_evaluated(child)
@@ -438,6 +483,7 @@ class ABMEDALSearch(medal.MCTSSearch):
 
     def _step(self):
         start = len(self.trace)
+        completed = self.simulations_completed
         while not self.done:
             request = self.next_evaluation()
             if request is None:
@@ -448,7 +494,7 @@ class ABMEDALSearch(medal.MCTSSearch):
                     self._counted, request.node.state, self.prompt_len, self.mask_id, self.config,
                     search_excluded_token_ids=self.search_excluded_token_ids)
             self.submit_evaluation(request, analysis=analysis)
-            if request.parent is not None:
+            if self.simulations_completed > completed:
                 break
         return self.trace[start:]
 
@@ -462,7 +508,8 @@ class ABMEDALSearch(medal.MCTSSearch):
                  "reward_evaluation": self._counted.seconds["simulation"] - filtering,
                  "backpropagation": self._counted.seconds["backpropagation"],
                  "candidate_selection": self._counted.seconds["candidate_evaluation"],
-                 "full_rollout": 0.0}
+                 "full_rollout": self._counted.seconds['adalook_rollout'],
+                 "temporary_candidate_evaluation": self._counted.seconds['adalook_comparison']}
         times["bookkeeping_trace"] = max(0.0, self.initialization_seconds - sum(times.values()))
         result.stats.update(implementation_version="ab_medal_fixed_budget_v2" if self.config.stop_mode == "budget" else "ab_medal_gaussian_v1", search_policy=self.config.search_policy,
                             evaluation_variant="Adaptive MEDAL (immediate-child IG)",
@@ -474,6 +521,12 @@ class ABMEDALSearch(medal.MCTSSearch):
                             initialization_wall_seconds=self.initialization_seconds,
                             timing_seconds=times,
                             **(tree_statistics(self) if self.config.stop_mode == "candidates" else {}))
+        result.stats.update(temporary_candidate_nfes=self._counted.counts['adalook_comparison'],
+                            adalook_total_extra_nfes=self._counted.counts['adalook_comparison'] + self._counted.counts['adalook_rollout'])
+        if self.config.reward_mode != 'ig':
+            result.stats.update(implementation_version='ab_medal_adalook_hybrid_v1',
+                                reward_version='ab_medal_adalook_hybrid_v1',
+                                evaluation_variant='AB-MEDAL + ' + self.config.reward_mode + ' (hybrid)')
         if self.config.stop_mode == "budget":
             result.stats.update(fallback_used=result.selected.depth < self.config.init_tokens,
                                 fallback_reason=self.stop_reason if result.selected.depth < self.config.init_tokens else None)

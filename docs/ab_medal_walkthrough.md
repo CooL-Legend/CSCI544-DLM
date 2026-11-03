@@ -1,15 +1,15 @@
 # AB-MEDAL implementation guide
 
-This guide describes `ab_medal_fixed_budget_v2`: AB-MEDAL under the same frozen
-inputs, immediate information-gain reward, final selection, and Confidence
-completion as MEDAL's E0 protocol. Adaptive branching changes how search spends
-its forward budget. It does not change the prompt, reward, or final decoder.
+The IG baseline retains `ab_medal_fixed_budget_v2`; the optional confidence
+variants use `ab_medal_adalook_hybrid_v1`. Both use the same frozen inputs, final
+candidate selection and LLaDA Confidence completion. The numbered algorithm
+sections below describe the IG baseline unless explicitly stated otherwise.
 
-The first development run uses one frozen development question, depth 10, search
-budget 256, and one question at a time. The formal E1/E3 runners are separate.
-Optional batching is an implementation study, not an algorithmic treatment.
-The [matched MEDAL notebook](medal_notebook.md) now shares the executable
-walkthrough, changing only the initialization selector to UCB MEDAL.
+The notebook defaults to a serial paired comparison on five development
+questions, depth 10 and search budget 256. `demo` mode retains the single-question
+walkthrough. Formal E1/E3 runners remain separate. Optional batching is an
+implementation study, not an algorithmic treatment. MEDAL and AB reuse prompting,
+completion, audit and report utilities.
 
 Entry points:
 
@@ -17,8 +17,107 @@ Entry points:
 - [Shared protocol and exact prompt](experiments.md).
 - [Adaptive search](../src/dlm_project/decoding/ab_medal.py).
 - [Development runner](../src/dlm_project/tasks/gsm8k/ab_development.py).
+- [Paired comparison runner](../src/dlm_project/tasks/gsm8k/ab_comparison.py).
+- [AB AdaLook adapter](../src/dlm_project/decoding/ab_adalook_rollout.py).
 - [Offline reconstruction](../src/dlm_project/decoding/search_audit.py).
 - [Batch executor](../src/dlm_project/decoding/ab_batch.py).
+
+## Notebook comparison and AdaLook semantics
+
+Settings in `AB_MEDAL_MCTS_Colab.ipynb`:
+
+```python
+NOTEBOOK_MODE = "comparison"   # or "demo"
+STAGE = "dev"                  # dev: 5, evaluation: 20, test: 200
+NUM_SAMPLES = 5
+CONDITION = "A"                # Lc=10, budget=256; B: Lc=10, budget=512
+COMPARISON_REWARD_MODES = ["ig", "adalook_adaptive"]
+REWARD_MODE = "adalook_adaptive"  # demo only
+RESUME_RUN = None
+```
+
+Use development questions for tuning; five questions are a diagnostic run.
+Freeze settings before evaluation/test. Adding `adalook_one_step` separates the
+confidence reward change from the extra adaptive computation. The default
+AdaLook thresholds match MEDAL's starting values; they are not tuned results.
+The reward modes share AB priors `(0, 1, 1, 0.1)`. Reward scales differ, so inspect
+reward distributions and posterior updates; any prior sensitivity study should
+be separate and development-only.
+
+Every traversal still uses AB's Student-t GEN/CONT decisions and expands exactly
+one real child. IG evaluates and backs up that child immediately. One-step mode
+replaces IG with `alpha * log(action_probability) + log(confidence_mass)`, using
+the existing epsilon floor, without extra forwards.
+
+Adaptive mode retains the real child's base analysis while evaluating a detached
+comparison hypothesis for every other retained action of the same parent. An
+already evaluated real sibling contributes its cached **base** analysis, not its
+previous refined reward. Otherwise a new comparison forward is charged. Negative
+temporary IDs are scoped to a real-child group and never enter `search.nodes`,
+posterior tables, remaining-action mutation or final candidate selection.
+Groups retain the parent's action order for deterministic tie-breaking, rather
+than giving the current real child priority in equal-score restarts.
+
+The shared `ConfidenceRefinement` evaluator then applies the existing MEDAL
+variance gate, confidence-based commitments, pruning and restart rules to this
+group. It copies all hypothesis states. Only the current real child's resulting
+score is returned to AB: exactly one tree backup and one update for each original
+GEN/CONT posterior recipient. Other hypotheses receive no AB update. If the real
+origin is pruned, it keeps its last valid score; a restart rooted at a different
+origin cannot transfer that origin's reward to the real child.
+
+`adalook_max_depth=1` and a zero variance threshold bypass comparison forwards and
+give the one-step ablation. Other groups and each refinement round must fit in
+full before the next configured checkpoint/budget; insufficient budget falls
+back to the last valid score. Reaching a checkpoint finalizes the pending child
+before the snapshot. Checkpoint schedules can change refinement allocation;
+compare runs with the same schedule. With only one available candidate, adaptive
+refinement stops rather than fabricating a variance comparison.
+
+The evaluator is AdaLook-inspired, not the paper's block/ETE decoder. AB's
+temporary sibling comparisons are a project-specific adaptation. They can
+consume more computation than MEDAL's sibling groups, which are real expansions.
+
+Accounting is explicit:
+
+```text
+search_nfes = root_analysis_nfes + real_child_evaluation_nfes
+            + temporary_candidate_nfes + adalook_extra_nfes
+adalook_total_extra_nfes = temporary_candidate_nfes + adalook_extra_nfes
+total_nfes = search_nfes + completion_nfes
+completion_nfes = 256 - selected_depth
+```
+
+`adalook_extra_nfes` retains MEDAL's rollout-only definition. Successful tree
+forwards reconcile to `nfes_per_depth` and `nfes_per_root_subtree`; temporary work
+is reported separately. Failed attempted forwards remain in cost accounting.
+`adalook_trigger_rate` is the fraction of finalized groups reaching depth > 1;
+stop reasons distinguish no progress, variance, pruning and budget boundaries.
+All real rewards, original IG, one-step scores and posterior updates are saved.
+
+Comparison outputs are under
+`MyDrive/CSCI544-DLM/results/ab_medal/comparison/<stage>/<condition>/<run>/` in
+Colab (under the local cache root outside Colab). They include:
+
+- `config.json`, `manifest.json`, `selection.json`: inputs, variants and code fingerprint.
+- `predictions.jsonl`: durable per-attempt results, including interruptions.
+- `traces/` and `questions/<variant>/<question>/<attempt>/`: full diagnostic evidence.
+- `summary.json`, `report/summary.csv`, `report/report.md`, `report/comparison.png`:
+  accuracy, mean search/completion/total NFE and decoding time, plus AB diagnostics.
+- `report/per_question.csv`, `report/paired_results.csv` and `.json`: latest results
+  and wrong-to-right/right-to-wrong transitions on completed pairs only.
+
+Setup/model loading, warm-up, tokenization, scoring and artifact writing are
+excluded from decoding time. Incomplete summaries cover completed questions and
+must not be treated as final matched-cohort comparisons. Set `RESUME_RUN` to the
+printed run directory to skip completed variant/question pairs. Interrupted
+questions restart with a new attempt directory. Configurations and source hashes
+must match. A completed run can regenerate reports without a loaded model.
+
+In `demo` mode, `REWARD_MODE` and `SAMPLE_INDEX` select one development question.
+The existing serial-five and batching sections remain optional. The cooperative
+executor uses the same request/submit state machine, including temporary forwards;
+run its padding/search parity checks before collecting batched throughput results.
 
 ## 1. Prompting and the initial state
 
@@ -217,15 +316,14 @@ Supported shared configurations are:
 
 | Configuration | Lc | Search budget |
 |---|---:|---:|
-| A (development default) | 7 | 256 |
-| B | 7 | 512 |
-| C | 10 | 512 |
-| D | 10 | 1024 |
+| A (development default) | 10 | 256 |
+| B | 10 | 512 |
 
 Count root analysis and all child forwards. Stop at the forward budget or an
 exhausted frontier; three candidates never stop a fixed-budget search.
 
-1. Find the maximum depth among successfully evaluated nodes, including root.
+1. Choose the deepest evaluated depth with at least three distinct states. If no
+   depth qualifies, choose the most populated depth, preferring deeper on ties.
 2. Collect every distinct state at that depth using exact token IDs/mask positions.
 3. For duplicate states, keep the first evaluated occurrence and its final
    statistics; do not pool transposition statistics.
@@ -233,14 +331,14 @@ exhausted frontier; three candidates never stop a fixed-budget search.
 5. Keep at most three; complete only the highest ranked state.
 
 Ranking performs zero model forwards and uses neither UCB bonuses nor Bayesian
-predictive draws. Deepest nodes are leaves in this immediate-child search, so
-normally their one backed-up reward equals immediate IG. The selection interface
-still reads accumulated W and N.
+predictive draws. Selection reads accumulated W and N; a selected node may have
+descendants, so its Q need not equal its immediate reward.
 
 Apply exactly this rule below Lc. Fallback means selected depth < Lc, independent
 of shortlist size. A root-only search has a one-item shortlist with Q=0 and
-completes from all masks. A single candidate at Lc is target-depth success, not
-fallback. Model errors do not become valid fallback runs.
+completes from all masks. A candidate reaching Lc counts as requested-depth
+success, but the selected depth can still be below Lc under the shortlist rule.
+Model errors do not become valid fallback runs.
 
 Low-level callers can explicitly request legacy `stop_mode="candidates"` and
 an optional cap. Historical comparison adapters retain this behavior, including

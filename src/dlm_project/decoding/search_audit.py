@@ -158,11 +158,12 @@ def from_events(events, *, prompt_ids=None, mask_id, gen_length, requested_depth
                  decisions=[copy.deepcopy(e) for e in events if e.get("stage") == "adaptive_decision"] if adaptive else None,
                  adalook_groups=[copy.deepcopy(e) for e in events if e.get('stage') == 'adalook_group'],
                  rollout_nfes=sum(e.get('stage') == 'forward' and e.get('phase') == 'adalook_rollout' for e in events),
-                 forwards=[copy.deepcopy(e) for e in events if e.get("stage") == "forward" and e.get("phase") in ("tree_analysis", "simulation", "candidate_evaluation", "adalook_rollout")],
+                 comparison_nfes=sum(e.get('stage') == 'forward' and e.get('phase') == 'adalook_comparison' for e in events),
+                 forwards=[copy.deepcopy(e) for e in events if e.get("stage") == "forward" and e.get("phase") in ("tree_analysis", "simulation", "candidate_evaluation", "adalook_rollout", "adalook_comparison")],
                  availability={"explicit_state_hashes": modern, "explicit_evaluation_order": modern,
                                "final_selection": final is not None, "adaptive_decisions": adaptive})
     reconstruct(audit, prompt_ids)
-    if final is not None and len(nodes) + audit['rollout_nfes'] != search_nfes:
+    if final is not None and len(nodes) + audit['rollout_nfes'] + audit['comparison_nfes'] != search_nfes:
         raise ValueError("Successful search NFEs differ from evaluated root plus children.")
     return audit
 
@@ -217,6 +218,8 @@ def metrics(audit):
         pairs.append(dict(candidate_ids=[a, b], shared_prefix_length=prefix,
                           jaccard_distance=1 - len(set(left) & set(right)) / len(union) if union else 0.0))
     budget, nfe = audit["requested_budget"], audit["search_nfes"]
+    groups = audit.get('adalook_groups', [])
+    extra_nfes = audit.get('rollout_nfes', 0) + audit.get('comparison_nfes', 0)
     result = dict(
         max_depth=deepest, selected_depth=selection["selected_depth"] if selection else None,
         average_search_depth=_mean([r["depth"] for r in children]) or 0.0,
@@ -235,10 +238,15 @@ def metrics(audit):
         ig_min=min(gains) if gains else None, ig_mean=_mean(gains), ig_max=max(gains) if gains else None,
         reward_min=min(rewards) if rewards else None, reward_mean=_mean(rewards), reward_max=max(rewards) if rewards else None,
         adalook_extra_nfes=audit.get('rollout_nfes', 0), adalook_groups=audit.get('adalook_groups', []),
+        temporary_candidate_nfes=audit.get('comparison_nfes', 0),
+        adalook_total_extra_nfes=extra_nfes, adalook_group_count=len(groups),
+        adalook_trigger_rate=sum(g['rollout_depth'] > 1 for g in groups) / len(groups) if groups else 0.0,
+        adalook_mean_depth=_mean([g['rollout_depth'] for g in groups]) if groups else 1.0,
+        adalook_stop_reasons=dict(Counter(g['stop_reason'] for g in groups)),
         selected_q=by_id[selection["selected_node_id"]]["q_value"] if selection else None,
         nfes_per_depth={str(k): v for k, v in sorted(depths.items())},
         nfes_per_root_subtree={str(k): v for k, v in sorted(subtrees.items())},
-        root_analysis_nfes=depths.get(0, 0), uncompleted_evaluation_nfes=nfe - len(nodes) - audit.get('rollout_nfes', 0),
+        root_analysis_nfes=depths.get(0, 0), uncompleted_evaluation_nfes=nfe - len(nodes) - extra_nfes,
         requested_depth_success=bool(target), fallback=selection["fallback"] if selection else None,
         fallback_rate=float(selection["fallback"]) if selection else None,
         stop_reason=selection["stop_reason"] if selection else None,
@@ -254,7 +262,7 @@ def metrics(audit):
                                 shared_prefix_length=min((p["shared_prefix_length"] for p in pairs), default=None)),
         state_hashes_available=hashes_available,
     )
-    tree_nfes = nfe - audit.get('rollout_nfes', 0)
+    tree_nfes = nfe - extra_nfes
     if selection and (sum(depths.values()) != tree_nfes or depths.get(0, 0) + sum(subtrees.values()) != tree_nfes):
         raise ValueError("Depth/subtree NFE allocation does not reconcile.")
     return result

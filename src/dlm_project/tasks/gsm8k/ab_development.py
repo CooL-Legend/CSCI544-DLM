@@ -39,7 +39,7 @@ def context(*, stage='dev', condition='A', indices=(0,), method='ab_medal', rewa
         raise ValueError('Sample index is outside the frozen stage.')
     selected = next((c for c in common['search']['conditions'] if c['label'] == condition), None)
     if selected is None:
-        raise ValueError('Condition must be A, B, or C.')
+        raise ValueError('Condition must be one of: ' + ', '.join(c['label'] for c in common['search']['conditions']))
     if method not in ('medal', 'ab_medal'):
         raise ValueError('Initialization method must be medal or ab_medal.')
     config_class = ABMEDALConfig if method == 'ab_medal' else MCTSConfig
@@ -48,11 +48,10 @@ def context(*, stage='dev', condition='A', indices=(0,), method='ab_medal', rewa
                'adalook_max_depth', 'adalook_variance_threshold', 'adalook_trigger_threshold', 'adalook_min_masks'}
     if set(reward_options) - allowed:
         raise ValueError('Unknown reward experiment setting.')
-    if method != 'medal' and reward_options:
-        raise ValueError('AdaLook development variants are MEDAL-only.')
     config = config_class(**common['decoding']['mcts'], init_tokens=selected['depth'],
                           max_model_calls=selected['budget'], stop_mode='budget', **reward_options)
-    return dict(implementation_version=IMPLEMENTATION_VERSION if method == 'ab_medal' else 'medal_fixed_budget_v6',
+    version = (IMPLEMENTATION_VERSION if config.reward_mode == 'ig' else 'ab_medal_adalook_hybrid_v1') if method == 'ab_medal' else 'medal_fixed_budget_v6'
+    return dict(implementation_version=version,
                 method=method, common=common,
                 common_protocol_hash=digest(common), prompt_template_hash=digest(common['prompt']['template']),
                 stage=stage, condition=condition, search=asdict(config),
@@ -328,7 +327,8 @@ def show_metrics(record):
                         'evaluated_root_subtrees', 'root_subtree_coverage', 'deepest_candidate_root_subtrees', 'shortlist_root_subtrees', 'candidate_diversity'],
         'Rewards': ['reward_mode', 'negative_ig_count', 'negative_ig_percentage', 'ig_min', 'ig_mean', 'ig_max',
                     'reward_min', 'reward_mean', 'reward_max', 'selected_q'],
-        'AdaLook': ['adalook_extra_nfes', 'adalook_groups'],
+        'AdaLook': ['temporary_candidate_nfes', 'adalook_extra_nfes', 'adalook_total_extra_nfes',
+                    'adalook_trigger_rate', 'adalook_mean_depth', 'adalook_stop_reasons', 'adalook_groups'],
         'Allocation': ['nfes_per_depth', 'root_analysis_nfes', 'nfes_per_root_subtree'],
         'Adaptive decisions': ['decision_counts', 'decision_percentages', 'forced_decisions', 'forced_decision_counts', 'forced_decision_percentages', 'forced_decision_percentage'],
         'Efficiency': ['requested_depth_success', 'fallback', 'fallback_rate', 'stop_reason', 'budget_utilization'],
@@ -357,7 +357,8 @@ def plot_metrics(directory):
         values = metrics[key]
         axis.bar(list(values), list(values.values()))
         axis.set(xlabel=label, ylabel='Tree evaluation NFEs')
-    axes[2].bar(['Tree', 'AdaLook rollout'], [sum(metrics['nfes_per_depth'].values()), metrics.get('adalook_extra_nfes', 0)])
+    axes[2].bar(['Tree', 'Comparison', 'Rollout'], [sum(metrics['nfes_per_depth'].values()),
+                metrics.get('temporary_candidate_nfes', 0), metrics.get('adalook_extra_nfes', 0)])
     axes[2].set(ylabel='Sequence NFEs')
     figure.suptitle('Search compute allocation (temporary rollouts shown separately)')
     FigureCanvasAgg(figure).print_png(str(directory / 'compute_allocation.png'))

@@ -34,7 +34,8 @@ def wrapper(model=None):
         encode_prompt=lambda text: torch.tensor([[3] * (2 + len(text) % 4)]))
 
 
-@pytest.mark.parametrize('condition,depth,budget', [('A', 10, 256), ('B', 10, 512), ('C', 10, 1024)])
+@pytest.mark.parametrize('condition,depth,budget', [
+    (c['label'], c['depth'], c['budget']) for c in dev.load_shared_protocol()['search']['conditions']])
 def test_shared_conditions_prompts_seeds_and_order(condition, depth, budget):
     ctx = dev.context(condition=condition, indices=(0, 1))
     w = wrapper()
@@ -126,7 +127,10 @@ def test_actual_notebook_cells_execute_one_model_and_all_metrics(tmp_path, monke
     monkeypatch.setattr(torch.cuda, 'is_available', lambda: True)
     monkeypatch.setattr(torch.cuda, 'is_bf16_supported', lambda: True)
     monkeypatch.setattr(torch.cuda, 'get_device_name', lambda i: 'stub')
-    scope = dict(Path=Path, DRIVE_ROOT=tmp_path, Image=lambda **kw: kw, display=lambda value: None)
+    from dlm_project.models import cache
+    monkeypatch.setattr(cache, 'cache_model', lambda **kw: tmp_path / 'model')
+    scope = dict(Path=Path, DRIVE_ROOT=tmp_path, REPO_DIR=Path.cwd(), IN_COLAB=False,
+                 Image=lambda **kw: kw, display=lambda value: None)
     # The import cell imports IPython's display; rendering local PNGs is safe.
     active = False
     for cell in notebook.cells:
@@ -136,7 +140,9 @@ def test_actual_notebook_cells_execute_one_model_and_all_metrics(tmp_path, monke
         compile(cell.source, cell.id, 'exec')
         active |= cell.id == 'ab-settings'
         if active:
-            exec(cell.source, scope)
+            source = cell.source.replace('NOTEBOOK_MODE = "comparison"', 'NOTEBOOK_MODE = "demo"')
+            source = source.replace('REWARD_MODE = "adalook_adaptive"', 'REWARD_MODE = "ig"')
+            exec(source, scope)
     assert len(loads) == 1
     assert scope['RUN_SERIAL_DEV'] is scope['RUN_BATCH_STUDY'] is False
     assert scope['record']['total_nfes'] == len(w.model.calls) - 1  # separate warm-up

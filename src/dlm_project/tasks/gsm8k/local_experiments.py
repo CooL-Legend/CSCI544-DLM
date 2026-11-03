@@ -60,7 +60,8 @@ def read_predictions(path):
     return rows
 
 
-def report(directory, rows, conditions, status, error=None):
+def report(directory, rows, conditions, status, error=None, *,
+           title='LLaDA / MEDAL AdaLook comparison', extra_metrics=()):
     # A retried question contributes only its latest attempt.
     latest = {(r['condition'], r['example_id']): r for r in rows}
     summary = dict(status=status, error=error, conditions=[])
@@ -70,7 +71,7 @@ def report(directory, rows, conditions, status, error=None):
         item = dict(id=condition, attempted=len(selected), completed=len(completed),
                     accuracy=mean(r['correct'] for r in completed) if completed else None)
         for key in ('search_nfes', 'completion_nfes', 'total_nfes', 'decoding_seconds',
-                    'adalook_extra_nfes', 'adalook_mean_depth'):
+                    'adalook_extra_nfes', 'adalook_mean_depth', *extra_metrics):
             item['mean_' + key] = mean(r.get(key, 0) for r in completed) if completed else None
         summary['conditions'].append(item)
     save(directory / 'summary.json', summary)
@@ -80,7 +81,7 @@ def report(directory, rows, conditions, status, error=None):
         writer = csv.DictWriter(f, fieldnames=list(summary['conditions'][0]))
         writer.writeheader()
         writer.writerows(summary['conditions'])
-    lines = ['# LLaDA / MEDAL AdaLook comparison', '', f'Status: {status}', '',
+    lines = ['# ' + title, '', f'Status: {status}', '',
              'Accuracy below uses completed questions only; incomplete runs are not final comparisons.', '',
              '| Condition | Completed | Accuracy | Mean total NFE | Mean seconds |', '|---|---:|---:|---:|---:|']
     for r in summary['conditions']:

@@ -122,12 +122,17 @@ consult the [v6 guide](docs/experiments.md) for metrics, artifacts, and migratio
 
 ## AB-MEDAL development
 
-The updated [AB-MEDAL notebook](notebooks/gsm8k/AB_MEDAL_MCTS_Colab.ipynb) starts
-with the first frozen development question, depth 10, a 256-forward search budget,
-and serial execution. It uses the shared two-shot prompt, immediate IG, deepest
-qualified empirical-Q selection, and LLaDA Confidence at T=0. It displays all search,
-reward, compute-allocation, and decoding metrics from saved traces, followed by
-optional five-question validation and parity-gated batching at sizes 1, 2, and 4.
+The [AB-MEDAL notebook](notebooks/gsm8k/AB_MEDAL_MCTS_Colab.ipynb) defaults to
+`NOTEBOOK_MODE="comparison"`: AB-MEDAL (IG) versus AB-MEDAL + adaptive AdaLook
+on five frozen development questions, depth 10 and search budget 256, serially.
+One loaded model serves both variants. It saves per-question results, strict
+resume metadata, paired answer changes and the same core CSV/Markdown/chart
+reports as the MEDAL notebook. Add `adalook_one_step` for the reward-only ablation.
+Temporary comparisons and rollout forwards both consume the search budget.
+
+Set `NOTEBOOK_MODE="demo"` to inspect one question's tree, GEN/CONT decisions,
+posterior updates and compute allocation. Optional serial-five validation and
+parity-gated batching remain disabled by default. The existing IG CLI remains:
 
 ```bash
 python scripts/run_ab_medal_single.py --condition A --num-samples 1
