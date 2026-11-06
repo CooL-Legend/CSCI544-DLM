@@ -124,6 +124,13 @@ def from_events(events, *, prompt_ids=None, mask_id, gen_length, requested_depth
                                   immediate_reward=event["reward"], action=expanded["action"]))
     nodes = [{key: row.get(key) for key in ("node_id", "parent_id", "depth", "evaluation_order",
               "state_hash", "immediate_reward", "action")} for row in nodes]
+    evaluations = {event["child_id"]: event for event in events if event.get("stage") == "evaluation"}
+    for row in nodes:
+        event = evaluations.get(row["node_id"], {})
+        if event.get("reward_mode") == "ig_kl":
+            # Backups use the combined reward; entropy diagnostics still mean IG.
+            for key in ("immediate_gain", "action_history_kl", "kl_penalty"):
+                row[key] = event[key]
     by_id = {row["node_id"]: row for row in nodes}
     for row in nodes:
         row.update(visits=0, reward_sum=0.0, q_value=0.0)
@@ -186,7 +193,8 @@ def metrics(audit):
     unique = len(identities)
     duplicates = len(nodes) - unique
     rewards = [row["immediate_reward"] for row in children]
-    negative = sum(r < 0 for r in rewards)
+    gains = [row.get("immediate_gain", row["immediate_reward"]) for row in children]
+    negative = sum(g < 0 for g in gains)
     deepest = max(depths, default=0)
     target = {tuple(sorted(paths[r["node_id"]])) for r in nodes if r["depth"] == audit["requested_depth"]}
     candidate_depth = selection["selected_depth"] if selection else deepest
@@ -227,7 +235,7 @@ def metrics(audit):
         deepest_candidate_root_subtrees=sorted({root_child[i] for i in candidate_representatives.values() if i != 0}),
         shortlist_root_subtrees=sorted({root_child[i] for i in shortlist if i != 0}),
         negative_ig_count=negative, negative_ig_percentage=100 * negative / len(rewards) if rewards else None,
-        ig_min=min(rewards) if rewards else None, ig_mean=_mean(rewards), ig_max=max(rewards) if rewards else None,
+        ig_min=min(gains) if gains else None, ig_mean=_mean(gains), ig_max=max(gains) if gains else None,
         selected_q=by_id[selection["selected_node_id"]]["q_value"] if selection else None,
         nfes_per_depth={str(k): v for k, v in sorted(depths.items())},
         nfes_per_root_subtree={str(k): v for k, v in sorted(subtrees.items())},

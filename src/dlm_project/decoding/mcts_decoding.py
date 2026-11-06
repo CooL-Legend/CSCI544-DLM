@@ -645,6 +645,23 @@ class MCTSSearch:
         if self.on_event:
             self.on_event(event)
 
+    def _analyze_node(self, node, *, logits=None):
+        """Analysis hook shared by serial search and external AB evaluations."""
+        if logits is not None:
+            return distribution_from_logits(
+                logits, node.state, self.prompt_len, self.mask_id, self.config,
+                search_excluded_token_ids=self.search_excluded_token_ids)[0]
+        return analyze_state(self._counted, node.state, self.prompt_len, self.mask_id,
+                             self.config, search_excluded_token_ids=self.search_excluded_token_ids)
+
+    def _apply_child_analysis(self, parent, child, analysis):
+        """Reward hook; the default remains the original immediate IG."""
+        return apply_child_analysis(parent, child, analysis, self.prompt_len, self.mask_id,
+                                    self.config, signal_nfe=self.model_calls)
+
+    def _evaluate_child(self, parent, child):
+        return self._apply_child_analysis(parent, child, self._analyze_node(child))
+
     def _snapshot_checkpoint(self, budget, stop_reason="model_call_budget"):
         evaluated = [copy.deepcopy(n) for n in self.nodes if n.evaluation_order is not None]
         candidates, shortlist = select_deepest_candidates(evaluated, limit=self.config.num_candidates)
@@ -777,9 +794,7 @@ class MCTSSearch:
         self.cycle += 1
         if self.root.analysis is None:
             with self._counted.phase("tree_analysis"):
-                self.root.analysis = analyze_state(self._counted, self.root.state, self.prompt_len,
-                                                   self.mask_id, self.config,
-                                                   search_excluded_token_ids=self.search_excluded_token_ids)
+                self.root.analysis = self._analyze_node(self.root)
             self._record_evaluated(self.root)
             self._emit("initialization", node_id=0, entropy=self.root.analysis.total_entropy,
                        masked_count=self.root.state.shape[1] - self.prompt_len,
@@ -819,8 +834,7 @@ class MCTSSearch:
                        simulations_started=self.simulations_started)
             try:
                 with self._counted.phase("simulation"):
-                    evaluation = evaluate_action(self._counted, parent, child, self.prompt_len, self.mask_id,
-                                                 self.config, search_excluded_token_ids=self.search_excluded_token_ids)
+                    evaluation = self._evaluate_child(parent, child)
             except BudgetExhausted:
                 child.closed = True
                 self._emit("simulation_interrupted", phase="simulation", child_id=child.node_id)

@@ -21,6 +21,7 @@ import torch
 from dlm_project.decoding import mcts_decoding as medal
 from dlm_project.decoding.ab_medal import ABMEDALConfig, ABMEDALSearch
 from dlm_project.decoding.mcts_decoding import MCTSConfig, MCTSSearch, select_deepest_candidates
+from dlm_project.decoding.ig_kl_search import IGKLMCTSSearch, IGKLABMEDALSearch, reward_settings
 from dlm_project.decoding.medal_demo import run_completion
 from dlm_project.decoding import search_audit
 from dlm_project.experiments.artifacts import save_json
@@ -54,8 +55,10 @@ def state_hash(state_tensor):
 
 
 def context(*, stage="dev", methods=("medal", "ab_medal"), budgets=None,
-            max_depth=MAX_SEARCH_DEPTH, num_candidates=MIN_CANDIDATES, num_samples=None):
+            max_depth=MAX_SEARCH_DEPTH, num_candidates=MIN_CANDIDATES, num_samples=None,
+            reward_mode="ig", kl_weight=0.05, kl_top_k=32):
     """Create and validate execution context for E1."""
+    reward = reward_settings(reward_mode, kl_weight, kl_top_k)
     common = load_shared_protocol()
     if budgets is None:
         budgets = tuple(c["budget"] for c in common["search"]["conditions"])
@@ -72,6 +75,7 @@ def context(*, stage="dev", methods=("medal", "ab_medal"), budgets=None,
 
     return {
         "protocol_version": PROTOCOL_VERSION,
+        "reward": reward,
         "stage": stage,
         "methods": list(methods),
         "budgets": list(budgets),
@@ -136,6 +140,12 @@ def execute_search_checkpointed(wrapper, prepared_item, ctx, method: str,
         search_cfg = MCTSConfig(**cfg_kwargs)
         search_cls = MCTSSearch
 
+    reward = _context_reward(ctx)
+    reward_options = {}
+    if reward["reward_mode"] == "ig_kl":
+        search_cls = IGKLABMEDALSearch if method == "ab_medal" else IGKLMCTSSearch
+        reward_options = {key: reward[key] for key in ("kl_weight", "kl_top_k")}
+
     search = search_cls(
         wrapper.model,
         prepared_item["ids"],
@@ -146,6 +156,7 @@ def execute_search_checkpointed(wrapper, prepared_item, ctx, method: str,
         tokenizer=wrapper.tokenizer,
         search_excluded_token_ids=ctx["termination"]["token_ids"],
         checkpoint_budgets=tuple(sorted(budgets)),
+        **reward_options,
     )
 
     t0 = perf_counter()
@@ -213,6 +224,9 @@ def run_question_e1(wrapper, prepared_item, ctx, method: str,
     """Run one question under a method and export all checkpoint and overall artifacts."""
     q_dir = base_dir / method / prepared_item["example"]["example_id"]
     q_dir.mkdir(parents=True, exist_ok=True)
+    # Persist reward identity before inference or partial artifact writes, so
+    # an interrupted question can safely resume under the same reward settings.
+    save_json(q_dir / "config.json", ctx)
 
     search, search_time = execute_search_checkpointed(
         wrapper, prepared_item, ctx, method, budgets=budgets,
@@ -246,7 +260,6 @@ def run_question_e1(wrapper, prepared_item, ctx, method: str,
     prompt_record = {k: v for k, v in prepared_item.items() if k != "ids"}
     prompt_record.update(mask_id=wrapper.mask_id, gen_length=ctx["common"]["generation"]["gen_length"])
     save_json(q_dir / "prompt.json", prompt_record)
-    save_json(q_dir / "config.json", ctx)
 
     # 2. Checkpoint results
     checkpoint_results = []
@@ -255,6 +268,7 @@ def run_question_e1(wrapper, prepared_item, ctx, method: str,
 
     for budget in sorted(budgets):
         chk = search.checkpoints[budget]
+        reward_metadata = chk.get("reward_metadata", _context_reward(ctx))
         chk_dir = checkpoints_dir / str(budget)
         chk_dir.mkdir(parents=True, exist_ok=True)
 
@@ -284,6 +298,7 @@ def run_question_e1(wrapper, prepared_item, ctx, method: str,
         # Save checkpoint artifacts
         selection_record = {
             **chk["selection"],
+            **reward_metadata,
             "selected_q": chk["selected_q"],
             "max_depth_reached": chk["max_depth_reached"],
             "selection_depth_gap": chk["selection_depth_gap"],
@@ -313,10 +328,12 @@ def run_question_e1(wrapper, prepared_item, ctx, method: str,
                 "action": None if n.action is None else asdict(n.action),
                 "child_ids": [c.node_id for c in n.children],
                 "evaluation_order": n.evaluation_order,
+                **chk.get("node_rewards", {}).get(n.node_id, {}),
             })
 
         save_json(chk_dir / "tree.json", {
             "method": method,
+            **reward_metadata,
             "budget": budget,
             "example_id": prepared_item["example"]["example_id"],
             "seed": prepared_item["seed"],
@@ -332,6 +349,7 @@ def run_question_e1(wrapper, prepared_item, ctx, method: str,
 
         checkpoint_row = {
             "method": method,
+            **reward_metadata,
             "search_budget": budget,
             "example_id": prepared_item["example"]["example_id"],
             "row_id": prepared_item["example"]["row_id"],
@@ -481,6 +499,7 @@ def run_e1_stage(wrapper, ctx, output_dir: Path, methods=("medal", "ab_medal"),
     output_dir = Path(output_dir)
     stage_dir = output_dir / ctx["stage"]
     summaries_dir = output_dir / "summaries"
+    _validate_reward_directory(output_dir, ctx, methods)
     summaries_dir.mkdir(parents=True, exist_ok=True)
 
     prepared = prepare(wrapper, ctx)
@@ -489,6 +508,7 @@ def run_e1_stage(wrapper, ctx, output_dir: Path, methods=("medal", "ab_medal"),
 
     manifest_data = {
         "protocol_version": PROTOCOL_VERSION,
+        "reward": _context_reward(ctx),
         "stage": ctx["stage"],
         "methods": list(methods),
         "budgets": list(budgets),
@@ -545,6 +565,31 @@ def run_e1_stage(wrapper, ctx, output_dir: Path, methods=("medal", "ab_medal"),
     print(f"\n✅ All {total_q} questions completed successfully for methods {list(methods)}.", flush=True)
 
     return all_checkpoint_rows, agg_rows
+
+
+def _context_reward(ctx):
+    options = ctx.get("reward", {})
+    return reward_settings(options.get("reward_mode", "ig"),
+                           options.get("kl_weight", 0.05), options.get("kl_top_k", 32))
+
+
+def _validate_reward_directory(output_dir, ctx, methods):
+    """Never resume or overwrite another reward variant, even with resume=False."""
+    expected = _context_reward(ctx)
+    records = [output_dir / "run_manifest.json",
+               output_dir / "summaries" / f"run_manifest_{ctx['stage']}.json"]
+    for method in methods:
+        for example in ctx["examples"]:
+            q_dir = output_dir / ctx["stage"] / method / example["example_id"]
+            config_path = q_dir / "config.json"
+            if q_dir.exists() and any(q_dir.iterdir()) and not config_path.is_file():
+                raise ValueError(f"Cannot verify saved reward in {q_dir}; use a new output directory.")
+            records.append(config_path)
+    for path in records:
+        if path.is_file():
+            saved = json.loads(path.read_text())
+            if _context_reward(saved) != expected:
+                raise ValueError(f"Reward settings differ from saved run at {path}; use a new output directory.")
 
 
 def _compact(value):
