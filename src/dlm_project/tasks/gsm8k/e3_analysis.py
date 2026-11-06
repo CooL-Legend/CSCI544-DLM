@@ -4,7 +4,7 @@ Pure offline evaluation reading E1 search traces and checkpoints with ZERO model
 Generates:
   - e3_per_question.csv
   - e3_aggregate.csv
-  - 6 publication figures (PNG and PDF)
+  - 7 publication figures (PNG and PDF)
 """
 
 from collections import Counter, defaultdict
@@ -19,6 +19,7 @@ import numpy as np
 
 from dlm_project.decoding import search_audit
 from dlm_project.experiments.sweep_report import wilson_interval, write_csv
+from dlm_project.tasks.gsm8k.e1_variants import METHODS, is_adaptive, variant
 
 
 def load_question_checkpoints(q_dir: Path, budgets: Sequence[int] = (256, 512, 1024)):
@@ -88,7 +89,7 @@ def compute_e3_question_record(method: str, budget: int, q_data: Dict[str, Any],
     d_c = 0
     for d_str, count in distinct_by_depth.items():
         d_int = int(d_str)
-        if count >= 3 and d_int > d_c:
+        if count >= metrics.get("num_candidates", 3) and d_int > d_c:
             d_c = d_int
 
     # Candidate diversity
@@ -104,20 +105,26 @@ def compute_e3_question_record(method: str, budget: int, q_data: Dict[str, Any],
     # Adaptive policy (AB-MEDAL only)
     decision_counts = stats.get("decision_counts") or {}
     forced_counts = stats.get("forced_decision_counts") or {}
-    gen_count = decision_counts.get("GEN", 0) if method == "ab_medal" else None
-    cont_count = decision_counts.get("CONT", 0) if method == "ab_medal" else None
-    forced_gen = forced_counts.get("GEN", 0) if method == "ab_medal" else None
-    forced_cont = forced_counts.get("CONT", 0) if method == "ab_medal" else None
+    gen_count = decision_counts.get("GEN", 0) if is_adaptive(method) else None
+    cont_count = decision_counts.get("CONT", 0) if is_adaptive(method) else None
+    forced_gen = forced_counts.get("GEN", 0) if is_adaptive(method) else None
+    forced_cont = forced_counts.get("CONT", 0) if is_adaptive(method) else None
 
     return {
         "example_id": example_id,
         "method": method,
+        **{k: variant(method)[k] for k in ("base_method", "reward_mode")},
         "search_budget": budget,
         "exact_match": metrics.get("exact_match", False),
         "parse_success": metrics.get("parse_success", False),
         "total_nfes": metrics.get("total_nfes", budget + 256 - d_selected),
         "search_nfes": metrics.get("search_nfes", budget),
         "completion_nfes": metrics.get("completion_nfes", 256 - d_selected),
+        "tree_nfes": sum(depth_counts.values()),
+        "evaluated_children": len(children),
+        **{key: stats.get(key, 0) for key in (
+            "temporary_candidate_nfes", "adalook_extra_nfes", "adalook_total_extra_nfes",
+            "adalook_group_count", "adalook_trigger_rate", "adalook_mean_depth")},
         "max_depth": max_depth,
         "selected_depth": d_selected,
         "depth_efficiency_gap": depth_gap,
@@ -147,7 +154,7 @@ def compute_e3_question_record(method: str, budget: int, q_data: Dict[str, Any],
 
 
 def analyze_e3_stage(results_dir: Path, output_dir: Path, stage: str = "dev",
-                     methods: Sequence[str] = ("medal", "ab_medal"),
+                     methods: Sequence[str] = METHODS,
                      budgets: Sequence[int] = (256, 512, 1024)):
     """Analyze all saved traces for a stage, output E3 CSVs and 6 figures."""
     results_dir = Path(results_dir)
@@ -190,6 +197,7 @@ def analyze_e3_stage(results_dir: Path, output_dir: Path, stage: str = "dev",
             agg_rows.append({
                 "stage": stage,
                 "method": method,
+                **{k: variant(method)[k] for k in ("base_method", "reward_mode")},
                 "search_budget": b,
                 "sample_count": n,
                 "accuracy": acc,
@@ -207,29 +215,36 @@ def analyze_e3_stage(results_dir: Path, output_dir: Path, stage: str = "dev",
                 "mean_negative_ig_pct": sum(r["negative_ig_percentage"] for r in subset) / n,
                 "mean_ig": sum(r["ig_mean"] for r in subset) / n,
                 "mean_selected_q": sum(r["selected_q"] for r in subset) / n,
+                **{f"mean_{key}": sum(r[key] for r in subset) / n for key in (
+                    "tree_nfes", "evaluated_children", "temporary_candidate_nfes",
+                    "adalook_extra_nfes", "adalook_total_extra_nfes", "adalook_trigger_rate",
+                    "adalook_mean_depth")},
                 "mean_largest_subtree_share": sum(r["largest_root_subtree_share"] for r in subset) / n,
                 "mean_jaccard_diversity": sum(r["mean_jaccard_distance"] for r in subset if r["mean_jaccard_distance"] is not None) / max(1, sum(1 for r in subset if r["mean_jaccard_distance"] is not None)),
                 "gen_proportion": (sum(r["gen_count"] for r in subset if r["gen_count"] is not None) /
-                                  max(1, sum((r["gen_count"] or 0) + (r["cont_count"] or 0) for r in subset))) if method == "ab_medal" else None,
+                                  max(1, sum((r["gen_count"] or 0) + (r["cont_count"] or 0) for r in subset))) if is_adaptive(method) else None,
             })
 
     agg_path = output_dir / f"e3_{stage}_aggregate.csv"
     write_csv(agg_path, agg_rows)
     write_csv(output_dir / "e3_aggregate.csv", agg_rows)
 
-    # 3. Generate 6 Publication Plots
+    # 3. Generate publication plots
     if e3_per_question_rows:
-        generate_e3_figures(e3_per_question_rows, agg_rows, figures_dir, budgets=budgets)
+        generate_e3_figures(e3_per_question_rows, agg_rows, figures_dir, budgets=budgets, methods=methods)
 
     print(f"E3 offline analysis complete: saved {per_q_path}, {agg_path}, and figures to {figures_dir}")
     return e3_per_question_rows, agg_rows
 
 
 def generate_e3_figures(rows: List[Dict[str, Any]], agg_rows: List[Dict[str, Any]],
-                        figures_dir: Path, budgets: Sequence[int] = (256, 512, 1024)):
-    """Generate the 6 publication-quality figures."""
+                        figures_dir: Path, budgets: Sequence[int] = (256, 512, 1024),
+                        methods: Sequence[str] = METHODS):
+    """Generate four-variant tree figures and the explicit compute breakdown."""
     figures_dir.mkdir(parents=True, exist_ok=True)
-    palette = {"medal": "#2b5c8f", "ab_medal": "#d95f02"}
+    palette = {"medal": "#2b5c8f", "ab_medal": "#d95f02",
+               "medal_adalook": "#368650", "ab_medal_adalook": "#9656a8"}
+    labels = {method: variant(method)["label"] for method in methods}
 
     # Figure 1: NFE allocation by depth
     fig, axes = plt.subplots(1, len(budgets), figsize=(5 * len(budgets), 4), sharey=True)
@@ -237,7 +252,7 @@ def generate_e3_figures(rows: List[Dict[str, Any]], agg_rows: List[Dict[str, Any
         axes = [axes]
     for idx, b in enumerate(sorted(budgets)):
         ax = axes[idx]
-        for method in ("medal", "ab_medal"):
+        for method in methods:
             sub = [r for r in rows if r["method"] == method and r["search_budget"] == b]
             if not sub:
                 continue
@@ -249,27 +264,27 @@ def generate_e3_figures(rows: List[Dict[str, Any]], agg_rows: List[Dict[str, Any
                     depth_totals[int(d_str)] += c
             depths = sorted(depth_totals.keys())
             means = [depth_totals[d] / len(sub) for d in depths]
-            ax.plot(depths, means, marker="o", label=method.upper(), color=palette[method], lw=2)
+            ax.plot(depths, means, marker="o", label=labels[method], color=palette[method], lw=2)
         ax.set_title(f"Search Budget B = {b}", fontsize=11, fontweight="bold")
         ax.set_xlabel("Depth", fontsize=10)
         if idx == 0:
-            ax.set_ylabel("Mean NFEs Allocated", fontsize=10)
+            ax.set_ylabel("Mean Real-Tree NFEs (excludes AdaLook)", fontsize=10)
         ax.grid(True, linestyle="--", alpha=0.5)
         ax.legend(frameon=True)
-    fig.suptitle("Fig 1: NFE Allocation by Search Depth", fontsize=13, fontweight="bold")
+    fig.suptitle("Fig 1: Real-Tree NFE Allocation by Search Depth", fontsize=13, fontweight="bold")
     plt.tight_layout()
     _save_fig(fig, figures_dir / "fig1_nfe_by_depth")
 
     # Figure 2: Branching factor distribution
     fig, ax = plt.subplots(figsize=(7, 4.5))
     x_indices = np.arange(len(budgets))
-    width = 0.35
-    for m_idx, method in enumerate(("medal", "ab_medal")):
+    width = 0.8 / len(methods)
+    for m_idx, method in enumerate(methods):
         means = []
         for b in sorted(budgets):
             sub = [r["branching_factor_mean"] for r in rows if r["method"] == method and r["search_budget"] == b]
             means.append(np.mean(sub) if sub else 0.0)
-        ax.bar(x_indices + (m_idx - 0.5) * width, means, width, label=method.upper(), color=palette[method], alpha=0.9)
+        ax.bar(x_indices + (m_idx - (len(methods) - 1) / 2) * width, means, width, label=labels[method], color=palette[method], alpha=0.9)
     ax.set_xticks(x_indices)
     ax.set_xticklabels([f"B={b}" for b in sorted(budgets)], fontsize=10)
     ax.set_ylabel("Mean Children per Expanded Parent", fontsize=10)
@@ -281,7 +296,7 @@ def generate_e3_figures(rows: List[Dict[str, Any]], agg_rows: List[Dict[str, Any
 
     # Figure 3: Candidate density vs depth
     fig, ax = plt.subplots(figsize=(7, 4.5))
-    for method in ("medal", "ab_medal"):
+    for method in methods:
         sub = [r for r in rows if r["method"] == method and r["search_budget"] == max(budgets)]
         if not sub:
             continue
@@ -290,9 +305,9 @@ def generate_e3_figures(rows: List[Dict[str, Any]], agg_rows: List[Dict[str, Any
         feas_d = [r["feasible_candidate_depth_dc"] for r in sub]
         ax.plot(["Max Depth", "Feasible D_C", "Selected d*"],
                 [np.mean(max_d), np.mean(feas_d), np.mean(sel_d)],
-                marker="s", lw=2, label=f"{method.upper()} (B={max(budgets)})", color=palette[method])
+                marker="s", lw=2, label=f"{labels[method]} (B={max(budgets)})", color=palette[method])
     ax.set_ylabel("Tree Depth", fontsize=10)
-    ax.set_title("Fig 3: Candidate Depth Feasibility Gap (B=1024)", fontsize=12, fontweight="bold")
+    ax.set_title(f"Fig 3: Candidate Depth Feasibility Gap (B={max(budgets)})", fontsize=12, fontweight="bold")
     ax.legend(frameon=True)
     ax.grid(True, linestyle="--", alpha=0.5)
     plt.tight_layout()
@@ -300,13 +315,13 @@ def generate_e3_figures(rows: List[Dict[str, Any]], agg_rows: List[Dict[str, Any
 
     # Figure 4: Root-subtree NFE allocation
     fig, ax = plt.subplots(figsize=(7, 4.5))
-    for m_idx, method in enumerate(("medal", "ab_medal")):
+    for m_idx, method in enumerate(methods):
         shares = []
         for b in sorted(budgets):
             sub = [r["largest_root_subtree_share"] * 100 for r in rows if r["method"] == method and r["search_budget"] == b]
             shares.append(np.mean(sub) if sub else 0.0)
-        ax.plot([f"B={b}" for b in sorted(budgets)], shares, marker="o", lw=2, label=method.upper(), color=palette[method])
-    ax.set_ylabel("Largest Root-Subtree Share (%)", fontsize=10)
+        ax.plot([f"B={b}" for b in sorted(budgets)], shares, marker="o", lw=2, label=labels[method], color=palette[method])
+    ax.set_ylabel("Largest Root-Subtree Share of Tree NFEs (%)", fontsize=10)
     ax.set_title("Fig 4: Root Subtree Compute Concentration", fontsize=12, fontweight="bold")
     ax.legend(frameon=True)
     ax.grid(True, linestyle="--", alpha=0.5)
@@ -315,14 +330,14 @@ def generate_e3_figures(rows: List[Dict[str, Any]], agg_rows: List[Dict[str, Any
 
     # Figure 5: Reward and redundancy analysis
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 4.5))
-    for method in ("medal", "ab_medal"):
+    for method in methods:
         neg_ig = [np.mean([r["negative_ig_percentage"] for r in rows if r["method"] == method and r["search_budget"] == b]) for b in sorted(budgets)]
         dup_pct = [np.mean([r["duplicate_state_percentage"] for r in rows if r["method"] == method and r["search_budget"] == b]) for b in sorted(budgets)]
         b_labels = [f"B={b}" for b in sorted(budgets)]
-        ax1.plot(b_labels, neg_ig, marker="o", lw=2, label=method.upper(), color=palette[method])
-        ax2.plot(b_labels, dup_pct, marker="s", lw=2, label=method.upper(), color=palette[method])
+        ax1.plot(b_labels, neg_ig, marker="o", lw=2, label=labels[method], color=palette[method])
+        ax2.plot(b_labels, dup_pct, marker="s", lw=2, label=labels[method], color=palette[method])
     ax1.set_ylabel("Negative IG Rate (%)", fontsize=10)
-    ax1.set_title("Negative Reward Expansions", fontsize=11, fontweight="bold")
+    ax1.set_title("Negative Immediate IG (all reward modes)", fontsize=11, fontweight="bold")
     ax1.grid(True, linestyle="--", alpha=0.5)
     ax1.legend()
     ax2.set_ylabel("Duplicate State Rate (%)", fontsize=10)
@@ -335,7 +350,7 @@ def generate_e3_figures(rows: List[Dict[str, Any]], agg_rows: List[Dict[str, Any
 
     # Figure 6: Accuracy vs search budget
     fig, ax = plt.subplots(figsize=(7, 4.5))
-    for method in ("medal", "ab_medal"):
+    for method in methods:
         sub_agg = [r for r in agg_rows if r["method"] == method]
         sub_agg.sort(key=lambda r: r["search_budget"])
         if not sub_agg:
@@ -345,7 +360,7 @@ def generate_e3_figures(rows: List[Dict[str, Any]], agg_rows: List[Dict[str, Any
         yerr_low = [r["accuracy_percent"] - r["ci_95_low"] * 100 for r in sub_agg]
         yerr_high = [r["ci_95_high"] * 100 - r["accuracy_percent"] for r in sub_agg]
         ax.errorbar(budgets_x, accs, yerr=[yerr_low, yerr_high], marker="o", lw=2, capsize=4,
-                    label=method.upper(), color=palette[method])
+                    label=labels[method], color=palette[method])
     ax.set_xlabel("Search Forward Budget B", fontsize=10)
     ax.set_ylabel("GSM8K Accuracy (%) [Wilson 95% CI]", fontsize=10)
     ax.set_title("Fig 6: Exact-Match Accuracy vs MCTS Compute Budget", fontsize=12, fontweight="bold")
@@ -353,6 +368,31 @@ def generate_e3_figures(rows: List[Dict[str, Any]], agg_rows: List[Dict[str, Any
     ax.legend(frameon=True)
     plt.tight_layout()
     _save_fig(fig, figures_dir / "fig6_accuracy_vs_budget")
+
+
+    # Figure 7: all search costs, including temporary states absent from the tree.
+    fig, axes = plt.subplots(1, len(budgets), figsize=(6 * len(budgets), 4.5), squeeze=False)
+    for ax, b in zip(axes[0], sorted(budgets)):
+        bottom = np.zeros(len(methods))
+        for key, label, color in (
+            ("tree_nfes", "Real tree", "#2b5c8f"),
+            ("temporary_candidate_nfes", "Temporary comparisons", "#d95f02"),
+            ("adalook_extra_nfes", "AdaLook rollout", "#368650"),
+        ):
+            values = []
+            for method in methods:
+                sub = [r[key] for r in rows if r["method"] == method and r["search_budget"] == b]
+                values.append(np.mean(sub) if sub else 0.0)
+            ax.bar(np.arange(len(methods)), values, bottom=bottom, label=label, color=color)
+            bottom += np.asarray(values)
+        ax.set_xticks(np.arange(len(methods)))
+        ax.set_xticklabels([labels[m] for m in methods], rotation=25, ha="right", fontsize=9)
+        ax.set_title(f"B={b}")
+        ax.set_ylabel("Mean Search NFEs")
+        ax.legend(fontsize=8)
+    fig.suptitle("Fig 7: Search Compute Breakdown")
+    fig.tight_layout()
+    _save_fig(fig, figures_dir / "fig7_compute_breakdown")
 
 
 def _save_fig(fig, base_path: Path):

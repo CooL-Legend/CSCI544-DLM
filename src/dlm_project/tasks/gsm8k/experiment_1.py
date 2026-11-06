@@ -1,7 +1,8 @@
 """Unified runner for Experiment 1 (E1: Accuracy and Inference Efficiency).
 
-Runs MEDAL and AB-MEDAL with verified prefix checkpointing at B in {256, 512, 1024},
-shared minimum-C candidate selection (v2), completion caching, and comprehensive logging.
+Runs MEDAL and AB-MEDAL with IG or AdaLook rewards under a shared checkpoint
+schedule, minimum-C selection, and completion caching. AdaLook equivalence
+requires the same earlier checkpoint boundaries.
 """
 
 import argparse
@@ -29,11 +30,12 @@ from dlm_project.experiments.paths import create_run_directory
 from dlm_project.experiments.sweep_report import wilson_interval, write_csv
 from dlm_project.tasks.gsm8k.e0_tokens import resolve_termination_tokens, decode_output
 from dlm_project.tasks.gsm8k.evaluation import score_answer
+from dlm_project.tasks.gsm8k.e1_variants import ADALOOK_DEFAULTS, METHODS, is_adaptive, variant
 from dlm_project.tasks.gsm8k.experiment_protocol import (
     load_shared_protocol, get_manifest, select_examples, build_prompt, example_seed
 )
 
-PROTOCOL_VERSION = "e1_unified_fixed_depth_v1"
+PROTOCOL_VERSION = "e1_four_variant_fixed_depth_v2"
 
 
 def _load_default_budgets() -> Tuple[int, ...]:
@@ -53,8 +55,9 @@ def state_hash(state_tensor):
     return hashlib.sha256(repr(medal._state_key(state_tensor)).encode()).hexdigest()
 
 
-def context(*, stage="dev", methods=("medal", "ab_medal"), budgets=None,
-            max_depth=MAX_SEARCH_DEPTH, num_candidates=MIN_CANDIDATES, num_samples=None):
+def context(*, stage="dev", methods=METHODS, budgets=None,
+            max_depth=MAX_SEARCH_DEPTH, num_candidates=MIN_CANDIDATES, num_samples=None,
+            adalook_options=None):
     """Create and validate execution context for E1."""
     common = load_shared_protocol()
     if budgets is None:
@@ -67,13 +70,22 @@ def context(*, stage="dev", methods=("medal", "ab_medal"), budgets=None,
         raise ValueError(f"No examples found for stage {stage}.")
 
     for m in methods:
-        if m not in ("medal", "ab_medal"):
-            raise ValueError(f"Unknown method {m}. Must be 'medal' or 'ab_medal'.")
+        variant(m)
+    options = dict(ADALOOK_DEFAULTS)
+    if adalook_options:
+        unknown = set(adalook_options) - set(options)
+        if unknown:
+            raise ValueError(f"Unknown AdaLook options: {sorted(unknown)}")
+        options.update(adalook_options)
+    MCTSConfig(reward_mode="adalook_adaptive", stop_mode="budget",
+               max_model_calls=max(budgets), **options)
 
     return {
         "protocol_version": PROTOCOL_VERSION,
         "stage": stage,
         "methods": list(methods),
+        "variants": {m: variant(m) for m in methods},
+        "adalook_options": options,
         "budgets": list(budgets),
         "max_depth": max_depth,
         "num_candidates": num_candidates,
@@ -114,27 +126,62 @@ def _jsonl(path: Path, rows: Sequence[Dict[str, Any]]):
             f.write(json.dumps(row, allow_nan=False) + "\n")
 
 
-def execute_search_checkpointed(wrapper, prepared_item, ctx, method: str,
-                                 budgets: Tuple[int, ...] = CHECKPOINT_BUDGETS,
-                                 max_depth: int = MAX_SEARCH_DEPTH,
-                                 num_candidates: int = MIN_CANDIDATES):
-    """Execute continuous search up to max(budgets) capturing checkpoints."""
-    max_budget = max(budgets)
+def search_config(ctx, method, budgets, max_depth, num_candidates):
+    """Change only reward evaluation within each existing outer search policy."""
+    spec = variant(method)
     cfg_kwargs = dict(
         init_tokens=max_depth,
         num_candidates=num_candidates,
         top_k_tokens=ctx["common"]["decoding"]["mcts"]["top_k_tokens"],
         top_k_actions=ctx["common"]["decoding"]["mcts"]["top_k_actions"],
         stop_mode="budget",
-        max_model_calls=max_budget,
+        max_model_calls=max(budgets),
+        reward_mode=spec["reward_mode"],
     )
+    if spec["reward_mode"] != "ig":
+        cfg_kwargs.update(ctx["adalook_options"])
+    config_cls = ABMEDALConfig if is_adaptive(method) else MCTSConfig
+    return config_cls(**cfg_kwargs)
 
-    if method == "ab_medal":
-        search_cfg = ABMEDALConfig(**cfg_kwargs)
-        search_cls = ABMEDALSearch
-    else:
-        search_cfg = MCTSConfig(**cfg_kwargs)
-        search_cls = MCTSSearch
+
+def question_config(wrapper, prepared_item, ctx, method, budgets, max_depth, num_candidates):
+    """Persist the effective settings, including boundaries that influence AdaLook."""
+    settings = {
+        "protocol_version": PROTOCOL_VERSION,
+        "method": method,
+        **variant(method),
+        "search": asdict(search_config(ctx, method, budgets, max_depth, num_candidates)),
+        "checkpoint_budgets": sorted(budgets),
+        "common": ctx["common"],
+        "manifest_hash": ctx["manifest_hash"],
+        "model": wrapper.identity,
+        "mask_id": wrapper.mask_id,
+        "termination": ctx["termination"],
+        "example_id": prepared_item["example"]["example_id"],
+        "prompt_ids_hash": prepared_item["prompt_ids_hash"],
+        "seed": prepared_item["seed"],
+    }
+    return {**settings, "config_hash": digest(settings)}
+
+
+def validate_saved_config(q_dir, expected):
+    """Refuse to mix old or differently configured results in the same directory."""
+    path = q_dir / "config.json"
+    if path.exists():
+        saved = json.loads(path.read_text())
+        if saved.get("config_hash") != expected["config_hash"]:
+            raise ValueError(f"E1 configuration mismatch at {q_dir}. Use a new output directory.")
+    elif q_dir.exists() and any(q_dir.iterdir()):
+        raise ValueError(f"E1 artifacts lack a configuration at {q_dir}. Use a new output directory.")
+
+
+def execute_search_checkpointed(wrapper, prepared_item, ctx, method: str,
+                                 budgets: Tuple[int, ...] = CHECKPOINT_BUDGETS,
+                                 max_depth: int = MAX_SEARCH_DEPTH,
+                                 num_candidates: int = MIN_CANDIDATES):
+    """Execute continuous search up to max(budgets) capturing checkpoints."""
+    search_cfg = search_config(ctx, method, budgets, max_depth, num_candidates)
+    search_cls = ABMEDALSearch if is_adaptive(method) else MCTSSearch
 
     search = search_cls(
         wrapper.model,
@@ -212,7 +259,10 @@ def run_question_e1(wrapper, prepared_item, ctx, method: str,
                     completion_cache=None):
     """Run one question under a method and export all checkpoint and overall artifacts."""
     q_dir = base_dir / method / prepared_item["example"]["example_id"]
+    effective_config = question_config(wrapper, prepared_item, ctx, method, budgets, max_depth, num_candidates)
+    validate_saved_config(q_dir, effective_config)
     q_dir.mkdir(parents=True, exist_ok=True)
+    save_json(q_dir / "config.json", effective_config)
 
     search, search_time = execute_search_checkpointed(
         wrapper, prepared_item, ctx, method, budgets=budgets,
@@ -237,7 +287,7 @@ def run_question_e1(wrapper, prepared_item, ctx, method: str,
         requested_depth=max_depth,
         requested_budget=max(budgets),
         search_nfes=search.model_calls,
-        adaptive=(method == "ab_medal"),
+        adaptive=is_adaptive(method),
         shortlist_limit=num_candidates,
     )
     save_json(q_dir / "search_audit.json", audit)
@@ -246,7 +296,6 @@ def run_question_e1(wrapper, prepared_item, ctx, method: str,
     prompt_record = {k: v for k, v in prepared_item.items() if k != "ids"}
     prompt_record.update(mask_id=wrapper.mask_id, gen_length=ctx["common"]["generation"]["gen_length"])
     save_json(q_dir / "prompt.json", prompt_record)
-    save_json(q_dir / "config.json", ctx)
 
     # 2. Checkpoint results
     checkpoint_results = []
@@ -263,8 +312,9 @@ def run_question_e1(wrapper, prepared_item, ctx, method: str,
             wrapper, selected_node.state, prepared_item, ctx, completion_cache=completion_cache
         )
 
-        comp_nfes = 256 - selected_node.depth
-        total_nfes = budget + comp_nfes
+        comp_nfes = ctx["common"]["generation"]["gen_length"] - selected_node.depth
+        actual_search_nfes = chk["model_calls"]
+        total_nfes = actual_search_nfes + comp_nfes
 
         # Build checkpoint search_audit
         chk_trace = chk["trace"] + [chk["selection"]]
@@ -275,11 +325,15 @@ def run_question_e1(wrapper, prepared_item, ctx, method: str,
             gen_length=ctx["common"]["generation"]["gen_length"],
             requested_depth=max_depth,
             requested_budget=budget,
-            search_nfes=budget,
-            adaptive=(method == "ab_medal"),
+            search_nfes=actual_search_nfes,
+            adaptive=is_adaptive(method),
             shortlist_limit=num_candidates,
         )
         chk_metrics = search_audit.metrics(chk_audit)
+        tree_nfes = sum(chk_metrics["nfes_per_depth"].values())
+        extra_nfes = chk_metrics["adalook_total_extra_nfes"]
+        if tree_nfes + extra_nfes != actual_search_nfes or actual_search_nfes > budget:
+            raise RuntimeError("Checkpoint NFE accounting does not match finalized tree and AdaLook evaluations.")
 
         # Save checkpoint artifacts
         selection_record = {
@@ -307,6 +361,8 @@ def run_question_e1(wrapper, prepared_item, ctx, method: str,
                 "reward_sum": n.reward_sum,
                 "mean_reward": n.mean_reward,
                 "immediate_reward": n.immediate_reward,
+                "immediate_gain": n.ig_reward,
+                "reward_mode": search.config.reward_mode,
                 "candidate": n.node_id in chk["selection"]["candidate_ids"],
                 "state_hash": candidate_value_record(n)["state_hash"],
                 "state": n.state.tolist()[0],
@@ -332,6 +388,10 @@ def run_question_e1(wrapper, prepared_item, ctx, method: str,
 
         checkpoint_row = {
             "method": method,
+            "base_method": variant(method)["base_method"],
+            "reward_mode": search.config.reward_mode,
+            "config_hash": effective_config["config_hash"],
+            "num_candidates": num_candidates,
             "search_budget": budget,
             "example_id": prepared_item["example"]["example_id"],
             "row_id": prepared_item["example"]["row_id"],
@@ -342,7 +402,16 @@ def run_question_e1(wrapper, prepared_item, ctx, method: str,
             "reference_answer": score["reference_answer"],
             "exact_match": bool(score["exact_match"]),
             "parse_success": bool(score["parse_success"]),
-            "search_nfes": budget,
+            "search_nfes": actual_search_nfes,
+            "tree_nfes": tree_nfes,
+            "evaluated_children": chk_metrics["evaluated_children"],
+            "temporary_candidate_nfes": chk_metrics["temporary_candidate_nfes"],
+            "adalook_extra_nfes": chk_metrics["adalook_extra_nfes"],
+            "adalook_total_extra_nfes": extra_nfes,
+            "adalook_group_count": chk_metrics["adalook_group_count"],
+            "adalook_trigger_rate": chk_metrics["adalook_trigger_rate"],
+            "adalook_mean_depth": chk_metrics["adalook_mean_depth"],
+            "adalook_stop_reasons": chk_metrics["adalook_stop_reasons"],
             "completion_nfes": comp_nfes,
             "total_nfes": total_nfes,
             "search_wall_seconds": search_time * (budget / max(budgets)),
@@ -385,6 +454,11 @@ def is_question_complete(stage_dir: Path, method: str, ex_id: str, budgets: Sequ
     if not (q_dir / "trace.jsonl").is_file():
         return False
     for b in budgets:
+        required = ["metrics.json", "tree.json", "selection.json", "completion.json"]
+        if is_adaptive(method):
+            required.append("posteriors.json")
+        if not all((q_dir / "checkpoints" / str(b) / name).is_file() for name in required):
+            return False
         met_file = q_dir / "checkpoints" / str(b) / "metrics.json"
         if not met_file.is_file():
             return False
@@ -425,6 +499,7 @@ def compute_e1_aggregate_rows(all_checkpoint_rows: List[Dict[str, Any]], stage: 
             agg_rows.append({
                 "stage": stage,
                 "method": method,
+                **{k: variant(method)[k] for k in ("base_method", "reward_mode")},
                 "search_budget": budget,
                 "sample_count": n,
                 "accuracy": correct_cnt / n,
@@ -435,6 +510,10 @@ def compute_e1_aggregate_rows(all_checkpoint_rows: List[Dict[str, Any]], stage: 
                 "mean_search_nfe": sum(r["search_nfes"] for r in subset) / n,
                 "mean_completion_nfe": sum(r["completion_nfes"] for r in subset) / n,
                 "mean_total_nfe": sum(r["total_nfes"] for r in subset) / n,
+                **{f"mean_{key}": sum(r.get(key, 0) for r in subset) / n for key in (
+                    "tree_nfes", "evaluated_children", "temporary_candidate_nfes",
+                    "adalook_extra_nfes", "adalook_total_extra_nfes", "adalook_trigger_rate",
+                    "adalook_mean_depth")},
                 "mean_search_wall_seconds": sum(r["search_wall_seconds"] for r in subset) / n,
                 "mean_completion_wall_seconds": sum(r["completion_wall_seconds"] for r in subset) / n,
                 "mean_total_wall_seconds": sum(r["total_wall_seconds"] for r in subset) / n,
@@ -474,7 +553,7 @@ def save_e1_progress(output_dir: Path, summaries_dir: Path, stage: str,
     return agg_rows
 
 
-def run_e1_stage(wrapper, ctx, output_dir: Path, methods=("medal", "ab_medal"),
+def run_e1_stage(wrapper, ctx, output_dir: Path, methods=METHODS,
                  budgets=CHECKPOINT_BUDGETS, max_depth=MAX_SEARCH_DEPTH,
                  num_candidates=MIN_CANDIDATES, resume: bool = True):
     """Execute complete E1 stage for all methods with incremental saving and resumption."""
@@ -484,6 +563,11 @@ def run_e1_stage(wrapper, ctx, output_dir: Path, methods=("medal", "ab_medal"),
     summaries_dir.mkdir(parents=True, exist_ok=True)
 
     prepared = prepare(wrapper, ctx)
+    # Validate all existing results before replacing manifests or summaries.
+    for item in prepared:
+        for method in methods:
+            expected = question_config(wrapper, item, ctx, method, budgets, max_depth, num_candidates)
+            validate_saved_config(stage_dir / method / item["example"]["example_id"], expected)
     all_checkpoint_rows = []
     completion_cache = {}
 
@@ -491,6 +575,10 @@ def run_e1_stage(wrapper, ctx, output_dir: Path, methods=("medal", "ab_medal"),
         "protocol_version": PROTOCOL_VERSION,
         "stage": ctx["stage"],
         "methods": list(methods),
+        "variants": {m: variant(m) for m in methods},
+        "adalook_options": ctx["adalook_options"],
+        "checkpoint_protocol": "continuous_with_shared_boundaries",
+        "timing_note": "Search time apportioned by budget; cached completion time is zero.",
         "budgets": list(budgets),
         "max_depth": max_depth,
         "num_candidates": num_candidates,
@@ -565,7 +653,7 @@ def candidate_value_record(node):
         "reward_sum": node.reward_sum,
         "q_value": node.mean_reward,
         "reward": node.mean_reward,
-        "immediate_gain": node.immediate_reward,
+        "immediate_gain": node.ig_reward,
         "state_hash": hashlib.sha256(repr(medal._state_key(node.state)).encode()).hexdigest(),
     }
 
