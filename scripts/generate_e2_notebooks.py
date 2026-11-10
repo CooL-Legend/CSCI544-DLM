@@ -50,7 +50,7 @@ def create_e2_dev_notebook():
     ))
 
     # Section 2: Repository Setup
-    cells.append(nbf.v4.new_markdown_cell("## 2. Repository Setup\nClone or update the GitHub repository on branch `adi`."))
+    cells.append(nbf.v4.new_markdown_cell("## 2. Repository Setup\nClone or update the GitHub repository on branch `adi-e2`."))
     cells.append(nbf.v4.new_code_cell(
         "from pathlib import Path\n"
         "import getpass\n"
@@ -316,7 +316,7 @@ def create_e2_eval_notebook():
     ))
 
     # Section 2: Repo Setup
-    cells.append(nbf.v4.new_markdown_cell("## 2. Repository Setup\nClone or update the GitHub repository on branch `adi`."))
+    cells.append(nbf.v4.new_markdown_cell("## 2. Repository Setup\nClone or update the GitHub repository on branch `adi-e2`."))
     cells.append(nbf.v4.new_code_cell(
         "from pathlib import Path\n"
         "import os\n"
