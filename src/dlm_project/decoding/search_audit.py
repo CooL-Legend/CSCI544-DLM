@@ -160,7 +160,7 @@ def from_events(events, *, prompt_ids=None, mask_id, gen_length, requested_depth
                  availability={"explicit_state_hashes": modern, "explicit_evaluation_order": modern,
                                "final_selection": final is not None, "adaptive_decisions": adaptive})
     reconstruct(audit, prompt_ids)
-    if final is not None and len(nodes) != search_nfes:
+    if final is not None and not allow_legacy and len(nodes) != search_nfes:
         raise ValueError("Successful search NFEs differ from evaluated root plus children.")
     return audit
 
