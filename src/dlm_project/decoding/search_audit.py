@@ -158,15 +158,18 @@ def from_events(events, *, prompt_ids=None, mask_id, gen_length, requested_depth
                  decisions=[copy.deepcopy(e) for e in events if e.get("stage") == "adaptive_decision"] if adaptive else None,
                  forwards=[copy.deepcopy(e) for e in events if e.get("stage") == "forward" and e.get("phase") in ("tree_analysis", "simulation", "candidate_evaluation")],
                  availability={"explicit_state_hashes": modern, "explicit_evaluation_order": modern,
-                               "final_selection": final is not None, "adaptive_decisions": adaptive})
+                               "final_selection": final is not None, "adaptive_decisions": adaptive},
+                 allow_legacy=allow_legacy)
     reconstruct(audit, prompt_ids)
     if final is not None and not allow_legacy and len(nodes) != search_nfes:
         raise ValueError("Successful search NFEs differ from evaluated root plus children.")
     return audit
 
 
-def metrics(audit):
+def metrics(audit, allow_legacy=None):
     """Calculate common allocation/structure/reward metrics from compact records."""
+    if allow_legacy is None:
+        allow_legacy = audit.get("allow_legacy", False)
     reconstruct(audit)
     nodes, selection = audit["nodes"], audit["selection"]
     by_id = {row["node_id"]: row for row in nodes}
@@ -247,7 +250,7 @@ def metrics(audit):
                                 shared_prefix_length=min((p["shared_prefix_length"] for p in pairs), default=None)),
         state_hashes_available=hashes_available,
     )
-    if selection and (sum(depths.values()) != nfe or depths.get(0, 0) + sum(subtrees.values()) != nfe):
+    if not allow_legacy and selection and (sum(depths.values()) != nfe or depths.get(0, 0) + sum(subtrees.values()) != nfe):
         raise ValueError("Depth/subtree NFE allocation does not reconcile.")
     return result
 

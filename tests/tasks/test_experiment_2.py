@@ -167,3 +167,63 @@ def test_e2_stage_execution_and_artifacts(tmp_path):
                 assert (chk_dir / "selection.json").exists()
                 assert (chk_dir / "completion.json").exists()
                 assert (chk_dir / "metrics.json").exists()
+
+
+def test_e2_e3_offline_analysis_compatibility(tmp_path):
+    """Verify that E3 offline analysis engine extracts all structural metrics and figures from E2 artifacts."""
+    from dlm_project.tasks.gsm8k import e3_analysis, e3_tree_plots
+
+    w = mock_wrapper()
+    ctx = e2.context(stage="dev", methods=("medal", "ab_medal"), num_samples=2)
+    budgets = (4, 8)
+
+    e2.run_e2_stage(
+        w,
+        ctx,
+        tmp_path,
+        methods=("medal", "ab_medal"),
+        budgets=budgets,
+        max_depth=4,
+        num_candidates=2,
+        batch_size=2,
+    )
+
+    stage_dir = tmp_path / "dev"
+    e3_out = tmp_path / "e3_summaries"
+    per_q, agg = e3_analysis.analyze_e3_stage(
+        stage_dir,
+        e3_out,
+        stage="dev",
+        methods=("medal", "ab_medal"),
+        budgets=budgets,
+    )
+
+    # 2 questions x 2 methods x 2 budgets = 8 records
+    assert len(per_q) == 8
+    assert len(agg) == 4
+    assert (e3_out / "e3_dev_per_question.csv").exists()
+    assert (e3_out / "e3_dev_aggregate.csv").exists()
+    assert (e3_out / "e3_figures" / "fig1_nfe_by_depth.png").exists()
+
+    # Check that structural metrics are populated and non-null
+    for row in per_q:
+        assert "branching_factor_mean" in row
+        assert "expanded_parents" in row
+        assert "unique_evaluated_states" in row
+        assert "negative_ig_percentage" in row
+        assert "ig_mean" in row
+        assert row["search_nfes"] in budgets
+        if row["method"] == "ab_medal":
+            assert row["gen_count"] is not None
+            assert row["cont_count"] is not None
+
+    # Verify tree visualizer validity
+    for method in ("medal", "ab_medal"):
+        for ex in ctx["examples"]:
+            q_dir = stage_dir / method / ex["example_id"]
+            chks = e3_analysis.load_question_checkpoints(q_dir, budgets=budgets)
+            for b, data in chks.items():
+                tree = e3_tree_plots._validated_tree(data, method=method, example_id=ex["example_id"], budget=b)
+                assert tree.root_id == 0
+                assert len(tree.nodes) >= 1
+

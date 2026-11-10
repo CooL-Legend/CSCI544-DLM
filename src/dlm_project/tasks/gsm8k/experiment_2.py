@@ -417,14 +417,24 @@ def export_question_e2_artifacts(
         comp_nfes = completion.model_calls
         total_nfes = budget + comp_nfes
 
-        selection_record = chk["selection"]
-        chk_metrics = {
-            "search_budget": budget,
-            "search_nfes": budget,
-            "completion_nfes": comp_nfes,
-            "total_nfes": total_nfes,
-            "selected_node_id": chk["selected_node_id"],
-            "selected_depth": chk["selected_depth"],
+        # Build checkpoint search_audit and metrics
+        chk_trace = chk["trace"] + [chk["selection"]]
+        chk_audit = search_audit.from_events(
+            chk_trace,
+            prompt_ids=prepared_item["prompt_ids"],
+            mask_id=wrapper.mask_id,
+            gen_length=ctx["common"]["generation"]["gen_length"],
+            requested_depth=max_depth,
+            requested_budget=budget,
+            search_nfes=budget,
+            adaptive=(method == "ab_medal"),
+            shortlist_limit=num_candidates,
+            allow_legacy=True,
+        )
+        chk_metrics = search_audit.metrics(chk_audit, allow_legacy=True)
+
+        selection_record = {
+            **chk["selection"],
             "selected_q": chk["selected_q"],
             "max_depth_reached": chk["max_depth_reached"],
             "selection_depth_gap": chk["selection_depth_gap"],

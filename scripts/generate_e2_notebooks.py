@@ -218,8 +218,41 @@ def create_e2_dev_notebook():
         "    print(f'  Exact Match: {met[\"exact_match\"]} | Pred: {met[\"predicted_answer\"]} | Ref: {met[\"reference_answer\"]}')\n"
     ))
 
-    # Section 11: Drive Sync
-    cells.append(nbf.v4.new_markdown_cell("## 11. Synchronize All Artifacts to Google Drive\nExplicitly flush and sync all in-flight buffers to Google Drive."))
+    # Section 11: E3 Offline Metric Extraction & Publication Figures
+    cells.append(nbf.v4.new_markdown_cell(
+        "## 11. E3 Offline Metric Extraction & Publication Figures\n"
+        "Run offline tree allocation, branching dynamics, and structural analysis on saved E2 checkpoints (zero GPU compute), and generate 6 publication figures."
+    ))
+    cells.append(nbf.v4.new_code_cell(
+        "from dlm_project.tasks.gsm8k.e3_analysis import analyze_e3_stage\n"
+        "from IPython.display import Image, display, Markdown\n\n"
+        "print('Running E3 Offline Tree Allocation & Topology Analysis on E2 traces...')\n"
+        "e3_q, e3_agg = analyze_e3_stage(\n"
+        "    results_dir=OUTPUT_DIR / STAGE,\n"
+        "    output_dir=OUTPUT_DIR / 'summaries',\n"
+        "    stage=STAGE,\n"
+        "    methods=tuple(METHODS),\n"
+        "    budgets=tuple(BUDGETS),\n"
+        ")\n"
+        "print(f'✓ E3 Analysis Completed successfully: {len(e3_q)} question outcomes evaluated.')\n\n"
+        "figures_dir = OUTPUT_DIR / 'summaries' / 'e3_figures'\n"
+        "fig_titles = {\n"
+        "    'fig1_nfe_by_depth': 'Figure 1: NFE Allocation by Tree Depth — MEDAL vs AB-MEDAL across budgets',\n"
+        "    'fig2_branching_factors': 'Figure 2: Branching Factor Distribution — Children per expanded parent',\n"
+        "    'fig3_candidate_density': 'Figure 3: Candidate Density vs Depth — Minimum-C availability and selection depth',\n"
+        "    'fig4_root_subtrees': 'Figure 4: Root-Subtree Compute Concentration — Search effort across root branches',\n"
+        "    'fig5_reward_redundancy': 'Figure 5: Reward and Search Redundancy — Negative IG rates and duplicate states',\n"
+        "    'fig6_accuracy_vs_budget': 'Figure 6: Accuracy vs Search Budget — Performance scaling curve',\n"
+        "}\n\n"
+        "for fig_key, title in fig_titles.items():\n"
+        "    png_path = figures_dir / f'{fig_key}.png'\n"
+        "    if png_path.is_file():\n"
+        "        display(Markdown(f'### {title}'))\n"
+        "        display(Image(filename=str(png_path), width=750))\n"
+    ))
+
+    # Section 12: Drive Sync
+    cells.append(nbf.v4.new_markdown_cell("## 12. Synchronize All Artifacts to Google Drive\nExplicitly flush and sync all in-flight buffers to Google Drive."))
     cells.append(nbf.v4.new_code_cell(
         "if IN_COLAB:\n"
         "    from google.colab import drive\n"
@@ -436,8 +469,41 @@ def create_e2_eval_notebook():
         "    display(pd.DataFrame(paired_combined)[['search_budget', 'paired_questions', 'medal_accuracy', 'ab_medal_accuracy', 'accuracy_delta_percent', 'ab_medal_only_correct', 'medal_only_correct', 'mcnemar_exact_p']])\n"
     ))
 
-    # Section 10: Drive Flush
-    cells.append(nbf.v4.new_markdown_cell("## 10. Synchronize All Artifacts to Google Drive\nFlush and sync all in-flight buffers to Google Drive."))
+    # Section 10: E3 Offline Metric Extraction & Publication Figures
+    cells.append(nbf.v4.new_markdown_cell(
+        "## 10. E3 Offline Metric Extraction & Publication Figures\n"
+        "Run offline tree allocation, branching dynamics, and structural analysis on all saved evaluation checkpoints, and generate 6 publication figures."
+    ))
+    cells.append(nbf.v4.new_code_cell(
+        "from dlm_project.tasks.gsm8k.e3_analysis import analyze_e3_stage\n"
+        "from IPython.display import Image, display, Markdown\n\n"
+        "print('Running E3 Offline Tree Allocation & Topology Analysis on E2 Evaluation traces...')\n"
+        "e3_q, e3_agg = analyze_e3_stage(\n"
+        "    results_dir=OUTPUT_DIR / STAGE,\n"
+        "    output_dir=OUTPUT_DIR / 'summaries',\n"
+        "    stage=STAGE,\n"
+        "    methods=tuple(METHODS),\n"
+        "    budgets=tuple(BUDGETS),\n"
+        ")\n"
+        "print(f'✓ E3 Analysis Completed successfully: {len(e3_q)} question outcomes evaluated.')\n\n"
+        "figures_dir = OUTPUT_DIR / 'summaries' / 'e3_figures'\n"
+        "fig_titles = {\n"
+        "    'fig1_nfe_by_depth': 'Figure 1: NFE Allocation by Tree Depth — MEDAL vs AB-MEDAL across budgets',\n"
+        "    'fig2_branching_factors': 'Figure 2: Branching Factor Distribution — Children per expanded parent',\n"
+        "    'fig3_candidate_density': 'Figure 3: Candidate Density vs Depth — Minimum-C availability and selection depth',\n"
+        "    'fig4_root_subtrees': 'Figure 4: Root-Subtree Compute Concentration — Search effort across root branches',\n"
+        "    'fig5_reward_redundancy': 'Figure 5: Reward and Search Redundancy — Negative IG rates and duplicate states',\n"
+        "    'fig6_accuracy_vs_budget': 'Figure 6: Accuracy vs Search Budget — Performance scaling curve',\n"
+        "}\n\n"
+        "for fig_key, title in fig_titles.items():\n"
+        "    png_path = figures_dir / f'{fig_key}.png'\n"
+        "    if png_path.is_file():\n"
+        "        display(Markdown(f'### {title}'))\n"
+        "        display(Image(filename=str(png_path), width=750))\n"
+    ))
+
+    # Section 11: Drive Flush
+    cells.append(nbf.v4.new_markdown_cell("## 11. Synchronize All Artifacts to Google Drive\nFlush and sync all in-flight buffers to Google Drive."))
     cells.append(nbf.v4.new_code_cell(
         "if IN_COLAB:\n"
         "    from google.colab import drive\n"
