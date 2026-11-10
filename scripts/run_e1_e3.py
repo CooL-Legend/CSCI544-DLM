@@ -25,6 +25,7 @@ def main(argv=None):
     parser.add_argument("--max-depth", type=int, default=MAX_SEARCH_DEPTH)
     parser.add_argument("--num-candidates", type=int, default=MIN_CANDIDATES)
     parser.add_argument("--num-samples", type=int, help="Optional prefix count for quick testing.")
+    parser.add_argument("--batch-size", type=int, default=4, help="Cooperative batch size across questions (default: 4).")
     parser.add_argument("--model-path", help="Local checkpoint or HuggingFace repo ID.")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--local-files-only", action="store_true")
@@ -37,7 +38,7 @@ def main(argv=None):
     if torch.device(args.device).type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA is requested but unavailable.")
 
-    print(f"Initializing E1 run: stage={args.stage}, methods={args.methods}, budgets={args.budgets}, depth={args.max_depth}, resume={args.resume}")
+    print(f"Initializing E1 run: stage={args.stage}, methods={args.methods}, budgets={args.budgets}, depth={args.max_depth}, batch_size={args.batch_size}, resume={args.resume}")
     ctx = context(
         stage=args.stage,
         methods=tuple(args.methods),
@@ -58,6 +59,7 @@ def main(argv=None):
         max_depth=args.max_depth,
         num_candidates=args.num_candidates,
         resume=args.resume,
+        batch_size=args.batch_size,
     )
     total_time = perf_counter() - started
 
