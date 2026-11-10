@@ -154,6 +154,7 @@ def execute_search_batch_checkpointed_e2(
         top_k_actions=ctx["common"]["decoding"]["mcts"]["top_k_actions"],
         stop_mode="budget",
         max_model_calls=max_budget,
+        max_simulations=max_budget,
     )
 
     if method == "ab_medal":
@@ -198,6 +199,9 @@ def execute_search_batch_checkpointed_e2(
         if not active:
             break
         invocation_id += 1
+        if invocation_id % 25 == 0 or invocation_id == 1:
+            calls_str = ", ".join(f"Q{i}:{tree.model_calls}/{max_budget} calls ({len(tree.nodes)} nodes)" for i, tree in enumerate(trees))
+            print(f"  [{method.upper()} Step {invocation_id}] Active: {len(active)}/{len(trees)} | {calls_str}", flush=True)
         current_states = [r.node.state for r in requests]
         ids, attention, _ = pack_states(current_states, pad_token_id, device)
         for index, request in zip(active, requests):
@@ -277,6 +281,9 @@ def complete_selected_states_batch(wrapper, completion_requests, ctx, completion
             if not active:
                 break
             invocation_id += 1
+            if invocation_id % 50 == 0 or invocation_id == 1:
+                masks_left = [int((unique_uncached[i]["state"][0, unique_uncached[i]["prompt_len"]:] == mask_id).sum().item()) for i in active]
+                print(f"  [Completion Step {invocation_id}] Active: {len(active)} | Masks remaining: {masks_left}", flush=True)
             current_states = [unique_uncached[i]["state"] for i in active]
             ids, attention, _ = pack_states(current_states, pad_token_id, device)
             prediction = wrapper.model(ids) if len(active) == 1 else wrapper.model(ids, attention_mask=attention)

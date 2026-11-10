@@ -41,94 +41,94 @@ class E2MEDALSearch(CooperativeMEDALSearch):
         self._pending_grandchild: Optional[Dict[str, Any]] = None
 
     def next_evaluation(self) -> Optional[EvaluationRequest]:
-        if self._pending is not None:
-            return self._pending
-        if self.done:
-            return None
+        while not self.done:
+            if self._pending is not None:
+                return self._pending
 
-        # 1. Root initialization
-        if self.root.analysis is None:
-            self.cycle += 1
-            self._root_cycle = True
-            self._pending = EvaluationRequest(self.root, None, [], [], "tree_analysis")
-            return self._pending
-
-        if self._at_cap() or self._at_simulation_cap():
-            self._finish("model_call_budget" if self._at_cap() else "simulation_budget")
-            return None
-
-        # 2. Outstanding grandchild evaluation from Phase 1
-        if self._pending_grandchild is not None:
-            grandchild = self._pending_grandchild["grandchild"]
-            g_key = medal._state_key(grandchild.state)
-            if g_key in self.cached_analyses:
-                # Cache hit on grandchild: resolve immediately without extra NFE
-                g_analysis = self.cached_analyses[g_key]
-                self._resolve_child_reward(g_analysis)
-                return self.next_evaluation()
-
-            self._pending = EvaluationRequest(
-                grandchild, self._pending_grandchild["child"], [], [], "simulation"
-            )
-            return self._pending
-
-        # 3. Frontier selection if needed
-        while self._parent is None:
-            if not self._root_cycle:
+            # 1. Root initialization
+            if self.root.analysis is None:
                 self.cycle += 1
-            self._root_cycle = False
-            with self._counted.phase("selection"):
-                parent, decisions = medal.select_node(self.root, self.config.exploration_c)
-            if parent is None:
-                self._finish("frontier_exhausted")
+                self._root_cycle = True
+                self._pending = EvaluationRequest(self.root, None, [], [], "tree_analysis")
+                return self._pending
+
+            if self._at_cap() or self._at_simulation_cap():
+                self._finish("model_call_budget" if self._at_cap() else "simulation_budget")
                 return None
-            self._emit(
-                "selection",
-                node_id=parent.node_id,
-                path=[0] + [hop["chosen_id"] for hop in decisions],
-                decisions=decisions,
-            )
-            parent.expanded = True
-            self._remaining = list(parent.analysis.actions)
-            if not self._remaining:
-                self._close_exhausted(parent)
-                if self.root.closed:
+
+            # 2. Outstanding grandchild evaluation from Phase 1
+            if self._pending_grandchild is not None:
+                grandchild = self._pending_grandchild["grandchild"]
+                g_key = medal._state_key(grandchild.state)
+                if g_key in self.cached_analyses:
+                    # Cache hit on grandchild: resolve immediately without extra NFE
+                    g_analysis = self.cached_analyses[g_key]
+                    self._resolve_child_reward(g_analysis)
+                    continue
+
+                self._pending = EvaluationRequest(
+                    grandchild, self._pending_grandchild["child"], [], [], "simulation"
+                )
+                return self._pending
+
+            # 3. Frontier selection if needed
+            while self._parent is None:
+                if not self._root_cycle:
+                    self.cycle += 1
+                self._root_cycle = False
+                with self._counted.phase("selection"):
+                    parent, decisions = medal.select_node(self.root, self.config.exploration_c)
+                if parent is None:
                     self._finish("frontier_exhausted")
                     return None
-                continue
-            self._parent = parent
+                self._emit(
+                    "selection",
+                    node_id=parent.node_id,
+                    path=[0] + [hop["chosen_id"] for hop in decisions],
+                    decisions=decisions,
+                )
+                parent.expanded = True
+                self._remaining = list(parent.analysis.actions)
+                if not self._remaining:
+                    self._close_exhausted(parent)
+                    if self.root.closed:
+                        self._finish("frontier_exhausted")
+                        return None
+                    continue
+                self._parent = parent
 
-        parent = self._parent
-        action = self._remaining.pop(0)
-        if action.token_id in self.search_excluded_token_ids:
-            raise RuntimeError("Excluded termination token reached search expansion.")
+            parent = self._parent
+            action = self._remaining.pop(0)
+            if action.token_id in self.search_excluded_token_ids:
+                raise RuntimeError("Excluded termination token reached search expansion.")
 
-        # Expand child state s_i
-        with self._counted.phase("expansion"):
-            child = medal.expand_node(
-                parent, action, len(self.nodes), self.prompt_len, self.mask_id, self.config.init_tokens
+            # Expand child state s_i
+            with self._counted.phase("expansion"):
+                child = medal.expand_node(
+                    parent, action, len(self.nodes), self.prompt_len, self.mask_id, self.config.init_tokens
+                )
+                self.nodes.append(child)
+
+            self._emit(
+                "expansion",
+                parent_id=parent.node_id,
+                child_id=child.node_id,
+                depth=child.depth,
+                action=medal.action_record(action, self.tokenizer),
             )
-            self.nodes.append(child)
+            self.simulations_started += 1
+            self._emit("simulation_started", child_id=child.node_id, simulations_started=self.simulations_started)
 
-        self._emit(
-            "expansion",
-            parent_id=parent.node_id,
-            child_id=child.node_id,
-            depth=child.depth,
-            action=medal.action_record(action, self.tokenizer),
-        )
-        self.simulations_started += 1
-        self._emit("simulation_started", child_id=child.node_id, simulations_started=self.simulations_started)
+            # Check if child is already in analysis cache
+            c_key = medal._state_key(child.state)
+            if c_key in self.cached_analyses:
+                child_analysis = self.cached_analyses[c_key]
+                self._prepare_grandchild_or_finalize(child, parent, child_analysis)
+                continue
 
-        # Check if child is already in analysis cache
-        c_key = medal._state_key(child.state)
-        if c_key in self.cached_analyses:
-            child_analysis = self.cached_analyses[c_key]
-            self._prepare_grandchild_or_finalize(child, parent, child_analysis)
-            return self.next_evaluation()
-
-        self._pending = EvaluationRequest(child, parent, [], [], "simulation")
-        return self._pending
+            self._pending = EvaluationRequest(child, parent, [], [], "simulation")
+            return self._pending
+        return None
 
     def _prepare_grandchild_or_finalize(self, child: medal.Node, parent: medal.Node, child_analysis: medal.StateAnalysis):
         """Prepare grandchild lookahead or finalize child immediately if fully committed."""
@@ -304,90 +304,90 @@ class E2ABMEDALSearch(ABMEDALSearch):
         self._pending_grandchild: Optional[Dict[str, Any]] = None
 
     def next_evaluation(self) -> Optional[EvaluationRequest]:
-        if self._pending is not None:
-            return self._pending
-        if self.done:
-            return None
+        while not self.done:
+            if self._pending is not None:
+                return self._pending
 
-        # 1. Root initialization
-        if self.root.analysis is None:
-            self.cycle += 1
-            self._root_cycle = True
-            self._pending = EvaluationRequest(self.root, None, [], [], "tree_analysis")
-            return self._pending
+            # 1. Root initialization
+            if self.root.analysis is None:
+                self.cycle += 1
+                self._root_cycle = True
+                self._pending = EvaluationRequest(self.root, None, [], [], "tree_analysis")
+                return self._pending
 
-        if self._at_cap() or self._at_simulation_cap():
-            self._finish("model_call_budget" if self._at_cap() else "simulation_budget")
-            return None
+            if self._at_cap() or self._at_simulation_cap():
+                self._finish("model_call_budget" if self._at_cap() else "simulation_budget")
+                return None
 
-        # 2. Outstanding grandchild evaluation from Phase 1
-        if self._pending_grandchild is not None:
-            grandchild = self._pending_grandchild["grandchild"]
-            g_key = medal._state_key(grandchild.state)
-            if g_key in self.cached_analyses:
-                g_analysis = self.cached_analyses[g_key]
-                self._resolve_child_reward(g_analysis)
-                return self.next_evaluation()
+            # 2. Outstanding grandchild evaluation from Phase 1
+            if self._pending_grandchild is not None:
+                grandchild = self._pending_grandchild["grandchild"]
+                g_key = medal._state_key(grandchild.state)
+                if g_key in self.cached_analyses:
+                    g_analysis = self.cached_analyses[g_key]
+                    self._resolve_child_reward(g_analysis)
+                    continue
 
-            self._pending = EvaluationRequest(
-                grandchild,
-                self._pending_grandchild["child"],
-                self._pending_grandchild["path"],
-                self._pending_grandchild["decisions"],
-                "simulation",
-            )
-            return self._pending
+                self._pending = EvaluationRequest(
+                    grandchild,
+                    self._pending_grandchild["child"],
+                    self._pending_grandchild["path"],
+                    self._pending_grandchild["decisions"],
+                    "simulation",
+                )
+                return self._pending
 
-        if not getattr(self, "_root_cycle", False) and self._round is None:
-            self.cycle += 1
-        self._root_cycle = False
+            if not getattr(self, "_root_cycle", False) and self._round is None:
+                self.cycle += 1
+            self._root_cycle = False
 
-        # 3. Frontier traversal & decision
-        with self._counted.phase("selection"):
-            parent, path, decisions = self._select()
-        if parent is None:
-            self._finish("frontier_exhausted")
-            return None
+            # 3. Frontier traversal & decision
+            with self._counted.phase("selection"):
+                parent, path, decisions = self._select()
+            if parent is None:
+                self._finish("frontier_exhausted")
+                return None
 
-        self._emit("selection", node_id=parent.node_id, path=[n.node_id for n in path], decisions=decisions)
+            self._emit("selection", node_id=parent.node_id, path=[n.node_id for n in path], decisions=decisions)
 
-        with self._counted.phase("expansion"):
-            action = self.remaining_actions[parent.node_id].pop(0)
-            if action.token_id in self.search_excluded_token_ids:
-                raise RuntimeError("Excluded termination token reached search expansion.")
-            parent.expanded = True
-            child = medal.expand_node(
-                parent, action, len(self.nodes), self.prompt_len, self.mask_id, self.config.init_tokens
-            )
-            self.nodes.append(child)
+            with self._counted.phase("expansion"):
+                action = self.remaining_actions[parent.node_id].pop(0)
+                if action.token_id in self.search_excluded_token_ids:
+                    raise RuntimeError("Excluded termination token reached search expansion.")
+                parent.expanded = True
+                child = medal.expand_node(
+                    parent, action, len(self.nodes), self.prompt_len, self.mask_id, self.config.init_tokens
+                )
+                self.nodes.append(child)
 
-        self._emit(
-            "expansion",
-            parent_id=parent.node_id,
-            child_id=child.node_id,
-            depth=child.depth,
-            action=medal.action_record(action, self.tokenizer),
-        )
-        self.simulations_started += 1
-        for order, decision in enumerate(decisions if self.config.search_policy == "gaussian" else []):
             self._emit(
-                "adaptive_decision",
-                traversal_id=self.simulations_started,
-                decision_order=order,
-                decision_node_id=decision["node_id"],
-                decision_type=decision["choice"],
+                "expansion",
+                parent_id=parent.node_id,
                 child_id=child.node_id,
-                **decision,
+                depth=child.depth,
+                action=medal.action_record(action, self.tokenizer),
             )
+            self.simulations_started += 1
+            for order, decision in enumerate(decisions if self.config.search_policy == "gaussian" else []):
+                self._emit(
+                    "adaptive_decision",
+                    traversal_id=self.simulations_started,
+                    decision_order=order,
+                    decision_node_id=decision["node_id"],
+                    decision_type=decision["choice"],
+                    child_id=child.node_id,
+                    **decision,
+                )
 
-        c_key = medal._state_key(child.state)
-        if c_key in self.cached_analyses:
-            child_analysis = self.cached_analyses[c_key]
-            self._prepare_grandchild_or_finalize(child, parent, path, decisions, child_analysis)
-            return self.next_evaluation()
+            c_key = medal._state_key(child.state)
+            if c_key in self.cached_analyses:
+                child_analysis = self.cached_analyses[c_key]
+                self._prepare_grandchild_or_finalize(child, parent, path, decisions, child_analysis)
+                continue
 
-        self._pending = EvaluationRequest(child, parent, path, decisions, "simulation")
-        return self._pending
+            self._pending = EvaluationRequest(child, parent, path, decisions, "simulation")
+            return self._pending
+        return None
 
     def _prepare_grandchild_or_finalize(
         self, child: medal.Node, parent: medal.Node, path: list, decisions: list, child_analysis: medal.StateAnalysis
