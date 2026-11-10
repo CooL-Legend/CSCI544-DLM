@@ -128,10 +128,11 @@ def prepare(wrapper, ctx):
     return prepared
 
 
-def load_model(ctx, model_path=None, device="cuda", local_files_only=False):
-    """Load model wrapper configured for the shared experimental protocol."""
-    from dlm_project.tasks.gsm8k.experiment_0 import load_model as e0_load_model
-    return e0_load_model(ctx, model_path=model_path, device=device, local_files_only=local_files_only)
+def load_model(ctx=None, model_path=None, device="cuda", local_files_only=False, **kwargs):
+    """Load LLaDA wrapper for E2 experiments."""
+    from dlm_project.models.llada import LLaDA
+    dtype = ctx["common"]["model"]["dtype"] if ctx and "common" in ctx else "bfloat16"
+    return LLaDA(device=device, model_path=model_path, dtype=dtype, local_files_only=local_files_only)
 
 
 @torch.inference_mode()
