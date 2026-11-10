@@ -1,6 +1,27 @@
-# CSCI544-DLM
+# Adaptive Compute Allocation for MCTS-Based Diffusion Language Model Decoding (`CSCI544-DLM`)
 
-Evaluate **LLaDA-8B-Instruct**, **iLLaDA-8B-Instruct**, and **LLaDA-8B-BGPO-sudoku** on Sudoku for CSCI 544 Applied NLP. Develop locally, run inference on **Google Colab Pro**, and keep model weights and experiment artifacts in **Google Drive**.
+## Project Overview
+
+**Diffusion Language Models (DLMs)**—such as **LLaDA-8B-Instruct**—generate text by iteratively unmasking tokens rather than decoding strictly left-to-right. In reasoning tasks like math word problems (GSM8K) and logic puzzles (Sudoku), *the order in which tokens are revealed* strongly influences whether the model reaches a correct solution.
+
+While greedy single-pass decoding is fast, early token commitments can lock the model into flawed reasoning paths. Tree-search methods like **MEDAL** use Monte Carlo Tree Search (MCTS) to explore multiple unmasking orders before completing the answer, but they spend a fixed compute budget uniformly across grouped candidate expansions.
+
+### Goal & Purpose of This Repository
+
+The goal of this project is to **use a fixed inference-time compute budget more effectively during DLM decoding—without any additional model training**.
+
+Specifically, this repository develops and evaluates **AB-MEDAL (Adaptive Branching MEDAL)** and trajectory-aware search rewards to test whether smarter allocation of search effort improves reasoning accuracy at matched computational cost:
+
+- ** E0 — Search-Free Baselines**: Establishes single-pass greedy decoding baselines (such as confidence and entropy-guided unmasking) to anchor accuracy and runtime costs.
+- ** E1 — Adaptive Branching (Accuracy & Efficiency)**: Evaluates whether dynamically balancing search **width** (generating new candidate branches) and **depth** (continuing promising branches) via **AB-MEDAL** improves final-answer accuracy over standard **MEDAL** under the exact same search budget.
+- ** E2 — Trajectory-Aware Rewards**: Investigates whether cumulative, stability-based, or lookahead uncertainty signals guide search more reliably than single-step information gain.
+- ** E3 — Compute-Allocation Diagnostics**: Analyzes the resulting search trees offline (branching behavior, exploration depth, subtree concentration, and duplicate states) to explain *why* different search strategies help or fall short.
+
+---
+
+## Quick Navigation & Notebooks
+
+Evaluate **LLaDA-8B-Instruct**, **iLLaDA-8B-Instruct**, and **LLaDA-8B-BGPO-sudoku** on GSM8K and Sudoku for CSCI 544 Applied NLP. Run experiments locally, on an external GPU server/cluster, or on **Google Colab Pro**.
 
 The **LLaDA and iLLaDA GSM8K notebooks** evaluate four shared decoding methods and display accuracy, inference cost, and randomly selected saved answers. LLaDA also includes the documented MEDAL reconstruction with immediate-child information gain, cached candidate ranking, and adjusted-score sampling.
 
