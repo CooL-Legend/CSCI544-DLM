@@ -19,7 +19,7 @@ def create_e2_dev_notebook():
 
     # Badge & Header
     cells.append(nbf.v4.new_markdown_cell(
-        '<a href="https://colab.research.google.com/github/CooL-Legend/CSCI544-DLM/blob/adi/notebooks/gsm8k/Experiment_2_Dev.ipynb" target="_parent"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open in Colab"/></a>'
+        '<a href="https://colab.research.google.com/github/CooL-Legend/CSCI544-DLM/blob/adi-e2/notebooks/gsm8k/Experiment_2_Dev.ipynb" target="_parent"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open in Colab"/></a>'
     ))
     cells.append(nbf.v4.new_markdown_cell(
         "# Experiment 2: Two-Step Lookahead MEDAL vs. AB-MEDAL on GSM8K — Dev (5 Questions)\n\n"
@@ -59,7 +59,7 @@ def create_e2_dev_notebook():
         "import sys\n\n"
         "IN_COLAB = 'google.colab' in sys.modules\n"
         "REPO_URL = 'https://github.com/CooL-Legend/CSCI544-DLM.git'\n"
-        "BRANCH = 'adi'\n"
+        "BRANCH = 'adi-e2'\n"
         "REPO_DIR = Path('/content/CSCI544-DLM') if IN_COLAB else Path.cwd().resolve()\n\n"
         "if IN_COLAB:\n"
         "    if not (REPO_DIR / '.git').exists():\n"
@@ -241,7 +241,7 @@ def create_e2_eval_notebook():
 
     # Badge & Header
     cells.append(nbf.v4.new_markdown_cell(
-        '<a href="https://colab.research.google.com/github/CooL-Legend/CSCI544-DLM/blob/adi/notebooks/gsm8k/Experiment_2_Eval.ipynb" target="_parent"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open in Colab"/></a>'
+        '<a href="https://colab.research.google.com/github/CooL-Legend/CSCI544-DLM/blob/adi-e2/notebooks/gsm8k/Experiment_2_Eval.ipynb" target="_parent"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open in Colab"/></a>'
     ))
     cells.append(nbf.v4.new_markdown_cell(
         "# Experiment 2: Two-Step Lookahead MEDAL vs. AB-MEDAL on GSM8K — Evaluation (20 Canonical + 50 Extended Questions)\n\n"
@@ -275,7 +275,7 @@ def create_e2_eval_notebook():
         "import sys\n\n"
         "IN_COLAB = 'google.colab' in sys.modules\n"
         "REPO_URL = 'https://github.com/CooL-Legend/CSCI544-DLM.git'\n"
-        "BRANCH = 'adi'\n"
+        "BRANCH = 'adi-e2'\n"
         "REPO_DIR = Path('/content/CSCI544-DLM') if IN_COLAB else Path.cwd().resolve()\n\n"
         "if IN_COLAB:\n"
         "    if not (REPO_DIR / '.git').exists():\n"
