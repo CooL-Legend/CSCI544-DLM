@@ -70,6 +70,7 @@ def compare_runs(reference, candidate):
 
 def _logit_difference(left, right, positions):
     maximum, relative, same_argmax, finite_pattern = 0., 0., True, True
+    total_abs, total_finite, matched_argmax, total_positions = 0., 0, 0, 0
     for index in positions.split(32):
         a, b = left[index].float(), right[index].float()
         finite = torch.isfinite(a) & torch.isfinite(b)
@@ -78,9 +79,20 @@ def _logit_difference(left, right, positions):
             delta = (a[finite] - b[finite]).abs()
             maximum = max(maximum, float(delta.max()))
             relative = max(relative, float((delta / a[finite].abs().clamp_min(ATOL)).max()))
-        same_argmax &= bool(torch.equal(a.argmax(-1), b.argmax(-1)))
-    return dict(max_abs_logit_difference=maximum, max_relative_logit_difference=relative,
-                argmax_equal=same_argmax, finite_pattern_equal=finite_pattern)
+            total_abs += float(delta.sum())
+            total_finite += int(finite.sum())
+        eq_argmax = a.argmax(-1) == b.argmax(-1)
+        same_argmax &= bool(eq_argmax.all())
+        matched_argmax += int(eq_argmax.sum())
+        total_positions += int(eq_argmax.numel())
+    return dict(
+        max_abs_logit_difference=maximum,
+        mean_abs_logit_difference=(total_abs / total_finite if total_finite else 0.0),
+        max_relative_logit_difference=relative,
+        argmax_equal=same_argmax,
+        argmax_match_rate=(matched_argmax / total_positions if total_positions else 1.0),
+        finite_pattern_equal=finite_pattern,
+    )
 
 
 @torch.inference_mode()
@@ -126,8 +138,39 @@ def padding_probe(wrapper, prepared, ctx, baseline, batch_size):
                                          passed=all(diff[k] for k in ('argmax_equal', 'finite_pattern_equal', 'action_ids_equal', 'entropy_close')), **diff))
                     del original, padded_serial
                 del batched
-        return dict(passed=all(r['passed'] for r in rows), rows=rows, model_invocations=calls,
-                    sequence_nfes=nfes, rtol=RTOL, atol=ATOL, error=None)
+        padded_serial_passed = all(r['passed'] for r in rows if r['comparison'] == 'padded_serial')
+        batched_probe_passed = all(r['passed'] for r in rows if r['comparison'] == 'batched')
+        exact_gemm_probe_passed = batched_probe_passed
+        llada_inner = getattr(wrapper.model, 'model', wrapper.model)
+        if padded_serial_passed and not batched_probe_passed and hasattr(llada_inner, '_varlen_exact_gemm'):
+            llada_inner._varlen_exact_gemm = True
+            try:
+                group = prepared[:batch_size]
+                states = [torch.tensor([item['prompt_ids'] + [wrapper.mask_id] * 256], dtype=torch.long) for item in group]
+                ids, attention, lengths = pack_states(states, ctx['pad_token_id'], device)
+                exact_batched = wrapper.model(ids, attention_mask=attention)
+                exact_ok = True
+                for i, (state, item, length) in enumerate(zip(states, group, lengths)):
+                    orig = wrapper.model(state.to(device))
+                    prompt_len = len(item['prompt_ids'])
+                    positions = torch.nonzero(state[0, prompt_len:] == wrapper.mask_id).flatten().to(device) + prompt_len
+                    ediff = _logit_difference(orig.logits[0], exact_batched.logits[i, :length], positions)
+                    exact_ok &= bool(ediff['argmax_equal'] and ediff['max_abs_logit_difference'] <= ATOL)
+                exact_gemm_probe_passed = exact_ok
+            finally:
+                llada_inner._varlen_exact_gemm = False
+        return dict(
+            passed=all(r['passed'] for r in rows),
+            padded_serial_passed=padded_serial_passed,
+            batched_probe_passed=batched_probe_passed,
+            exact_gemm_probe_passed=exact_gemm_probe_passed,
+            rows=rows,
+            model_invocations=calls,
+            sequence_nfes=nfes,
+            rtol=RTOL,
+            atol=ATOL,
+            error=None,
+        )
     except (Exception, KeyboardInterrupt) as error:
         return dict(passed=False, rows=rows, model_invocations=calls, sequence_nfes=nfes,
                     rtol=RTOL, atol=ATOL, error=f'{type(error).__name__}: {error}',

@@ -96,6 +96,8 @@ def load_records(directory, config):
         common = config["common_protocol"]
         validate_manifest(manifest, common)
         expected_ids = [r["example_id"] for r in select_examples(manifest, config["evaluation"]["stage"])]
+        if config["data"].get("num_samples") is not None:
+            expected_ids = expected_ids[:config["data"]["num_samples"]]
         if (digest(common) != config["common_protocol_hash"]
                 or config["run"]["example_ids"] != expected_ids
                 or config["prompt"] != common["prompt"]
@@ -198,13 +200,14 @@ def _validate_current_record(row, condition, config):
                   "shortlist_size", "expanded_parents", "evaluated_children"):
         if type(row[field]) is not int or row[field] < 0:
             raise ValueError("Invalid E0 count.")
-    if condition["method"] == "confidence":
+    if condition["method"] in ("confidence", "entropy"):
         if (any(row[k] for k in ("selected_depth", "max_depth", "candidate_count", "shortlist_size",
                                 "target_depth_candidate_count", "expanded_parents", "evaluated_children",
                                 "fallback_decode_used", "shortlist_underfilled", "realized_branching_factor"))
                 or row["budget_utilization"] is not None):
             raise ValueError("No-search baseline contains search metrics.")
         return
+
     depth = row["selected_depth"]
     details = row["details"]
     candidates, shortlist = details["candidate_evaluations"], details["candidate_shortlist"]
