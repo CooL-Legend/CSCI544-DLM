@@ -24,6 +24,9 @@ STAGE_COUNTS = {"dev": 5, "evaluation": 20, "test": 200}
 EXTENDED_TEST_COUNT = 500
 EXTENDED_STAGE_COUNTS = {"dev": 5, "evaluation": 20, "test": EXTENDED_TEST_COUNT}
 EXTENDED_MANIFEST_PATH = PROJECT_ROOT / "configs/gsm8k/experiment_samples_500.json"
+E2_EVALUATION_COUNT = 70
+E2_STAGE_COUNTS = {"dev": 5, "evaluation": E2_EVALUATION_COUNT, "test": 200}
+E2_MANIFEST_PATH = PROJECT_ROOT / "configs/gsm8k/experiment_samples_e2.json"
 # Lc is identical for every experiment and condition; only the budget varies.
 FIXED_DEPTH = 10
 
@@ -97,11 +100,14 @@ def question_key(question):
     return digest(" ".join(question.split()).casefold())
 
 
-def build_manifest(train, test, *, revision, sample_seed=1, test_count=None):
-    """Keep the historical E0 RNG/shuffle order, freezing 5/20/200 (or extended test_count) rows."""
+def build_manifest(train, test, *, revision, sample_seed=1, test_count=None, eval_count=None):
+    """Keep the historical E0 RNG/shuffle order, freezing 5/20/200 (or extended test/eval counts)."""
     target_counts = dict(STAGE_COUNTS)
     if test_count is not None:
         target_counts["test"] = int(test_count)
+    if eval_count is not None:
+        target_counts["evaluation"] = int(eval_count)
+    needed_train = target_counts["dev"] + target_counts["evaluation"]
     rng = random.Random(sample_seed)
     train_order, test_order = list(range(len(train))), list(range(len(test)))
     rng.shuffle(train_order)
@@ -113,12 +119,13 @@ def build_manifest(train, test, *, revision, sample_seed=1, test_count=None):
         if key not in seen and key not in test_keys:
             seen.add(key)
             picked.append(index)
-        if len(picked) == 25:
+        if len(picked) == needed_train:
             break
-    if len(picked) != 25:
-        raise ValueError("Need 25 distinct training questions disjoint from test.")
+    if len(picked) != needed_train:
+        raise ValueError(f"Need {needed_train} distinct training questions disjoint from test.")
     examples = []
-    pools = {"dev": ("train", picked[:5]), "evaluation": ("train", picked[5:]),
+    dev_count = target_counts["dev"]
+    pools = {"dev": ("train", picked[:dev_count]), "evaluation": ("train", picked[dev_count:]),
              "test": ("test", test_order)}
     for stage, (split, order) in pools.items():
         source = train if split == "train" else test
@@ -183,9 +190,18 @@ def validate_manifest(manifest, common=None, *, expected_stage_counts=None):
                     raise ValueError("Shared manifest hash mismatch: content or sample order changed.")
             else:
                 canonical = get_manifest(common=common)
-                prefix_len = sum(STAGE_COUNTS.values())
-                if manifest["examples"][:prefix_len] != canonical["examples"]:
-                    raise ValueError("Extended manifest prefix does not match the canonical 5/20/200 manifest.")
+                can_dev = [e for e in canonical["examples"] if e["stage"] == "dev"]
+                can_eval = [e for e in canonical["examples"] if e["stage"] == "evaluation"]
+                can_test = [e for e in canonical["examples"] if e["stage"] == "test"]
+                man_dev = [e for e in manifest["examples"] if e["stage"] == "dev"]
+                man_eval = [e for e in manifest["examples"] if e["stage"] == "evaluation"]
+                man_test = [e for e in manifest["examples"] if e["stage"] == "test"]
+                if man_dev[:len(can_dev)] != can_dev:
+                    raise ValueError("Manifest dev prefix does not match canonical dev.")
+                if man_eval[:len(can_eval)] != can_eval:
+                    raise ValueError("Manifest evaluation prefix does not match canonical evaluation.")
+                if man_test[:min(len(can_test), len(man_test))] != can_test[:min(len(can_test), len(man_test))]:
+                    raise ValueError("Manifest test prefix does not match canonical test.")
     except (KeyError, TypeError, AttributeError) as error:
         raise ValueError("Malformed shared GSM8K manifest.") from error
     return manifest
@@ -210,6 +226,20 @@ def get_extended_manifest(path=None, *, common=None, test_count=EXTENDED_TEST_CO
         )
     target_counts = dict(STAGE_COUNTS)
     target_counts["test"] = int(test_count)
+    return validate_manifest(json.loads(path.read_text()), common, expected_stage_counts=target_counts)
+
+
+def get_e2_manifest(path=None, *, common=None, eval_count=E2_EVALUATION_COUNT):
+    common = common or load_shared_protocol()
+    path = Path(path) if path is not None else E2_MANIFEST_PATH
+    if not path.is_file():
+        raise ValueError(
+            f"E2 manifest missing at {path}. "
+            "Run scripts/prepare_gsm8k_experiments.py --rebuild --e2 "
+            f"--output {E2_MANIFEST_PATH}."
+        )
+    target_counts = dict(STAGE_COUNTS)
+    target_counts["evaluation"] = int(eval_count)
     return validate_manifest(json.loads(path.read_text()), common, expected_stage_counts=target_counts)
 
 
