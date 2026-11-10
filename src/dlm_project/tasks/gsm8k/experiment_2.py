@@ -213,8 +213,11 @@ def execute_search_batch_checkpointed_e2(
                 sync(wrapper.model)
                 search_latencies[index] = perf_counter() - t0
         del prediction
+        del ids, attention, current_states
 
     sync(wrapper.model)
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     total_search_time = perf_counter() - t0
     for index, tree in enumerate(trees):
         if search_latencies[index] is None:
@@ -299,8 +302,11 @@ def complete_selected_states_batch(wrapper, completion_requests, ctx, completion
                     entry["comp_time"] = perf_counter() - t0
 
             del prediction
+            del ids, attention, current_states
 
         sync(wrapper.model)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         total_comp_time = perf_counter() - t0
 
         for entry in unique_uncached:
@@ -566,6 +572,13 @@ def run_questions_batch_e2(
             precomputed_completions=precomputed_completions,
         )
         batch_rows.extend(rows)
+
+    del search_pairs
+    del precomputed_completions
+    import gc
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     return batch_rows
 

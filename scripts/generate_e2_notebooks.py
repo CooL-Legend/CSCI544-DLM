@@ -143,6 +143,8 @@ def create_e2_dev_notebook():
         "STAGE = 'dev'\n"
         "METHODS = ('medal', 'ab_medal')\n"
         "BUDGETS = (256, 512)\n"
+        "# On NVIDIA L4 (22.4 GiB VRAM), BATCH_SIZE = 2 is recommended for stability;\n"
+        "# BATCH_SIZE = 4 is suited for A100 (40/80 GB) or High-RAM runtimes.\n"
         "BATCH_SIZE = 2\n"
         "RESUME = True\n\n"
         "ctx = context(\n"
@@ -152,17 +154,31 @@ def create_e2_dev_notebook():
         "    max_depth=MAX_SEARCH_DEPTH,\n"
         "    num_candidates=MIN_CANDIDATES,\n"
         ")\n"
-        "print(f'Stage: {ctx[\"stage\"]} | Questions: {len(ctx[\"examples\"])} | Budgets: {BUDGETS} | Methods: {METHODS}')\n"
+        "print(f'Stage: {ctx[\"stage\"]} | Questions: {len(ctx[\"examples\"])} | Budgets: {BUDGETS} | Methods: {METHODS} | Batch Size: {BATCH_SIZE}')\n"
     ))
 
     # Section 7: Load Model
-    cells.append(nbf.v4.new_markdown_cell("## 7. Cache & Load LLaDA-8B-Instruct\nLoad `LLaDA-8B-Instruct` model and tokenizer on CUDA in bfloat16, and prepare tokenized evaluation prompts."))
+    cells.append(nbf.v4.new_markdown_cell("## 7. Cache & Load LLaDA-8B-Instruct\nStage model to fast local NVMe storage and load `LLaDA-8B-Instruct` model and tokenizer on CUDA in bfloat16."))
     cells.append(nbf.v4.new_code_cell(
+        "import shutil\n"
+        "from pathlib import Path\n"
+        "from dlm_project.models.profiles import get_profile\n"
         "from dlm_project.tasks.gsm8k.experiment_2 import load_model, prepare\n\n"
+        "profile = get_profile('llada')\n"
+        "model_name = profile['repo_id'].split('/')[-1]\n"
+        "drive_model_dir = DRIVE_ROOT / 'models' / model_name\n"
+        "runtime_model_dir = Path('/content/models') / model_name\n\n"
+        "# Fast local NVMe cache in Colab runtime if available on Drive\n"
+        "if IN_COLAB and drive_model_dir.is_dir() and not (runtime_model_dir / 'config.json').is_file():\n"
+        "    print(f'Copying model from Google Drive to local fast runtime storage: {runtime_model_dir}...')\n"
+        "    shutil.copytree(drive_model_dir, runtime_model_dir)\n\n"
+        "MODEL_PATH = str(runtime_model_dir if runtime_model_dir.is_dir() else (drive_model_dir if drive_model_dir.is_dir() else profile['repo_id']))\n"
+        "print('Using model location:', MODEL_PATH)\n"
         "print('Loading model and tokenizer on GPU in bfloat16...')\n"
-        "wrapper = load_model(ctx, device='cuda')\n"
+        "wrapper = load_model(ctx, model_path=MODEL_PATH, device='cuda', local_files_only=Path(MODEL_PATH).is_dir())\n"
         "prepared = prepare(wrapper, ctx)\n"
-        "print(f'Prepared {len(prepared)} tokenized evaluation prompts.')\n"
+        "print(f'✓ Model loaded: {wrapper.identity[\"family\"]} ({wrapper.identity[\"repo_id\"]} @ {wrapper.identity[\"revision\"]})')\n"
+        "print(f'✓ Prepared {len(prepared)} tokenized evaluation prompts.')\n"
     ))
 
     # Section 8: Execute Full E2 Dev
@@ -383,21 +399,36 @@ def create_e2_eval_notebook():
         "print(f'Output directory: {OUTPUT_DIR.resolve()}')\n"
     ))
 
-    # Section 6: Controls
-    cells.append(nbf.v4.new_markdown_cell("## 6. Experiment Controls & Shared Model Loading\nConfigure budgets [256, 512], depth 10, batch size 4, and load `LLaDA-8B-Instruct`."))
+    # Section 6: Controls & Model Loading
+    cells.append(nbf.v4.new_markdown_cell("## 6. Experiment Controls & Staged Model Loading\nConfigure budgets [256, 512], depth 10, batch size 2, and load `LLaDA-8B-Instruct` from staged NVMe storage."))
     cells.append(nbf.v4.new_code_cell(
+        "import shutil\n"
+        "from pathlib import Path\n"
+        "from dlm_project.models.profiles import get_profile\n"
         "from dlm_project.tasks.gsm8k.experiment_2 import (\n"
         "    CHECKPOINT_BUDGETS, MAX_SEARCH_DEPTH, MIN_CANDIDATES, context, load_model\n"
         ")\n\n"
         "METHODS = ('medal', 'ab_medal')\n"
         "BUDGETS = (256, 512)\n"
-        "BATCH_SIZE = 4\n"
+        "# On NVIDIA L4 (22.4 GiB VRAM), BATCH_SIZE = 2 is recommended for stability;\n"
+        "# BATCH_SIZE = 4 is suited for A100 (40/80 GB) or High-RAM runtimes.\n"
+        "BATCH_SIZE = 2\n"
         "RESUME = True\n\n"
         "# Load base context to initialize model identity\n"
-        "base_ctx = context(stage='evaluation', methods=METHODS, budgets=BUDGETS)\n"
+        "base_ctx = context(stage='evaluation', methods=METHODS, budgets=BUDGETS)\n\n"
+        "profile = get_profile('llada')\n"
+        "model_name = profile['repo_id'].split('/')[-1]\n"
+        "drive_model_dir = DRIVE_ROOT / 'models' / model_name\n"
+        "runtime_model_dir = Path('/content/models') / model_name\n\n"
+        "# Fast local NVMe cache in Colab runtime if available on Drive\n"
+        "if IN_COLAB and drive_model_dir.is_dir() and not (runtime_model_dir / 'config.json').is_file():\n"
+        "    print(f'Copying model from Google Drive to local fast runtime storage: {runtime_model_dir}...')\n"
+        "    shutil.copytree(drive_model_dir, runtime_model_dir)\n\n"
+        "MODEL_PATH = str(runtime_model_dir if runtime_model_dir.is_dir() else (drive_model_dir if drive_model_dir.is_dir() else profile['repo_id']))\n"
+        "print('Using model location:', MODEL_PATH)\n"
         "print('Loading LLaDA-8B-Instruct wrapper on GPU in bfloat16...')\n"
-        "wrapper = load_model(base_ctx, device='cuda')\n"
-        "print('Model successfully loaded.')\n"
+        "wrapper = load_model(base_ctx, model_path=MODEL_PATH, device='cuda', local_files_only=Path(MODEL_PATH).is_dir())\n"
+        "print(f'✓ Model loaded: {wrapper.identity[\"family\"]} ({wrapper.identity[\"repo_id\"]} @ {wrapper.identity[\"revision\"]})')\n"
     ))
 
     # Section 7: Run Canonical 20 Samples
