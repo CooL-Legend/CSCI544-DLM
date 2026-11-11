@@ -40,6 +40,8 @@ hybrid with temporary adaptive rollout, not a reproduction of the paper's block 
 | LLaDA — GSM8K decoders | [Open LLaDA GSM8K in Colab](https://colab.research.google.com/github/CooL-Legend/CSCI544-DLM/blob/chong/notebooks/gsm8k/LLaDA_GSM8K_Colab.ipynb) | Transformers 4.38.2 |
 | iLLaDA — GSM8K decoders | [Open iLLaDA GSM8K in Colab](https://colab.research.google.com/github/CooL-Legend/CSCI544-DLM/blob/chong/notebooks/gsm8k/iLLaDA_GSM8K_Colab.ipynb) | Transformers 4.57.1, Tokenizers 0.22.2, Hugging Face Hub 0.36.2 |
 | LLaDA — MEDAL MCTS Demo | [Open MEDAL MCTS Demo in Colab](https://colab.research.google.com/github/CooL-Legend/CSCI544-DLM/blob/chong/notebooks/gsm8k/MEDAL_MCTS_Demo.ipynb) | Transformers 4.38.2 |
+| E1 Eval — IG / AdaLook four-variant comparison (20 questions) | [Open E1 Eval in Colab](https://colab.research.google.com/github/CooL-Legend/CSCI544-DLM/blob/chong/notebooks/gsm8k/Experiment_1_Eval.ipynb) | Transformers 4.38.2 |
+| E2 Eval — IG / AdaLook four-variant comparison (70 questions) | [Open E2 Eval in Colab](https://colab.research.google.com/github/CooL-Legend/CSCI544-DLM/blob/chong/notebooks/gsm8k/Experiment_2_Eval.ipynb) | Transformers 4.38.2 |
 
 This repository is private. Authorize Colab to read it through GitHub, or download the desired notebook and use **File → Upload notebook**. An older notebook copy saved in Drive does not automatically receive repository changes. Both GSM8K notebooks check out `chong` and display its commit before running.
 
@@ -141,6 +143,24 @@ The E0 notebooks ([Dev](notebooks/gsm8k/Experiment_0_Baseline_Test_Dev.ipynb),
 [Testing](notebooks/gsm8k/Experiment_0_Baseline_Test_Testing.ipynb)) are aligned with
 this clean baseline protocol. Use the CLI above and consult [docs/experiments.md](docs/experiments.md)
 for metrics, artifacts, and protocol specifications.
+
+## Extended 70-question AdaLook evaluation
+
+[`Experiment_2_Eval.ipynb`](notebooks/gsm8k/Experiment_2_Eval.ipynb) runs the
+same four variants as E1 Eval (MEDAL, AB-MEDAL, and their AdaLook variants) on
+all 70 frozen evaluation questions in `experiment_samples_e2.json`. It uses
+the E1 runner with `evaluation_set="extended_70"`, budgets `[256, 512]`, depth
+10, and serial execution. The first 20 questions match the original E1 pool;
+all 70 come from the training split. Existing E1 callers still default to 20.
+
+Open the notebook on `chong`. Results and the E1-style paired tables and seven
+E3 figures cover the full 70-question pool, under
+`MyDrive/CSCI544-DLM/results/adalook_eval_70/`. A fresh run evaluates all 70
+questions; resume only reuses compatible results in this directory, without
+importing historical E1 runs. `NUM_SAMPLES=2` selects a separate `smoke_2/`
+directory for a GPU smoke run; restore `None` for the complete evaluation.
+The original two-step FIG experiment remains available through
+`Experiment_2_Dev.ipynb` and `scripts/run_e2.py`.
 
 ## AB-MEDAL development
 

@@ -6,6 +6,8 @@ completion interface is stubbed to isolate runner/accounting/report behavior.
 """
 
 from dataclasses import asdict
+from contextlib import redirect_stdout
+import io
 import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -95,6 +97,62 @@ class FourVariantTests(unittest.TestCase):
             self.assertEqual(a, b)
         with self.assertRaises(ValueError):
             e1.context(adalook_options={"exploration_c": 1})
+
+    def test_extended_evaluation_preserves_canonical_inputs(self):
+        canonical = e1.context(stage="evaluation")
+        extended = e1.context(stage="evaluation", evaluation_set="extended_70")
+        self.assertEqual(len(extended["examples"]), 70)
+        self.assertEqual(extended["examples"][:20], canonical["examples"])
+        self.assertEqual(len({e["example_id"] for e in extended["examples"]}), 70)
+        self.assertEqual({e["source_split"] for e in extended["examples"]}, {"train"})
+        self.assertNotEqual(extended["manifest_hash"], canonical["manifest_hash"])
+        for key in ("common", "adalook_options", "methods", "budgets", "prompt_template_hash"):
+            self.assertEqual(extended[key], canonical[key])
+        self.assertEqual(e1.context(stage="evaluation", evaluation_set="extended_70",
+                                    num_samples=2)["examples"], extended["examples"][:2])
+        with self.assertRaisesRegex(ValueError, "requires stage"):
+            e1.context(stage="test", evaluation_set="extended_70")
+        with self.assertRaisesRegex(ValueError, "Unknown evaluation_set"):
+            e1.context(stage="evaluation", evaluation_set="typo")
+
+    def test_adalook_batch_rejected_before_side_effects(self):
+        for method in ("medal_adalook", "ab_medal_adalook"):
+            with self.subTest(method=method), TemporaryDirectory() as temp:
+                w, ctx = wrapper(), small_context()
+                out = Path(temp) / "must_not_exist"
+                with self.assertRaisesRegex(ValueError, "batch_size=1"):
+                    e1.run_e1_stage(w, ctx, out, methods=(method,), batch_size=2)
+                self.assertFalse(out.exists())
+                self.assertEqual(len(w.model.seen), 0)
+                with self.assertRaisesRegex(ValueError, "batch_size=1"):
+                    e1.execute_search_batch_checkpointed(w, [], ctx, method)
+
+    def test_extended_evaluation_run_resume_and_old_manifest_rejection(self):
+        with TemporaryDirectory() as temp:
+            out, w = Path(temp), wrapper()
+            ctx = small_context()
+            extended = e1.context(stage="evaluation", evaluation_set="extended_70")
+            # Exercise one canonical and one newly added question with short decoding.
+            extended["examples"] = [extended["examples"][0], extended["examples"][20]]
+            extended["common"] = ctx["common"]
+            extended["adalook_options"] = ctx["adalook_options"]
+            args = dict(budgets=(12, 30), max_depth=3, num_candidates=2)
+            rows, aggregates = e1.run_e1_stage(w, extended, out, **args)
+            self.assertEqual(len(rows), 16)
+            self.assertEqual(len(aggregates), 8)
+            self.assertTrue(all(r["sample_count"] == 2 for r in aggregates))
+            calls = len(w.model.seen)
+            resumed, _ = e1.run_e1_stage(w, extended, out, **args)
+            self.assertEqual(json.loads(json.dumps(rows)), resumed)
+            self.assertEqual(len(w.model.seen), calls)
+            offline, _ = e3.analyze_e3_stage(out / "evaluation", out / "summaries",
+                                            stage="evaluation", budgets=(12, 30))
+            self.assertEqual(len(offline), 16)
+            self.assertEqual(len(w.model.seen), calls)
+            extended["manifest_hash"] = e1.context(stage="evaluation")["manifest_hash"]
+            with self.assertRaisesRegex(ValueError, "configuration mismatch"):
+                e1.run_e1_stage(w, extended, out, **args)
+            self.assertEqual(len(w.model.seen), calls)
 
     def test_four_variant_artifacts_nfes_and_offline_figures(self):
         with TemporaryDirectory() as temp:
@@ -188,14 +246,14 @@ class FourVariantTests(unittest.TestCase):
 
     def test_notebook_defaults_branches_and_python_syntax(self):
         root = Path(__file__).resolve().parents[2]
-        for name in ("Experiment_1_Eval", "MEDAL_MCTS_Demo", "AB_MEDAL_MCTS_Colab"):
+        for name in ("Experiment_1_Eval", "Experiment_2_Eval", "MEDAL_MCTS_Demo", "AB_MEDAL_MCTS_Colab"):
             nb = json.loads((root / "notebooks/gsm8k" / f"{name}.ipynb").read_text())
             sources = ["".join(c["source"]) for c in nb["cells"]]
             text = "\n".join(sources)
             self.assertIn('BRANCH = "chong"', text)
             self.assertIn('/blob/chong/', text)
             self.assertNotIn('/blob/adi/', text)
-            if name == "Experiment_1_Eval":
+            if name in ("Experiment_1_Eval", "Experiment_2_Eval"):
                 for cell, source in zip(nb["cells"], sources):
                     if cell["cell_type"] == "code":
                         compile(source, name, "exec")
@@ -203,6 +261,36 @@ class FourVariantTests(unittest.TestCase):
                 self.assertIn('STAGE = "evaluation"', text)
                 for method in METHODS:
                     self.assertIn(f'"{method}"', text)
+            if name == "Experiment_2_Eval":
+                self.assertIn('EVALUATION_SET = "extended_70"', text)
+                self.assertIn('evaluation_set=EVALUATION_SET', text)
+                self.assertIn('NUM_SAMPLES = None', text)
+                self.assertIn('BATCH_SIZE = 1', text)
+                self.assertIn('batch_size=BATCH_SIZE', text)
+                self.assertIn('results/adalook_eval_70', text)
+                self.assertNotIn('run_e2_stage', text)
+                self.assertNotIn('canonical_20', text)
+                self.assertNotIn('extended_50', text)
+
+    def test_extended_notebook_controls_and_smoke_directory_reruns(self):
+        root = Path(__file__).resolve().parents[2]
+        nb = json.loads((root / "notebooks/gsm8k/Experiment_2_Eval.ipynb").read_text())
+        controls = next("".join(c["source"]) for c in nb["cells"]
+                        if c["cell_type"] == "code" and 'EVALUATION_SET = ' in "".join(c["source"]))
+        with TemporaryDirectory() as temp, redirect_stdout(io.StringIO()):
+            scope = {"DRIVE_ROOT": Path(temp)}
+            exec(controls, scope)
+            self.assertEqual(len(scope["ctx"]["examples"]), 70)
+            self.assertEqual(scope["METHODS"], list(METHODS))
+            self.assertEqual(scope["BATCH_SIZE"], 1)
+            full_dir = scope["OUTPUT_DIR"]
+            smoke = controls.replace("NUM_SAMPLES = None", "NUM_SAMPLES = 2")
+            exec(smoke, scope)
+            exec(smoke, scope)
+            self.assertEqual(scope["OUTPUT_DIR"], full_dir / "smoke_2")
+            self.assertEqual(len(scope["ctx"]["examples"]), 2)
+            exec(controls, scope)
+            self.assertEqual(scope["OUTPUT_DIR"], full_dir)
 
 
 if __name__ == "__main__":

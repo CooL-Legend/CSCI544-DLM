@@ -35,8 +35,9 @@ from dlm_project.tasks.gsm8k.e0_tokens import resolve_termination_tokens, decode
 from dlm_project.tasks.gsm8k.evaluation import score_answer
 from dlm_project.tasks.gsm8k.e1_variants import ADALOOK_DEFAULTS, METHODS, is_adaptive, variant
 from dlm_project.tasks.gsm8k.experiment_protocol import (
-    EXTENDED_TEST_COUNT, STAGE_COUNTS,
-    load_shared_protocol, get_extended_manifest, get_manifest, select_examples, build_prompt, example_seed
+    E2_EVALUATION_COUNT, EXTENDED_TEST_COUNT, STAGE_COUNTS,
+    load_shared_protocol, get_e2_manifest, get_extended_manifest, get_manifest,
+    select_examples, build_prompt, example_seed
 )
 
 PROTOCOL_VERSION = "e1_four_variant_fixed_depth_v2"
@@ -61,12 +62,23 @@ def state_hash(state_tensor):
 
 def context(*, stage="dev", methods=METHODS, budgets=None,
             max_depth=MAX_SEARCH_DEPTH, num_candidates=MIN_CANDIDATES, num_samples=None,
-            adalook_options=None):
-    """Create and validate execution context for E1."""
+            adalook_options=None, evaluation_set="canonical_20"):
+    """Build an E1 context; opt into the frozen 70-question evaluation pool.
+
+    Existing callers retain the canonical 20-question evaluation set. The
+    extended manifest validates its canonical prefix before selecting samples.
+    """
+    if evaluation_set not in ("canonical_20", "extended_70"):
+        raise ValueError(f"Unknown evaluation_set: {evaluation_set!r}.")
+    if evaluation_set == "extended_70" and stage != "evaluation":
+        raise ValueError("extended_70 requires stage='evaluation'.")
     common = load_shared_protocol()
     if budgets is None:
         budgets = tuple(c["budget"] for c in common["search"]["conditions"])
-    if stage == "test" and num_samples is not None and num_samples > STAGE_COUNTS["test"]:
+    if evaluation_set == "extended_70":
+        manifest = get_e2_manifest(common=common)
+        examples = select_examples(manifest, stage, expected_count=E2_EVALUATION_COUNT)
+    elif stage == "test" and num_samples is not None and num_samples > STAGE_COUNTS["test"]:
         manifest = get_extended_manifest(common=common, test_count=EXTENDED_TEST_COUNT)
         examples = select_examples(manifest, stage, expected_count=EXTENDED_TEST_COUNT)
     else:
@@ -265,6 +277,8 @@ def execute_search_batch_checkpointed(wrapper, prepared_group, ctx, method: str,
                                       max_depth: int = MAX_SEARCH_DEPTH,
                                       num_candidates: int = MIN_CANDIDATES):
     """Execute cooperative batched search up to max(budgets) across a group of questions."""
+    if variant(method)["reward_mode"] != "ig":
+        raise ValueError("AdaLook methods require serial execution (batch_size=1).")
     max_budget = max(budgets)
     cfg_kwargs = dict(
         init_tokens=max_depth,
@@ -833,6 +847,8 @@ def run_e1_stage(wrapper, ctx, output_dir: Path, methods=METHODS,
     """Execute complete E1 stage for all methods with incremental saving, resumption, and optional cooperative batching."""
     if type(batch_size) is not int or batch_size < 1:
         raise ValueError("batch_size must be a positive integer.")
+    if batch_size > 1 and any(variant(m)["reward_mode"] != "ig" for m in methods):
+        raise ValueError("AdaLook methods require serial execution (batch_size=1).")
     output_dir = Path(output_dir)
     stage_dir = output_dir / ctx["stage"]
     summaries_dir = output_dir / "summaries"

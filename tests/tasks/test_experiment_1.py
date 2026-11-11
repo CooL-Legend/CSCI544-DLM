@@ -255,8 +255,14 @@ def test_e1_test_script_and_gpu_profiler_and_notebooks():
             for c in json.loads((PROJECT_ROOT / dev_eval_rel).read_text())["cells"]
             if c["cell_type"] == "code"
         )
-        assert "BATCH_SIZE = 4" in nb_src
-        assert "batch_size=BATCH_SIZE" in nb_src
+        if dev_eval_rel.endswith("Experiment_1_Dev.ipynb"):
+            assert "BATCH_SIZE = 4" in nb_src
+            assert "batch_size=BATCH_SIZE" in nb_src
+        else:
+            # The four-variant Eval notebook uses the runner's serial default.
+            assert "BATCH_SIZE = 1" in nb_src
+            assert '"medal_adalook"' in nb_src
+            assert '"ab_medal_adalook"' in nb_src
 
     test_nb_src = "\n".join(
         "".join(c["source"])
