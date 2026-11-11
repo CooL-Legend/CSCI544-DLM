@@ -690,7 +690,8 @@ class MCTSSearch:
             self.on_event(event)
 
     def _snapshot_checkpoint(self, budget, stop_reason="model_call_budget"):
-        evaluated = [copy.deepcopy(n) for n in self.nodes if n.evaluation_order is not None]
+        evaluated_source = [n for n in self.nodes if n.evaluation_order is not None]
+        evaluated = copy.deepcopy(evaluated_source)
         candidates, shortlist = select_deepest_candidates(evaluated, limit=self.config.num_candidates)
         selected = shortlist[0]
         distinct_counts = {}

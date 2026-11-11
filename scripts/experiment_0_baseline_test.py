@@ -1,4 +1,4 @@
-"""E0 v5: shared GSM8K inputs, Confidence baseline, and fixed MEDAL A–D matrix."""
+"""Experiment 0: Search-free LLaDA Baselines (Confidence primary, optional Entropy)."""
 
 from dlm_project.tasks.gsm8k.experiment_0 import main
 

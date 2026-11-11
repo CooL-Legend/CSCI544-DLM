@@ -98,6 +98,7 @@ class CooperativeMEDALSearch(medal.MCTSSearch):
             self._emit('initialization', node_id=0, entropy=analysis.total_entropy,
                        actions=[medal.action_record(a, self.tokenizer) for a in analysis.actions])
             self._pending = None
+            self._check_checkpoint()
             return
         evaluation = medal.apply_child_analysis(parent, child, analysis, self.prompt_len,
             self.mask_id, self.config, signal_nfe=self.model_calls)
@@ -108,6 +109,7 @@ class CooperativeMEDALSearch(medal.MCTSSearch):
         with self._counted.phase('backpropagation'):
             updates = medal.backpropagate(child, evaluation['reward'])
         self._emit('backpropagation', child_id=child.node_id, reward=evaluation['reward'], updates=updates)
+        self._check_checkpoint()
         if child.depth == self.config.init_tokens:
             key = medal._state_key(child.state)
             duplicate = key in self.candidates

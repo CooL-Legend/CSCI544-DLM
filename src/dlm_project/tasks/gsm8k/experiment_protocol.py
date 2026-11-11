@@ -21,6 +21,12 @@ from dlm_project.tasks.gsm8k.evaluation import extract_answer
 COMMON_PATH = PROJECT_ROOT / "configs/gsm8k/experiments_common.yaml"
 PROTOCOL_VERSION = "gsm8k_shared_v2"
 STAGE_COUNTS = {"dev": 5, "evaluation": 20, "test": 200}
+EXTENDED_TEST_COUNT = 500
+EXTENDED_STAGE_COUNTS = {"dev": 5, "evaluation": 20, "test": EXTENDED_TEST_COUNT}
+EXTENDED_MANIFEST_PATH = PROJECT_ROOT / "configs/gsm8k/experiment_samples_500.json"
+E2_EVALUATION_COUNT = 70
+E2_STAGE_COUNTS = {"dev": 5, "evaluation": E2_EVALUATION_COUNT, "test": 200}
+E2_MANIFEST_PATH = PROJECT_ROOT / "configs/gsm8k/experiment_samples_e2.json"
 # Lc is identical for every experiment and condition; only the budget varies.
 FIXED_DEPTH = 10
 
@@ -94,8 +100,14 @@ def question_key(question):
     return digest(" ".join(question.split()).casefold())
 
 
-def build_manifest(train, test, *, revision, sample_seed=1):
-    """Keep the historical E0 RNG/shuffle order, freezing exactly 5/20/200 rows."""
+def build_manifest(train, test, *, revision, sample_seed=1, test_count=None, eval_count=None):
+    """Keep the historical E0 RNG/shuffle order, freezing 5/20/200 (or extended test/eval counts)."""
+    target_counts = dict(STAGE_COUNTS)
+    if test_count is not None:
+        target_counts["test"] = int(test_count)
+    if eval_count is not None:
+        target_counts["evaluation"] = int(eval_count)
+    needed_train = target_counts["dev"] + target_counts["evaluation"]
     rng = random.Random(sample_seed)
     train_order, test_order = list(range(len(train))), list(range(len(test)))
     rng.shuffle(train_order)
@@ -107,12 +119,13 @@ def build_manifest(train, test, *, revision, sample_seed=1):
         if key not in seen and key not in test_keys:
             seen.add(key)
             picked.append(index)
-        if len(picked) == 25:
+        if len(picked) == needed_train:
             break
-    if len(picked) != 25:
-        raise ValueError("Need 25 distinct training questions disjoint from test.")
+    if len(picked) != needed_train:
+        raise ValueError(f"Need {needed_train} distinct training questions disjoint from test.")
     examples = []
-    pools = {"dev": ("train", picked[:5]), "evaluation": ("train", picked[5:]),
+    dev_count = target_counts["dev"]
+    pools = {"dev": ("train", picked[:dev_count]), "evaluation": ("train", picked[dev_count:]),
              "test": ("test", test_order)}
     for stage, (split, order) in pools.items():
         source = train if split == "train" else test
@@ -129,23 +142,24 @@ def build_manifest(train, test, *, revision, sample_seed=1):
                              "source_split": split, "stage": stage,
                              "content_hash": digest(content), **content})
             count += 1
-            if count == STAGE_COUNTS[stage]:
+            if count == target_counts[stage]:
                 break
     manifest = {"version": 2, "kind": "gsm8k_shared", "sample_seed": sample_seed,
                 "dataset": {"repo_id": "openai/gsm8k", "subset": "main", "revision": revision},
                 "source_counts": {"train": len(train), "test": len(test)}, "examples": examples}
-    return validate_manifest(manifest)
+    return validate_manifest(manifest, expected_stage_counts=target_counts)
 
 
-def validate_manifest(manifest, common=None):
+def validate_manifest(manifest, common=None, *, expected_stage_counts=None):
     """Validate structure and, for official runs, the full ordered content hash."""
+    target_counts = expected_stage_counts or STAGE_COUNTS
     try:
         data = manifest["dataset"]
         if (manifest["version"] != 2 or manifest["kind"] != "gsm8k_shared"
                 or manifest["sample_seed"] != 1 or data["repo_id"] != "openai/gsm8k"
                 or data["subset"] != "main" or not re.fullmatch(r"[0-9a-f]{40}", data["revision"])):
             raise ValueError("Invalid shared GSM8K manifest identity.")
-        counts, ids, questions = dict.fromkeys(STAGE_COUNTS, 0), set(), set()
+        counts, ids, questions = dict.fromkeys(target_counts, 0), set(), set()
         stages = []
         for row in manifest["examples"]:
             stage = row["stage"]
@@ -166,13 +180,28 @@ def validate_manifest(manifest, common=None):
             questions.add(key)
             counts[stage] += 1
             stages.append(stage)
-        if counts != STAGE_COUNTS or stages != [s for s, count in STAGE_COUNTS.items() for _ in range(count)]:
+        if counts != target_counts or stages != [s for s, count in target_counts.items() for _ in range(count)]:
             raise ValueError("Shared manifest requires ordered dev/evaluation/test pools of 5/20/200.")
         if common is not None:
             if data["revision"] != common["data"]["revision"]:
                 raise ValueError("Dataset revision differs from the shared protocol.")
-            if digest(manifest) != common["data"]["manifest_hash"]:
-                raise ValueError("Shared manifest hash mismatch: content or sample order changed.")
+            if target_counts == STAGE_COUNTS:
+                if digest(manifest) != common["data"]["manifest_hash"]:
+                    raise ValueError("Shared manifest hash mismatch: content or sample order changed.")
+            else:
+                canonical = get_manifest(common=common)
+                can_dev = [e for e in canonical["examples"] if e["stage"] == "dev"]
+                can_eval = [e for e in canonical["examples"] if e["stage"] == "evaluation"]
+                can_test = [e for e in canonical["examples"] if e["stage"] == "test"]
+                man_dev = [e for e in manifest["examples"] if e["stage"] == "dev"]
+                man_eval = [e for e in manifest["examples"] if e["stage"] == "evaluation"]
+                man_test = [e for e in manifest["examples"] if e["stage"] == "test"]
+                if man_dev[:len(can_dev)] != can_dev:
+                    raise ValueError("Manifest dev prefix does not match canonical dev.")
+                if man_eval[:len(can_eval)] != can_eval:
+                    raise ValueError("Manifest evaluation prefix does not match canonical evaluation.")
+                if man_test[:min(len(can_test), len(man_test))] != can_test[:min(len(can_test), len(man_test))]:
+                    raise ValueError("Manifest test prefix does not match canonical test.")
     except (KeyError, TypeError, AttributeError) as error:
         raise ValueError("Malformed shared GSM8K manifest.") from error
     return manifest
@@ -186,11 +215,40 @@ def get_manifest(path=None, *, common=None):
     return validate_manifest(json.loads(path.read_text()), common)
 
 
-def select_examples(manifest, stage):
+def get_extended_manifest(path=None, *, common=None, test_count=EXTENDED_TEST_COUNT):
+    common = common or load_shared_protocol()
+    path = Path(path) if path is not None else EXTENDED_MANIFEST_PATH
+    if not path.is_file():
+        raise ValueError(
+            f"Extended manifest missing at {path}. "
+            "Run scripts/prepare_gsm8k_experiments.py --rebuild --test-count 500 "
+            "--output configs/gsm8k/experiment_samples_500.json."
+        )
+    target_counts = dict(STAGE_COUNTS)
+    target_counts["test"] = int(test_count)
+    return validate_manifest(json.loads(path.read_text()), common, expected_stage_counts=target_counts)
+
+
+def get_e2_manifest(path=None, *, common=None, eval_count=E2_EVALUATION_COUNT):
+    common = common or load_shared_protocol()
+    path = Path(path) if path is not None else E2_MANIFEST_PATH
+    if not path.is_file():
+        raise ValueError(
+            f"E2 manifest missing at {path}. "
+            "Run scripts/prepare_gsm8k_experiments.py --rebuild --e2 "
+            f"--output {E2_MANIFEST_PATH}."
+        )
+    target_counts = dict(STAGE_COUNTS)
+    target_counts["evaluation"] = int(eval_count)
+    return validate_manifest(json.loads(path.read_text()), common, expected_stage_counts=target_counts)
+
+
+def select_examples(manifest, stage, *, expected_count=None):
     if stage not in STAGE_COUNTS:
         raise ValueError("Stage must be dev, evaluation, or test.")
     rows = [row for row in manifest["examples"] if row["stage"] == stage]
-    if len(rows) != STAGE_COUNTS[stage]:
+    target = expected_count if expected_count is not None else STAGE_COUNTS[stage]
+    if len(rows) != target:
         raise ValueError("Wrong shared stage size.")
     return rows
 

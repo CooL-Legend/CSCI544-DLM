@@ -161,15 +161,22 @@ def from_events(events, *, prompt_ids=None, mask_id, gen_length, requested_depth
                  comparison_nfes=sum(e.get('stage') == 'forward' and e.get('phase') == 'adalook_comparison' for e in events),
                  forwards=[copy.deepcopy(e) for e in events if e.get("stage") == "forward" and e.get("phase") in ("tree_analysis", "simulation", "candidate_evaluation", "adalook_rollout", "adalook_comparison")],
                  availability={"explicit_state_hashes": modern, "explicit_evaluation_order": modern,
-                               "final_selection": final is not None, "adaptive_decisions": adaptive})
+                               "final_selection": final is not None, "adaptive_decisions": adaptive},
+                 allow_legacy=allow_legacy)
     reconstruct(audit, prompt_ids)
-    if final is not None and len(nodes) + audit['rollout_nfes'] + audit['comparison_nfes'] != search_nfes:
+    if (
+        final is not None
+        and not allow_legacy
+        and len(nodes) + audit['rollout_nfes'] + audit['comparison_nfes'] != search_nfes
+    ):
         raise ValueError("Successful search NFEs differ from evaluated root plus children.")
     return audit
 
 
-def metrics(audit):
+def metrics(audit, allow_legacy=None):
     """Calculate common allocation/structure/reward metrics from compact records."""
+    if allow_legacy is None:
+        allow_legacy = audit.get("allow_legacy", False)
     reconstruct(audit)
     nodes, selection = audit["nodes"], audit["selection"]
     by_id = {row["node_id"]: row for row in nodes}
@@ -263,7 +270,10 @@ def metrics(audit):
         state_hashes_available=hashes_available,
     )
     tree_nfes = nfe - extra_nfes
-    if selection and (sum(depths.values()) != tree_nfes or depths.get(0, 0) + sum(subtrees.values()) != tree_nfes):
+    if not allow_legacy and selection and (
+        sum(depths.values()) != tree_nfes
+        or depths.get(0, 0) + sum(subtrees.values()) != tree_nfes
+    ):
         raise ValueError("Depth/subtree NFE allocation does not reconcile.")
     return result
 

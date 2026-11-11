@@ -1,6 +1,27 @@
-# CSCI544-DLM
+# Adaptive Compute Allocation for MCTS-Based Diffusion Language Model Decoding (`CSCI544-DLM`)
 
-Evaluate **LLaDA-8B-Instruct**, **iLLaDA-8B-Instruct**, and **LLaDA-8B-BGPO-sudoku** on Sudoku for CSCI 544 Applied NLP. Develop locally, run inference on **Google Colab Pro**, and keep model weights and experiment artifacts in **Google Drive**.
+## Project Overview
+
+**Diffusion Language Models (DLMs)**—such as **LLaDA-8B-Instruct**—generate text by iteratively unmasking tokens rather than decoding strictly left-to-right. In reasoning tasks like math word problems (GSM8K) and logic puzzles (Sudoku), *the order in which tokens are revealed* strongly influences whether the model reaches a correct solution.
+
+While greedy single-pass decoding is fast, early token commitments can lock the model into flawed reasoning paths. Tree-search methods like **MEDAL** use Monte Carlo Tree Search (MCTS) to explore multiple unmasking orders before completing the answer, but they spend a fixed compute budget uniformly across grouped candidate expansions.
+
+### Goal & Purpose of This Repository
+
+The goal of this project is to **use a fixed inference-time compute budget more effectively during DLM decoding—without any additional model training**.
+
+Specifically, this repository develops and evaluates **AB-MEDAL (Adaptive Branching MEDAL)** and trajectory-aware search rewards to test whether smarter allocation of search effort improves reasoning accuracy at matched computational cost:
+
+- ** E0 — Search-Free Baselines**: Establishes single-pass greedy decoding baselines (such as confidence and entropy-guided unmasking) to anchor accuracy and runtime costs.
+- ** E1 — Adaptive Branching (Accuracy & Efficiency)**: Evaluates whether dynamically balancing search **width** (generating new candidate branches) and **depth** (continuing promising branches) via **AB-MEDAL** improves final-answer accuracy over standard **MEDAL** under the exact same search budget.
+- ** E2 — Trajectory-Aware Rewards**: Investigates whether cumulative, stability-based, or lookahead uncertainty signals guide search more reliably than single-step information gain.
+- ** E3 — Compute-Allocation Diagnostics**: Analyzes the resulting search trees offline (branching behavior, exploration depth, subtree concentration, and duplicate states) to explain *why* different search strategies help or fall short.
+
+---
+
+## Quick Navigation & Notebooks
+
+Evaluate **LLaDA-8B-Instruct**, **iLLaDA-8B-Instruct**, and **LLaDA-8B-BGPO-sudoku** on GSM8K and Sudoku for CSCI 544 Applied NLP. Run experiments locally, on an external GPU server/cluster, or on **Google Colab Pro**.
 
 The **LLaDA and iLLaDA GSM8K notebooks** evaluate four shared decoding methods and display accuracy, inference cost, and randomly selected saved answers. LLaDA also includes the documented MEDAL reconstruction with immediate-child information gain, cached candidate ranking, and adjusted-score sampling.
 
@@ -91,34 +112,35 @@ and notebook usage.
 ## Experiment 0: fixed-budget GSM8K baseline test
 
 [The shared experiment guide](docs/experiments.md) defines the fixed inputs for
-E0/E1/E2 and the implemented E0 v6 runner. One confidence baseline is compared
-with MEDAL at (Lc, B) = (10, 256), (10, 512), and (10, 1024).
-All conditions use the same two-shot prompt, 256 output tokens, and LLaDA
-Confidence completion at T=0. Search collects distinct states at the deepest depth
-having at least C distinct nodes (falling back to the depth with the most distinct states,
-breaking ties towards deeper depths), ranks by mean backed-up reward, retains up to
-three, and completes only rank 1.
+E0/E1/E2 and the implemented E0 baseline runner. Experiment 0 establishes the
+search-free baseline suite: standard **LLaDA Confidence** (`confidence_t0`, 256 NFEs, $T=0$)
+with an optional **LLaDA Entropy** baseline (`entropy_t0`, 256 NFEs, $T=0$).
+All tree search conditions (MEDAL vs. AB-MEDAL across budgets 256, 512, 1024)
+are unified in Experiment 1 (`scripts/run_e1_e3.py`).
 
-Use the new [development](notebooks/gsm8k/Experiment_0_Baseline_Test_Dev.ipynb),
-[evaluation](notebooks/gsm8k/Experiment_0_Baseline_Test_Evaluation.ipynb), and
-[testing](notebooks/gsm8k/Experiment_0_Baseline_Test_Testing.ipynb) Colab notebooks
-for 5/20 disjoint training questions and 25 held-out test questions, respectively.
-Each loads one model and displays paired accuracy, actual NFEs, runtime, depth,
-fallbacks, and saved answers. Testing can expand to 100 using the same frozen
-ordering. Before these changes are on `chong`, the notebooks also accept the
-delivered `dist/experiment_0_colab_source.zip` through `SOURCE_MODE="upload"`.
-The [implementation README](docs/experiment_0/README.md) explains the exact
-protocol, code interfaces, commands, metrics, saved records, and validation.
+All baselines use the exact same two-shot decomposition prompt from
+[experiments_common.yaml](configs/gsm8k/experiments_common.yaml), 256 output tokens,
+and greedy decoding at $T=0$.
+
+The checked-in manifest ([experiment_samples.json](configs/gsm8k/experiment_samples.json))
+freezes 5 dev and 20 evaluation questions from train and 200 test questions.
+Slicing via `--num-samples` is supported for rapid local testing and development.
 
 ```bash
 python scripts/prepare_gsm8k_experiments.py
 python scripts/experiment_0_baseline_test.py --stage dev
 python scripts/experiment_0_baseline_test.py --stage evaluation
 python scripts/experiment_0_baseline_test.py --stage test
+
+# Optional: include the entropy baseline or test a prefix slice
+python scripts/experiment_0_baseline_test.py --stage test --include-entropy --num-samples 25
 ```
 
-The existing E0 notebooks are aligned with the v6 protocol. Use the CLI above and
-consult the [v6 guide](docs/experiments.md) for metrics, artifacts, and migration.
+The E0 notebooks ([Dev](notebooks/gsm8k/Experiment_0_Baseline_Test_Dev.ipynb),
+[Evaluation](notebooks/gsm8k/Experiment_0_Baseline_Test_Evaluation.ipynb), and
+[Testing](notebooks/gsm8k/Experiment_0_Baseline_Test_Testing.ipynb)) are aligned with
+this clean baseline protocol. Use the CLI above and consult [docs/experiments.md](docs/experiments.md)
+for metrics, artifacts, and protocol specifications.
 
 ## AB-MEDAL development
 
