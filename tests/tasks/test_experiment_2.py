@@ -7,7 +7,12 @@ import torch
 
 from dlm_project.decoding.ab_batch import execute_trees
 from dlm_project.decoding.ab_medal import ABMEDALConfig
-from dlm_project.decoding.e2_search import E2ABMEDALSearch, E2MEDALSearch, compute_fig_reward
+from dlm_project.decoding.e2_search import (
+    E2ABMEDALSearch,
+    E2MEDALSearch,
+    compute_fig_reward,
+    compute_srig_reward,
+)
 from dlm_project.decoding.mcts_decoding import MCTSConfig
 from dlm_project.tasks.gsm8k import experiment_2 as e2
 from tests.decoding.test_ab_batch import BatchModel
@@ -31,6 +36,34 @@ def test_fig_reward_formula():
     # Negative gain (grandchild more uncertain than parent)
     r4 = compute_fig_reward(parent_entropy=4.0, grandchild_entropy=6.0, epsilon=1e-8)
     assert abs(r4 - (-0.5)) < 1e-6
+
+
+def test_srig_reward_formula():
+    """Verify exact computation of the two-step lookahead SRIG (Sum of Relative Information Gains) reward."""
+    # Standard positive two-step relative IG:
+    # Step 1: (10 - 6) / 10 = 0.4
+    # Step 2: (6 - 3) / 6 = 0.5
+    # Total (lambda=1.0): 0.4 + 1.0 * 0.5 = 0.9
+    r1 = compute_srig_reward(parent_entropy=10.0, child_entropy=6.0, grandchild_entropy=3.0, reward_lambda=1.0)
+    assert abs(r1 - 0.9) < 1e-6
+
+    # Weighted lambda = 0.5: 0.4 + 0.5 * 0.5 = 0.65
+    r2 = compute_srig_reward(parent_entropy=10.0, child_entropy=6.0, grandchild_entropy=3.0, reward_lambda=0.5)
+    assert abs(r2 - 0.65) < 1e-6
+
+    # Terminal child (H(c)=0 -> step 2 gain is 0, total = 1.0)
+    r3 = compute_srig_reward(parent_entropy=5.0, child_entropy=0.0, grandchild_entropy=0.0, reward_lambda=1.0)
+    assert abs(r3 - 1.0) < 1e-6
+
+    # Negative step 2 IG (grandchild more uncertain than child)
+    # Step 1: (8 - 4) / 8 = 0.5
+    # Step 2: (4 - 6) / 4 = -0.5
+    # Total: 0.5 + 1.0 * (-0.5) = 0.0
+    r4 = compute_srig_reward(parent_entropy=8.0, child_entropy=4.0, grandchild_entropy=6.0, reward_lambda=1.0)
+    assert abs(r4 - 0.0) < 1e-6
+
+    with pytest.raises(ValueError, match="Invalid reward_lambda"):
+        compute_srig_reward(parent_entropy=10.0, child_entropy=6.0, grandchild_entropy=3.0, reward_lambda=float("nan"))
 
 
 def test_e2_context_and_manifest_slicing():
@@ -226,4 +259,101 @@ def test_e2_e3_offline_analysis_compatibility(tmp_path):
                 tree = e3_tree_plots._validated_tree(data, method=method, example_id=ex["example_id"], budget=b)
                 assert tree.root_id == 0
                 assert len(tree.nodes) >= 1
+
+
+@pytest.mark.parametrize("method", ["medal", "ab_medal"])
+def test_e2_srig_search_execution(method):
+    """Verify SRIG (Sum of Relative Information Gains) 2-step search execution."""
+    m = BatchModel()
+    prompt = torch.tensor([[3, 3, 3]])
+    cfg_kwargs = dict(init_tokens=4, max_model_calls=10, stop_mode="budget")
+
+    if method == "medal":
+        tree = E2MEDALSearch(m, prompt, 0, 50, MCTSConfig(**cfg_kwargs), seed=1, reward_mode="srig", reward_lambda=1.0)
+    else:
+        tree = E2ABMEDALSearch(m, prompt, 0, 50, ABMEDALConfig(**cfg_kwargs), seed=1, reward_mode="srig", reward_lambda=1.0)
+
+    tree.step()
+
+    # Root (1) + child (1) + grandchild (1) = 3 calls
+    assert tree.model_calls == 3
+    child = tree.nodes[1]
+    assert child.immediate_reward is not None
+    assert math.isfinite(child.immediate_reward)
+
+    # Check trace evaluation event
+    eval_events = [e for e in tree.trace if e.get("stage") == "evaluation"]
+    assert len(eval_events) >= 1
+    ev = eval_events[0]
+    assert ev["reward_mode"] == "srig"
+    assert ev["reward_lambda"] == 1.0
+    assert "rig_step1" in ev and "rig_step2" in ev
+    assert abs(ev["reward"] - (ev["rig_step1"] + ev["rig_step2"])) < 1e-6
+
+    # Verify virtual grandchild did NOT mutate child's GEN/CONT posteriors in AB-MEDAL
+    if method == "ab_medal":
+        assert child.node_id in tree.posteriors
+        child_models = tree.posteriors[child.node_id]
+        # Child was registered after simulation backup: GEN and CONT posteriors must be unupdated (prior state: kappa=1.0, nu=1.0)
+        assert child_models["GEN"].kappa == 1.0
+        assert child_models["CONT"].kappa == 1.0
+
+
+def test_e2_exact_boundary_checkpoint_equivalence():
+    """Verify that an intermediate checkpoint snapshot at B=4 is exact and never mutates live search."""
+    m = BatchModel()
+    prompt = torch.tensor([[3, 3, 3]])
+    # Root (1) + child (2) + grandchild (3) -> 3 calls.
+    # Next child is call 4 (hits checkpoint B=4). Grandchild is call 5.
+    tree = E2ABMEDALSearch(
+        m,
+        prompt,
+        0,
+        50,
+        ABMEDALConfig(init_tokens=4, max_model_calls=6, stop_mode="budget"),
+        checkpoint_budgets=(4,),
+        seed=1,
+    )
+
+    while not tree.done:
+        tree.step()
+
+    assert 4 in tree.checkpoints
+    chk_4 = tree.checkpoints[4]
+    # Checkpoint must have exact 4 model calls recorded
+    assert chk_4["model_calls"] == 4
+    assert chk_4["stop_reason"] == "model_call_budget"
+
+    # Live tree must have proceeded to the hard cap 6
+    assert tree.model_calls == 6
+    # Live child node 2 has its full 2-step reward evaluated
+    child_2 = tree.nodes[2]
+    assert child_2.immediate_reward is not None
+
+
+def test_e2_simulation_cap_safeguard():
+    """Verify that simulation cap safeguard stops runaway cached searches and records NFE utilization."""
+    m = BatchModel()
+    prompt = torch.tensor([[3, 3, 3]])
+    # Set simulation cap multiplier to 1 -> max_simulations = 1 * 10 = 10
+    tree = E2MEDALSearch(
+        m,
+        prompt,
+        0,
+        50,
+        MCTSConfig(init_tokens=4, max_model_calls=50, max_simulations=2, stop_mode="budget"),
+        sim_cap_multiplier=1,
+        seed=1,
+    )
+
+    while not tree.done:
+        tree.step()
+
+    assert tree.stop_reason == "simulation_budget"
+    assert tree.simulations_completed >= 2
+    assert tree.model_calls < 50
+    chk = tree._snapshot_checkpoint(budget=50, stop_reason=tree.stop_reason)
+    assert chk["nfe_utilization"] < 1.0
+    assert chk["stop_reason"] == "simulation_budget"
+
 
