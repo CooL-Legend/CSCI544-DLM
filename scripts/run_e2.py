@@ -129,6 +129,24 @@ def main(argv=None) -> int:
         help="Matched search budgets to checkpoint (default: 256 512).",
     )
     parser.add_argument(
+        "--reward-mode",
+        choices=["fig", "srig"],
+        default="fig",
+        help="Two-step lookahead reward function: 'fig' (Fractional IG) or 'srig' (Sum of Relative IG).",
+    )
+    parser.add_argument(
+        "--reward-lambda",
+        type=float,
+        default=1.0,
+        help="Weight lambda for the second-step relative IG term in SRIG mode (default: 1.0).",
+    )
+    parser.add_argument(
+        "--sim-cap-multiplier",
+        type=int,
+        default=4,
+        help="Multiplier for the simulation cap safeguard: max_simulations = multiplier * B (default: 4).",
+    )
+    parser.add_argument(
         "--batch-size",
         type=int,
         default=4,
@@ -208,6 +226,9 @@ def main(argv=None) -> int:
         num_candidates=args.num_candidates,
         num_samples=args.num_samples,
         sample_slice=sample_slice,
+        reward_mode=args.reward_mode,
+        reward_lambda=args.reward_lambda,
+        sim_cap_multiplier=args.sim_cap_multiplier,
     )
 
     print(f"\nPrepared {len(ctx['examples'])} questions for evaluation.")

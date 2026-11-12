@@ -24,7 +24,14 @@ from dlm_project.decoding import mcts_decoding as medal
 from dlm_project.decoding.ab_batch import pack_states, sync
 from dlm_project.decoding.ab_medal import ABMEDALConfig
 from dlm_project.decoding.common import commit_from_logits
-from dlm_project.decoding.e2_search import E2ABMEDALSearch, E2MEDALSearch, compute_fig_reward
+from dlm_project.decoding.e2_search import (
+    DEFAULT_SIM_CAP_MULTIPLIER,
+    E2ABMEDALSearch,
+    E2MEDALSearch,
+    VALID_REWARD_MODES,
+    compute_fig_reward,
+    compute_srig_reward,
+)
 from dlm_project.decoding.mcts_decoding import MCTSConfig, select_deepest_candidates
 from dlm_project.decoding.medal_demo import DecodingResult, run_completion
 from dlm_project.decoding import search_audit
@@ -51,6 +58,7 @@ PROTOCOL_VERSION = "e2_two_step_lookahead_v1"
 CHECKPOINT_BUDGETS = (256, 512)
 MAX_SEARCH_DEPTH = 10
 MIN_CANDIDATES = 3
+SIMULATION_CAP_MULTIPLIER = DEFAULT_SIM_CAP_MULTIPLIER
 
 
 def state_hash(state_tensor):
@@ -66,8 +74,13 @@ def context(
     num_candidates=MIN_CANDIDATES,
     num_samples=None,
     sample_slice: Optional[Tuple[int, int]] = None,
+    reward_mode: str = "fig",
+    reward_lambda: float = 1.0,
+    sim_cap_multiplier: int = SIMULATION_CAP_MULTIPLIER,
 ):
     """Create and validate execution context for E2."""
+    if reward_mode not in VALID_REWARD_MODES:
+        raise ValueError(f"Unknown reward_mode {reward_mode!r}. Must be one of {VALID_REWARD_MODES}.")
     common = load_shared_protocol()
     if budgets is None:
         budgets = CHECKPOINT_BUDGETS
@@ -97,6 +110,9 @@ def context(
         "budgets": list(budgets),
         "max_depth": max_depth,
         "num_candidates": num_candidates,
+        "reward_mode": reward_mode,
+        "reward_lambda": float(reward_lambda),
+        "sim_cap_multiplier": int(sim_cap_multiplier),
         "common": common,
         "manifest": manifest["dataset"],
         "manifest_hash": digest(manifest),
@@ -144,9 +160,17 @@ def execute_search_batch_checkpointed_e2(
     budgets: Tuple[int, ...] = CHECKPOINT_BUDGETS,
     max_depth: int = MAX_SEARCH_DEPTH,
     num_candidates: int = MIN_CANDIDATES,
+    reward_mode: Optional[str] = None,
+    reward_lambda: Optional[float] = None,
+    sim_cap_multiplier: Optional[int] = None,
 ):
     """Execute cooperative batched 2-step lookahead search up to max(budgets)."""
     max_budget = max(budgets)
+    resolved_reward_mode = reward_mode if reward_mode is not None else ctx.get("reward_mode", "fig")
+    resolved_reward_lambda = float(reward_lambda if reward_lambda is not None else ctx.get("reward_lambda", 1.0))
+    resolved_sim_mult = int(sim_cap_multiplier if sim_cap_multiplier is not None else ctx.get("sim_cap_multiplier", SIMULATION_CAP_MULTIPLIER))
+    max_sims = resolved_sim_mult * max_budget
+
     cfg_kwargs = dict(
         init_tokens=max_depth,
         num_candidates=num_candidates,
@@ -154,6 +178,7 @@ def execute_search_batch_checkpointed_e2(
         top_k_actions=ctx["common"]["decoding"]["mcts"]["top_k_actions"],
         stop_mode="budget",
         max_model_calls=max_budget,
+        max_simulations=max_sims,
     )
 
     if method == "ab_medal":
@@ -174,6 +199,9 @@ def execute_search_batch_checkpointed_e2(
             tokenizer=wrapper.tokenizer,
             search_excluded_token_ids=ctx["termination"]["token_ids"],
             checkpoint_budgets=tuple(sorted(budgets)),
+            reward_mode=resolved_reward_mode,
+            reward_lambda=resolved_reward_lambda,
+            sim_cap_multiplier=resolved_sim_mult,
         )
         for item in prepared_group
     ]
@@ -198,6 +226,12 @@ def execute_search_batch_checkpointed_e2(
         if not active:
             break
         invocation_id += 1
+        if invocation_id % 25 == 0 or invocation_id == 1:
+            calls_str = ", ".join(
+                f"Q{i}:{tree.model_calls}/{max_budget} NFEs, {tree.simulations_completed}/{max_sims} sims ({len(tree.nodes)} nodes)"
+                for i, tree in enumerate(trees)
+            )
+            print(f"  [{method.upper()} Step {invocation_id}] Active: {len(active)}/{len(trees)} | {calls_str}", flush=True)
         current_states = [r.node.state for r in requests]
         ids, attention, _ = pack_states(current_states, pad_token_id, device)
         for index, request in zip(active, requests):
@@ -213,8 +247,11 @@ def execute_search_batch_checkpointed_e2(
                 sync(wrapper.model)
                 search_latencies[index] = perf_counter() - t0
         del prediction
+        del ids, attention, current_states
 
     sync(wrapper.model)
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     total_search_time = perf_counter() - t0
     for index, tree in enumerate(trees):
         if search_latencies[index] is None:
@@ -274,6 +311,9 @@ def complete_selected_states_batch(wrapper, completion_requests, ctx, completion
             if not active:
                 break
             invocation_id += 1
+            if invocation_id % 50 == 0 or invocation_id == 1:
+                masks_left = [int((unique_uncached[i]["state"][0, unique_uncached[i]["prompt_len"]:] == mask_id).sum().item()) for i in active]
+                print(f"  [Completion Step {invocation_id}] Active: {len(active)} | Masks remaining: {masks_left}", flush=True)
             current_states = [unique_uncached[i]["state"] for i in active]
             ids, attention, _ = pack_states(current_states, pad_token_id, device)
             prediction = wrapper.model(ids) if len(active) == 1 else wrapper.model(ids, attention_mask=attention)
@@ -299,8 +339,11 @@ def complete_selected_states_batch(wrapper, completion_requests, ctx, completion
                     entry["comp_time"] = perf_counter() - t0
 
             del prediction
+            del ids, attention, current_states
 
         sync(wrapper.model)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         total_comp_time = perf_counter() - t0
 
         for entry in unique_uncached:
@@ -415,16 +458,27 @@ def export_question_e2_artifacts(
             )[req_key]
 
         comp_nfes = completion.model_calls
-        total_nfes = budget + comp_nfes
+        actual_search_nfes = int(chk.get("model_calls", budget))
+        total_nfes = actual_search_nfes + comp_nfes
 
-        selection_record = chk["selection"]
-        chk_metrics = {
-            "search_budget": budget,
-            "search_nfes": budget,
-            "completion_nfes": comp_nfes,
-            "total_nfes": total_nfes,
-            "selected_node_id": chk["selected_node_id"],
-            "selected_depth": chk["selected_depth"],
+        # Build checkpoint search_audit and metrics
+        chk_trace = chk["trace"] + [chk["selection"]]
+        chk_audit = search_audit.from_events(
+            chk_trace,
+            prompt_ids=prepared_item["prompt_ids"],
+            mask_id=wrapper.mask_id,
+            gen_length=ctx["common"]["generation"]["gen_length"],
+            requested_depth=max_depth,
+            requested_budget=budget,
+            search_nfes=actual_search_nfes,
+            adaptive=(method == "ab_medal"),
+            shortlist_limit=num_candidates,
+            allow_legacy=True,
+        )
+        chk_metrics = search_audit.metrics(chk_audit, allow_legacy=True)
+
+        selection_record = {
+            **chk["selection"],
             "selected_q": chk["selected_q"],
             "max_depth_reached": chk["max_depth_reached"],
             "selection_depth_gap": chk["selection_depth_gap"],
@@ -471,6 +525,11 @@ def export_question_e2_artifacts(
                 for node_id, models in chk["posteriors"].items()
             })
 
+        sim_completed = chk.get("simulations_completed", search.simulations_completed)
+        sim_mult = ctx.get("sim_cap_multiplier", SIMULATION_CAP_MULTIPLIER)
+        sim_cap = chk.get("simulation_cap", sim_mult * budget)
+        nfe_util = chk.get("nfe_utilization", (actual_search_nfes / budget) if budget else 1.0)
+
         checkpoint_row = {
             "method": method,
             "search_budget": budget,
@@ -483,9 +542,15 @@ def export_question_e2_artifacts(
             "reference_answer": score["reference_answer"],
             "exact_match": bool(score["exact_match"]),
             "parse_success": bool(score["parse_success"]),
-            "search_nfes": budget,
+            "search_nfes": actual_search_nfes,
             "completion_nfes": comp_nfes,
             "total_nfes": total_nfes,
+            "nfe_utilization": float(nfe_util),
+            "simulations_completed": int(sim_completed),
+            "simulation_cap": int(sim_cap),
+            "simulation_cap_bound": bool(chk.get("stop_reason") == "simulation_budget"),
+            "reward_mode": ctx.get("reward_mode", "fig"),
+            "reward_lambda": float(ctx.get("reward_lambda", 1.0)),
             "search_wall_seconds": search_time * (budget / max(budgets)),
             "completion_wall_seconds": comp_time,
             "total_wall_seconds": (search_time * (budget / max(budgets))) + comp_time,
@@ -557,6 +622,13 @@ def run_questions_batch_e2(
         )
         batch_rows.extend(rows)
 
+    del search_pairs
+    del precomputed_completions
+    import gc
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
     return batch_rows
 
 
@@ -612,6 +684,9 @@ def compute_e2_aggregate_rows(all_checkpoint_rows: List[Dict[str, Any]], stage: 
                 "mean_search_nfe": sum(r["search_nfes"] for r in subset) / n,
                 "mean_completion_nfe": sum(r["completion_nfes"] for r in subset) / n,
                 "mean_total_nfe": sum(r["total_nfes"] for r in subset) / n,
+                "mean_nfe_utilization": sum(r.get("nfe_utilization", (r["search_nfes"] / budget) if budget else 1.0) for r in subset) / n,
+                "mean_simulations": sum(r.get("simulations_completed", 0) for r in subset) / n,
+                "sim_cap_bind_rate": sum(bool(r.get("simulation_cap_bound", False)) for r in subset) / n,
                 "mean_search_wall_seconds": sum(r["search_wall_seconds"] for r in subset) / n,
                 "mean_completion_wall_seconds": sum(r["completion_wall_seconds"] for r in subset) / n,
                 "mean_total_wall_seconds": sum(r["total_wall_seconds"] for r in subset) / n,
@@ -680,6 +755,9 @@ def run_e2_stage(
         "budgets": list(budgets),
         "max_depth": max_depth,
         "num_candidates": num_candidates,
+        "reward_mode": ctx.get("reward_mode", "fig"),
+        "reward_lambda": float(ctx.get("reward_lambda", 1.0)),
+        "sim_cap_multiplier": int(ctx.get("sim_cap_multiplier", SIMULATION_CAP_MULTIPLIER)),
         "batch_size": batch_size,
         "sample_count": len(prepared),
         "examples": [p["example"]["example_id"] for p in prepared],

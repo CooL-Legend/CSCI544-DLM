@@ -96,11 +96,24 @@ def test_custom_question_never_loads_dataset_or_uses_its_reference(tmp_path, mon
     ("Reasoning: 3 + 2 = 5.\n#### 5", "5"), ("#### $1,200.00", "1200"),
     ("#### -3.50", "-3.5"), ("#### +.5", "0.5"), ("#### -0.00", "0"),
     ("#### 2\nActually:\n#### 3.", "3"),
-    ("There are 5 apples.", None), ("#### 1,2", None), ("#### 5 dollars", None),
+    ("There are 5 apples.", None), ("#### 1,2", None), ("#### 5 dollars", "5"),
     ("#### 5\n#### unknown", None), ("#### 1/2", None), ("#### NaN", None),
+    # Trailing units after the marker are accepted; the last marker still wins.
+    ("#### 110 miles", "110"), ("#### 15 pounds", "15"), ("#### $1,200 dollars.", "1200"),
+    ("#### 20%", "20"), ("#### 5.", "5"), ("#### 2 cups\n#### 3 cups", "3"),
+    ("#### 5km", "5"), ("#### 7 xylophones", "7"),
+    # Tails that continue the number or an expression are rejected, never truncated.
+    ("#### 3 1/2", None), ("#### 5 - 3", None), ("#### 12 x 3", None), ("#### 4 * 2", None),
+    ("#### 1.5.2", None), ("#### 5 miles\n#### unknown", None),
 ])
 def test_explicit_final_answer_parsing(text, expected):
     assert extract_answer(text) == expected
+
+
+def test_trailing_units_are_scored_against_reference():
+    assert score_answer("Reasoning.\n#### 110 miles", "#### 110")["exact_match"] is True
+    assert score_answer("#### 15 pounds", "#### 15")["parse_success"] is True
+    assert score_answer("#### 15 pounds", "#### 16")["exact_match"] is False
 
 
 def test_failed_parse_does_not_get_credit_and_invalid_reference_is_reported():
