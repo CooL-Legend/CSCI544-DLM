@@ -10,10 +10,11 @@ from dlm_project.decoding.ab_medal import ABMEDALConfig
 from dlm_project.decoding.e2_search import (
     E2ABMEDALSearch,
     E2MEDALSearch,
+    compute_cmer_reward,
     compute_fig_reward,
     compute_srig_reward,
 )
-from dlm_project.decoding.mcts_decoding import MCTSConfig
+from dlm_project.decoding.mcts_decoding import MCTSConfig, StateAnalysis, _state_key
 from dlm_project.tasks.gsm8k import experiment_2 as e2
 from tests.decoding.test_ab_batch import BatchModel
 from tests.tasks.test_experiment_1 import mock_wrapper
@@ -355,5 +356,210 @@ def test_e2_simulation_cap_safeguard():
     chk = tree._snapshot_checkpoint(budget=50, stop_reason=tree.stop_reason)
     assert chk["nfe_utilization"] < 1.0
     assert chk["stop_reason"] == "simulation_budget"
+
+
+def test_cmer_reward_formula():
+    """Verify Common-Mask Entropy Reduction over masked positions, negatives, and empty masks."""
+    parent_h = torch.tensor([2.0, 1.5, 0.8, 1.2])
+    target_h = torch.tensor([0.0, 0.5, 0.0, 0.4])
+    # Only positions 1 and 3 remain masked in target; committed positions (0, 2) must be ignored
+    mask = torch.tensor([False, True, False, True])
+    reward, count = compute_cmer_reward(parent_h, target_h, mask)
+    assert count == 2
+    assert abs(reward - (((1.5 - 0.5) + (1.2 - 0.4)) / 2.0)) < 1e-6
+
+    # Signed negative entropy reduction when target uncertainty increases at common masks
+    inc_target_h = torch.tensor([0.0, 2.5, 0.0, 1.6])
+    neg_reward, neg_count = compute_cmer_reward(parent_h, inc_target_h, mask)
+    assert neg_count == 2
+    assert abs(neg_reward - (((1.5 - 2.5) + (1.2 - 1.6)) / 2.0)) < 1e-6
+
+    # Empty common mask set -> 0.0 reward without division by zero
+    empty_reward, empty_count = compute_cmer_reward(parent_h, target_h, torch.tensor([False, False, False, False]))
+    assert empty_count == 0
+    assert empty_reward == 0.0
+
+
+@pytest.mark.parametrize("method", ["medal", "ab_medal"])
+def test_e2_cmer_search_execution(method):
+    """Verify CMER 2-step search execution reuses cached per-position entropies cleanly."""
+    m = BatchModel()
+    prompt = torch.tensor([[3, 3, 3]])
+    cfg_kwargs = dict(init_tokens=4, max_model_calls=10, stop_mode="budget")
+
+    if method == "medal":
+        tree = E2MEDALSearch(m, prompt, 0, 50, MCTSConfig(**cfg_kwargs), seed=1, reward_mode="cmer")
+    else:
+        tree = E2ABMEDALSearch(m, prompt, 0, 50, ABMEDALConfig(**cfg_kwargs), seed=1, reward_mode="cmer")
+
+    tree.step()
+
+    # Root (1) + child (1) + virtual grandchild (1) = 3 calls (0 extra NFEs for per-token entropies)
+    assert tree.model_calls == 3
+    child = tree.nodes[1]
+    assert child.immediate_reward is not None
+    assert math.isfinite(child.immediate_reward)
+
+    eval_events = [e for e in tree.trace if e.get("stage") == "evaluation"]
+    assert len(eval_events) == 1
+    ev = eval_events[0]
+    assert ev["reward_mode"] == "cmer"
+    assert ev["lookahead_available"] is True
+    assert ev["common_mask_count"] == 48  # gen_length=50 minus 1 child commit minus 1 grandchild commit
+
+    # Verify trace reward matches cached grandchild StateAnalysis.entropies over remaining grandchild masks
+    g_action = tree.cached_analyses[_state_key(child.state)].actions[0]
+    g_state = child.state.clone()
+    g_state[0, tree.prompt_len + g_action.output_position] = g_action.token_id
+    g_analysis = tree.cached_analyses[_state_key(g_state)]
+    g_mask = g_state[0, tree.prompt_len:] == tree.mask_id
+    expected_reward, expected_count = compute_cmer_reward(
+        tree.root.analysis.entropies, g_analysis.entropies, g_mask
+    )
+    assert ev["common_mask_count"] == expected_count
+    assert abs(ev["reward"] - expected_reward) < 1e-6
+
+    if method == "ab_medal":
+        child_models = tree.posteriors[child.node_id]
+        assert child_models["GEN"].kappa == 1.0
+        assert child_models["CONT"].kappa == 1.0
+
+
+@pytest.mark.parametrize("method", ["medal", "ab_medal"])
+def test_e2_cmer_empty_common_masks_terminal_grandchild(method):
+    """When child is terminal or grandchild fills final mask (|M(g*)| == 0), CMER reward is 0.0."""
+    from dlm_project.decoding.mcts_decoding import Action, expand_node
+
+    m = BatchModel()
+    prompt = torch.tensor([[3, 3, 3]])
+    cfg_kwargs = dict(init_tokens=4, max_model_calls=6, stop_mode="budget")
+
+    def _make_tree():
+        if method == "medal":
+            t = E2MEDALSearch(m, prompt, 0, 5, MCTSConfig(**cfg_kwargs), seed=1, reward_mode="cmer")
+        else:
+            t = E2ABMEDALSearch(m, prompt, 0, 5, ABMEDALConfig(**cfg_kwargs), seed=1, reward_mode="cmer")
+        req_root = t.next_evaluation()
+        t.record_external_forward(req_root, invocation_id=1, batch_size=1)
+        with torch.no_grad():
+            t.submit_evaluation(req_root, logits=m(req_root.node.state).logits[0])
+        return t
+
+    # Case 1: Child with 1 mask left whose greedy action fills it -> |M(g*)| == 0 -> R_CMER = 0.0
+    tree1 = _make_tree()
+    near_terminal = expand_node(tree1.root, Action(0, 10, 0.9, 0.0, 0.1), 1, tree1.prompt_len, tree1.mask_id, 5)
+    near_terminal.state[0, tree1.prompt_len : tree1.prompt_len + 4] = torch.tensor([10, 11, 12, 13])
+    tree1.nodes.append(near_terminal)
+    c_ent = torch.tensor([0.0, 0.0, 0.0, 0.0, 0.9])
+    c_analysis = StateAnalysis(c_ent, (Action(4, 14, 0.95, 0.0, 0.1),), _state_key(near_terminal.state), 0.95)
+    if method == "medal":
+        tree1._prepare_grandchild_or_finalize(near_terminal, tree1.root, c_analysis)
+    else:
+        tree1._prepare_grandchild_or_finalize(near_terminal, tree1.root, [tree1.root], ["GEN"], c_analysis)
+    evals1 = [e for e in tree1.trace if e.get("stage") == "evaluation"]
+    assert len(evals1) == 1
+    assert evals1[0]["common_mask_count"] == 0
+    assert evals1[0]["reward"] == 0.0
+
+    # Case 2: Already terminal child (0 masks left) -> R_CMER = 0.0
+    tree2 = _make_tree()
+    terminal_child = expand_node(tree2.root, Action(0, 10, 0.9, 0.0, 0.1), 1, tree2.prompt_len, tree2.mask_id, 5)
+    terminal_child.state[0, tree2.prompt_len :] = torch.tensor([10, 11, 12, 13, 14])
+    tree2.nodes.append(terminal_child)
+    t_analysis = StateAnalysis(torch.zeros(5), (), _state_key(terminal_child.state), 0.0)
+    if method == "medal":
+        tree2._prepare_grandchild_or_finalize(terminal_child, tree2.root, t_analysis)
+    else:
+        tree2._prepare_grandchild_or_finalize(terminal_child, tree2.root, [tree2.root], ["GEN"], t_analysis)
+    evals2 = [e for e in tree2.trace if e.get("stage") == "evaluation"]
+    assert len(evals2) == 1
+    assert evals2[0]["lookahead_status"] == "terminal_child"
+    assert evals2[0]["common_mask_count"] == 0
+    assert evals2[0]["reward"] == 0.0
+
+
+@pytest.mark.parametrize("method", ["medal", "ab_medal"])
+def test_e2_cmer_boundary_fallback_and_checkpoint_equivalence(method):
+    """Verify 1-step CMER fallback at NFE boundary B=2 (never mixing FIG/SRIG) and B-checkpoint match."""
+    m = BatchModel()
+    prompt = torch.tensor([[3, 3, 3]])
+
+    def _build(max_calls, checkpoint_budgets=None):
+        cfg_kwargs = dict(init_tokens=4, max_model_calls=max_calls, stop_mode="budget")
+        if method == "medal":
+            return E2MEDALSearch(
+                m, prompt, 0, 50, MCTSConfig(**cfg_kwargs), checkpoint_budgets=checkpoint_budgets, seed=1, reward_mode="cmer"
+            )
+        return E2ABMEDALSearch(
+            m, prompt, 0, 50, ABMEDALConfig(**cfg_kwargs), checkpoint_budgets=checkpoint_budgets, seed=1, reward_mode="cmer"
+        )
+
+    # Call 1 = root, Call 2 = child 1; child 1's grandchild is uncached -> boundary fallback fires at B=2
+    cont_tree = _build(max_calls=6, checkpoint_budgets=(2,))
+    while not cont_tree.done:
+        cont_tree.step()
+
+    ind_tree = _build(max_calls=2, checkpoint_budgets=None)
+    while not ind_tree.done:
+        ind_tree.step()
+
+    chk_2 = cont_tree.checkpoints[2]
+    assert chk_2["model_calls"] == 2
+    assert chk_2["stop_reason"] == "model_call_budget"
+
+    chk_evals = [e for e in chk_2["trace"] if e.get("stage") == "evaluation"]
+    ind_evals = [e for e in ind_tree.trace if e.get("stage") == "evaluation"]
+    assert len(chk_evals) == len(ind_evals) == 1
+
+    fallback_ev = chk_evals[0]
+    assert fallback_ev["lookahead_available"] is False
+    assert fallback_ev["lookahead_status"] == "budget_boundary_fallback"
+    assert fallback_ev["common_mask_count"] == 49
+    assert abs(fallback_ev["reward"] - ind_evals[0]["reward"]) < 1e-6
+
+    # Confirm 1-step CMER fallback matches R_CMER(parent, child) over M(c)
+    node1 = [n for n in cont_tree.nodes if n.node_id == fallback_ev["child_id"]][0]
+    expected_1step, _ = compute_cmer_reward(
+        cont_tree.root.analysis.entropies,
+        node1.analysis.entropies,
+        node1.state[0, cont_tree.prompt_len:] == cont_tree.mask_id,
+    )
+    assert abs(fallback_ev["reward"] - expected_1step) < 1e-6
+
+
+def test_e2_cmer_actionless_nonterminal_fallback():
+    """Non-terminal child with no legal actions uses 1-step CMER fallback over M(c)."""
+    m = BatchModel()
+    prompt = torch.tensor([[3, 3, 3]])
+    tree = E2MEDALSearch(
+        m, prompt, 0, 50, MCTSConfig(init_tokens=4, max_model_calls=10, stop_mode="budget"), seed=1, reward_mode="cmer"
+    )
+
+    req_root = tree.next_evaluation()
+    tree.record_external_forward(req_root, invocation_id=1, batch_size=1)
+    with torch.no_grad():
+        tree.submit_evaluation(req_root, logits=m(req_root.node.state).logits[0])
+    req_child = tree.next_evaluation()
+    child = req_child.node
+    parent = req_child.parent
+    c_key = _state_key(child.state)
+    c_entropies = torch.zeros(50)
+    c_entropies[child.state[0, tree.prompt_len:] == tree.mask_id] = 0.7
+    actionless_analysis = StateAnalysis(c_entropies, (), c_key, 0.0)
+    tree._prepare_grandchild_or_finalize(child, parent, actionless_analysis)
+
+    eval_events = [e for e in tree.trace if e.get("stage") == "evaluation"]
+    assert len(eval_events) == 1
+    ev = eval_events[0]
+    assert ev["lookahead_available"] is False
+    assert ev["lookahead_status"] == "no_legal_actions"
+    expected_1step, expected_count = compute_cmer_reward(
+        parent.analysis.entropies,
+        c_entropies,
+        child.state[0, tree.prompt_len:] == tree.mask_id,
+    )
+    assert ev["common_mask_count"] == expected_count
+    assert abs(ev["reward"] - expected_1step) < 1e-6
+
 
 

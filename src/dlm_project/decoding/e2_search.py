@@ -1,18 +1,22 @@
 """Two-step lookahead MCTS search for Experiment 2 (E2).
 
-Implements E2MEDALSearch and E2ABMEDALSearch supporting two reward modes:
+Implements E2MEDALSearch and E2ABMEDALSearch supporting three reward modes:
 1. "fig" (Fractional Information Gain):
     R_FIG(s, s_i) = (H(s) - H(g*_i)) / max(H(s), epsilon)
 2. "srig" (Sum of Relative Information Gains / FutureR_ig):
     FutureR_ig(s, a_i) = R_ig(s, s_i) + lambda * R_ig(s_i, g*_i)
                        = (H(s) - H(s_i)) / H(s) + lambda * (H(s_i) - H(g*_i)) / H(s_i)
+3. "cmer" (Common-Mask Entropy Reduction):
+    R_CMER(s, g*_i) = (1 / |M(g*_i)|) * sum_{j in M(g*_i)} [h_j(s) - h_j(g*_i)]
 
 Key properties:
 - Virtual grandchildren g*_i are evaluated and cached in `cached_analyses` but never
   attached to the MCTS tree or assigned GEN/CONT posteriors.
-- Terminal children (0 remaining masks) have H(s_i) = 0 and second-step gain 0.
-- Non-terminal children with no legal actions fall back to 1-step R_ig(s, s_i) with
-  lookahead_available=False (never substituting H(g*_i) = 0 when H(s_i) > 0).
+- Terminal children (0 remaining masks) have H(s_i) = 0 and second-step gain 0 (and
+  R_CMER = 0.0 since |M(g*_i)| = 0).
+- Non-terminal children with no legal actions fall back to a reward-consistent 1-step
+  fallback (1-step R_ig for fig/srig; 1-step R_CMER over M(s_i) for cmer) with
+  lookahead_available=False.
 - Intermediate checkpoints are enforced before dispatching uncached grandchild forwards
   via isolated hypothetical backups that never mutate the continuing live tree, while
   also enforcing the 4B simulation-cap safeguard after complete simulations.
@@ -31,7 +35,7 @@ from dlm_project.decoding import mcts_decoding as medal
 from dlm_project.decoding.ab_medal import ABMEDALConfig, ABMEDALSearch, EvaluationRequest
 from dlm_project.decoding.medal_batch import CooperativeMEDALSearch
 
-VALID_REWARD_MODES = ("fig", "srig")
+VALID_REWARD_MODES = ("fig", "srig", "cmer")
 DEFAULT_SIM_CAP_MULTIPLIER = 4
 
 
@@ -69,6 +73,79 @@ def compute_srig_reward(
             f"grandchild={grandchild_entropy}, lambda={reward_lambda}"
         )
     return gain
+
+
+def compute_cmer_reward(
+    parent_entropies: torch.Tensor,
+    target_entropies: torch.Tensor,
+    common_mask: torch.Tensor,
+) -> Tuple[float, int]:
+    """Compute Common-Mask Entropy Reduction over positions remaining masked in `target`.
+
+    Returns ``(reward, common_mask_count)``. When ``|M(target)| == 0``, returns ``(0.0, 0)``.
+    """
+    mask = common_mask.to(dtype=torch.bool, device=parent_entropies.device)
+    n_common = int(mask.sum().item())
+    if n_common == 0:
+        return 0.0, 0
+    diff = parent_entropies[mask].double() - target_entropies[mask].double()
+    reward = float(diff.mean().item())
+    if not math.isfinite(reward):
+        raise ValueError(f"Non-finite CMER reward: common_mask_count={n_common}")
+    return reward, n_common
+
+
+def _compute_e2_two_step_reward(
+    reward_mode: str,
+    reward_lambda: float,
+    epsilon: float,
+    parent_analysis: medal.StateAnalysis,
+    child_analysis: medal.StateAnalysis,
+    grandchild_analysis: Optional[medal.StateAnalysis],
+    *,
+    grandchild_state: Optional[torch.Tensor] = None,
+    prompt_len: int = 0,
+    mask_id: int = 0,
+) -> Tuple[float, Optional[int]]:
+    """Compute the 2-step lookahead reward and optional common-mask count."""
+    if reward_mode == "cmer":
+        if grandchild_analysis is None or grandchild_state is None:
+            return 0.0, 0
+        common_mask = grandchild_state[0, prompt_len:] == mask_id
+        return compute_cmer_reward(parent_analysis.entropies, grandchild_analysis.entropies, common_mask)
+    grandchild_entropy = 0.0 if grandchild_analysis is None else grandchild_analysis.total_entropy
+    if reward_mode == "srig":
+        return (
+            compute_srig_reward(
+                parent_analysis.total_entropy,
+                child_analysis.total_entropy,
+                grandchild_entropy,
+                reward_lambda,
+                epsilon,
+            ),
+            None,
+        )
+    return compute_fig_reward(parent_analysis.total_entropy, grandchild_entropy, epsilon), None
+
+
+def _compute_e2_one_step_fallback(
+    reward_mode: str,
+    epsilon: float,
+    parent_analysis: medal.StateAnalysis,
+    child_analysis: medal.StateAnalysis,
+    *,
+    child_state: torch.Tensor,
+    prompt_len: int,
+    mask_id: int,
+) -> Tuple[float, Optional[int]]:
+    """Compute a reward-consistent 1-step fallback when 2-step lookahead is unavailable."""
+    if reward_mode == "cmer":
+        child_mask = child_state[0, prompt_len:] == mask_id
+        return compute_cmer_reward(parent_analysis.entropies, child_analysis.entropies, child_mask)
+    return (
+        medal.information_gain(parent_analysis.total_entropy, child_analysis.total_entropy, epsilon),
+        None,
+    )
 
 
 def _validate_e2_params(reward_mode: str, reward_lambda: float, sim_cap_multiplier: int):
@@ -157,7 +234,46 @@ def _build_snapshot_from_evaluated(
     }
 
 
-class E2MEDALSearch(CooperativeMEDALSearch):
+class _E2RewardMixin:
+    """Shared E2 two-step reward and 1-step fallback computation across tree search policies."""
+
+    def _compute_two_step_reward(
+        self,
+        parent_analysis: medal.StateAnalysis,
+        child_analysis: medal.StateAnalysis,
+        grandchild_analysis: Optional[medal.StateAnalysis],
+        grandchild_state: Optional[torch.Tensor] = None,
+    ) -> Tuple[float, Optional[int]]:
+        return _compute_e2_two_step_reward(
+            self.reward_mode,
+            self.reward_lambda,
+            self.config.epsilon,
+            parent_analysis,
+            child_analysis,
+            grandchild_analysis,
+            grandchild_state=grandchild_state,
+            prompt_len=self.prompt_len,
+            mask_id=self.mask_id,
+        )
+
+    def _compute_one_step_fallback(
+        self,
+        parent_analysis: medal.StateAnalysis,
+        child_analysis: medal.StateAnalysis,
+        child_state: torch.Tensor,
+    ) -> Tuple[float, Optional[int]]:
+        return _compute_e2_one_step_fallback(
+            self.reward_mode,
+            self.config.epsilon,
+            parent_analysis,
+            child_analysis,
+            child_state=child_state,
+            prompt_len=self.prompt_len,
+            mask_id=self.mask_id,
+        )
+
+
+class E2MEDALSearch(_E2RewardMixin, CooperativeMEDALSearch):
     """Two-step lookahead MEDAL search with cooperative batching and state caching."""
 
     def __init__(
@@ -175,15 +291,6 @@ class E2MEDALSearch(CooperativeMEDALSearch):
         self.sim_cap_multiplier = sim_cap_multiplier
         self.cached_analyses: Dict[Tuple[int, ...], medal.StateAnalysis] = {}
         self._pending_grandchild: Optional[Dict[str, Any]] = None
-
-    def _compute_two_step_reward(
-        self, parent_entropy: float, child_entropy: float, grandchild_entropy: float
-    ) -> float:
-        if self.reward_mode == "srig":
-            return compute_srig_reward(
-                parent_entropy, child_entropy, grandchild_entropy, self.reward_lambda, self.config.epsilon
-            )
-        return compute_fig_reward(parent_entropy, grandchild_entropy, self.config.epsilon)
 
     def _snapshot_checkpoint(self, budget: int, stop_reason: str = "model_call_budget") -> Dict[str, Any]:
         evaluated_source = [n for n in self.nodes if n.evaluation_order is not None]
@@ -220,7 +327,10 @@ class E2MEDALSearch(CooperativeMEDALSearch):
         parent_copy = by_id[parent.node_id]
         trace_copy = copy.deepcopy(self.trace)
 
-        reward = medal.information_gain(
+        reward, common_mask_count = self._compute_one_step_fallback(
+            parent_copy.analysis, child_analysis, child_copy.state
+        )
+        rig_step1 = medal.information_gain(
             parent_copy.analysis.total_entropy, child_analysis.total_entropy, self.config.epsilon
         )
         sim_order = self.simulations_completed + 1
@@ -254,10 +364,11 @@ class E2MEDALSearch(CooperativeMEDALSearch):
             "entropy_before": parent_copy.analysis.total_entropy,
             "entropy_child": child_analysis.total_entropy,
             "entropy_grandchild": None,
-            "rig_step1": reward,
+            "rig_step1": rig_step1,
             "rig_step2": 0.0,
             "reward_lambda": self.reward_lambda,
             "reward_mode": self.reward_mode,
+            "common_mask_count": common_mask_count,
             "lookahead_available": False,
             "lookahead_status": "budget_boundary_fallback",
             "reward": reward,
@@ -414,10 +525,10 @@ class E2MEDALSearch(CooperativeMEDALSearch):
 
         remaining_masks = int((child.state[0, self.prompt_len:] == self.mask_id).sum().item())
 
-        # Case A: Terminal child (0 remaining masks -> H(child) = 0, second-step gain = 0)
+        # Case A: Terminal child (0 remaining masks -> H(child) = 0, second-step gain = 0, |M(g*)| = 0 -> CMER = 0)
         if remaining_masks == 0:
-            reward = self._compute_two_step_reward(
-                parent.analysis.total_entropy, child_analysis.total_entropy, 0.0
+            reward, common_mask_count = self._compute_two_step_reward(
+                parent.analysis, child_analysis, None
             )
             self._apply_evaluation_result(
                 child,
@@ -427,13 +538,14 @@ class E2MEDALSearch(CooperativeMEDALSearch):
                 grandchild_entropy=0.0,
                 lookahead_available=True,
                 lookahead_status="terminal_child",
+                common_mask_count=common_mask_count,
             )
             return
 
-        # Case B: Non-terminal child with no legal actions -> do NOT substitute H(g) = 0; fallback to 1-step IG
+        # Case B: Non-terminal child with no legal actions -> fallback to reward-consistent 1-step reward
         if not child_analysis.actions:
-            reward = medal.information_gain(
-                parent.analysis.total_entropy, child_analysis.total_entropy, self.config.epsilon
+            reward, common_mask_count = self._compute_one_step_fallback(
+                parent.analysis, child_analysis, child.state
             )
             self._apply_evaluation_result(
                 child,
@@ -443,6 +555,7 @@ class E2MEDALSearch(CooperativeMEDALSearch):
                 grandchild_entropy=None,
                 lookahead_available=False,
                 lookahead_status="no_legal_actions",
+                common_mask_count=common_mask_count,
             )
             return
 
@@ -464,8 +577,8 @@ class E2MEDALSearch(CooperativeMEDALSearch):
         if g_key in self.cached_analyses:
             g_analysis = self.cached_analyses[g_key]
             grandchild.analysis = g_analysis
-            reward = self._compute_two_step_reward(
-                parent.analysis.total_entropy, child_analysis.total_entropy, g_analysis.total_entropy
+            reward, common_mask_count = self._compute_two_step_reward(
+                parent.analysis, child_analysis, g_analysis, grandchild.state
             )
             self._apply_evaluation_result(
                 child,
@@ -475,14 +588,15 @@ class E2MEDALSearch(CooperativeMEDALSearch):
                 grandchild_entropy=g_analysis.total_entropy,
                 lookahead_available=True,
                 lookahead_status="cached_grandchild",
+                common_mask_count=common_mask_count,
             )
             return
 
         # Case C2: Grandchild is uncached (requires 1 new model forward pass)
-        # If at hard model-call cap, cannot dispatch another forward; fallback to 1-step IG
+        # If at hard model-call cap, cannot dispatch another forward; fallback to reward-consistent 1-step reward
         if self._at_cap():
-            reward = medal.information_gain(
-                parent.analysis.total_entropy, child_analysis.total_entropy, self.config.epsilon
+            reward, common_mask_count = self._compute_one_step_fallback(
+                parent.analysis, child_analysis, child.state
             )
             self._apply_evaluation_result(
                 child,
@@ -492,6 +606,7 @@ class E2MEDALSearch(CooperativeMEDALSearch):
                 grandchild_entropy=None,
                 lookahead_available=False,
                 lookahead_status="budget_boundary_fallback",
+                common_mask_count=common_mask_count,
             )
             return
 
@@ -535,8 +650,8 @@ class E2MEDALSearch(CooperativeMEDALSearch):
         self.cached_analyses[medal._state_key(grandchild.state)] = g_analysis
 
         grandchild_entropy = g_analysis.total_entropy
-        reward = self._compute_two_step_reward(
-            parent.analysis.total_entropy, child_analysis.total_entropy, grandchild_entropy
+        reward, common_mask_count = self._compute_two_step_reward(
+            parent.analysis, child_analysis, g_analysis, grandchild.state
         )
         self._apply_evaluation_result(
             child,
@@ -546,6 +661,7 @@ class E2MEDALSearch(CooperativeMEDALSearch):
             grandchild_entropy=grandchild_entropy,
             lookahead_available=True,
             lookahead_status=lookahead_status,
+            common_mask_count=common_mask_count,
         )
 
     def _apply_evaluation_result(
@@ -558,6 +674,7 @@ class E2MEDALSearch(CooperativeMEDALSearch):
         *,
         lookahead_available: bool = True,
         lookahead_status: str = "evaluated_grandchild",
+        common_mask_count: Optional[int] = None,
     ):
         """Commit child reward, update statistics, check checkpoints and finalize."""
         child.analysis = child_analysis
@@ -584,6 +701,7 @@ class E2MEDALSearch(CooperativeMEDALSearch):
             "rig_step2": rig_step2,
             "reward_lambda": self.reward_lambda,
             "reward_mode": self.reward_mode,
+            "common_mask_count": common_mask_count,
             "lookahead_available": lookahead_available,
             "lookahead_status": lookahead_status,
             "reward": reward,
@@ -693,7 +811,7 @@ class E2MEDALSearch(CooperativeMEDALSearch):
         return self.trace[start:]
 
 
-class E2ABMEDALSearch(ABMEDALSearch):
+class E2ABMEDALSearch(_E2RewardMixin, ABMEDALSearch):
     """Two-step lookahead AB-MEDAL search with greedy continuation lookahead and caching."""
 
     def __init__(
@@ -711,15 +829,6 @@ class E2ABMEDALSearch(ABMEDALSearch):
         self.sim_cap_multiplier = sim_cap_multiplier
         self.cached_analyses: Dict[Tuple[int, ...], medal.StateAnalysis] = {}
         self._pending_grandchild: Optional[Dict[str, Any]] = None
-
-    def _compute_two_step_reward(
-        self, parent_entropy: float, child_entropy: float, grandchild_entropy: float
-    ) -> float:
-        if self.reward_mode == "srig":
-            return compute_srig_reward(
-                parent_entropy, child_entropy, grandchild_entropy, self.reward_lambda, self.config.epsilon
-            )
-        return compute_fig_reward(parent_entropy, grandchild_entropy, self.config.epsilon)
 
     def _snapshot_checkpoint(self, budget: int, stop_reason: str = "model_call_budget") -> Dict[str, Any]:
         evaluated_source = [n for n in self.nodes if n.evaluation_order is not None]
@@ -781,7 +890,10 @@ class E2ABMEDALSearch(ABMEDALSearch):
             node_id: list(history) for node_id, history in self.decision_history.items()
         }
 
-        reward = medal.information_gain(
+        reward, common_mask_count = self._compute_one_step_fallback(
+            parent_copy.analysis, child_analysis, child_copy.state
+        )
+        rig_step1 = medal.information_gain(
             parent_copy.analysis.total_entropy, child_analysis.total_entropy, self.config.epsilon
         )
         sim_order = self.simulations_completed + 1
@@ -824,10 +936,11 @@ class E2ABMEDALSearch(ABMEDALSearch):
             "entropy_before": parent_copy.analysis.total_entropy,
             "entropy_child": child_analysis.total_entropy,
             "entropy_grandchild": None,
-            "rig_step1": reward,
+            "rig_step1": rig_step1,
             "rig_step2": 0.0,
             "reward_lambda": self.reward_lambda,
             "reward_mode": self.reward_mode,
+            "common_mask_count": common_mask_count,
             "lookahead_available": False,
             "lookahead_status": "budget_boundary_fallback",
             "reward": reward,
@@ -1000,10 +1113,10 @@ class E2ABMEDALSearch(ABMEDALSearch):
 
         remaining_masks = int((child.state[0, self.prompt_len:] == self.mask_id).sum().item())
 
-        # Case A: Terminal child (0 remaining masks -> H(child) = 0, second-step gain = 0)
+        # Case A: Terminal child (0 remaining masks -> H(child) = 0, second-step gain = 0, |M(g*)| = 0 -> CMER = 0)
         if remaining_masks == 0:
-            reward = self._compute_two_step_reward(
-                parent.analysis.total_entropy, child_analysis.total_entropy, 0.0
+            reward, common_mask_count = self._compute_two_step_reward(
+                parent.analysis, child_analysis, None
             )
             self._apply_evaluation_result(
                 child,
@@ -1015,13 +1128,14 @@ class E2ABMEDALSearch(ABMEDALSearch):
                 grandchild_entropy=0.0,
                 lookahead_available=True,
                 lookahead_status="terminal_child",
+                common_mask_count=common_mask_count,
             )
             return
 
-        # Case B: Non-terminal child with no legal actions -> do NOT substitute H(g) = 0; fallback to 1-step IG
+        # Case B: Non-terminal child with no legal actions -> fallback to reward-consistent 1-step reward
         if not child_analysis.actions:
-            reward = medal.information_gain(
-                parent.analysis.total_entropy, child_analysis.total_entropy, self.config.epsilon
+            reward, common_mask_count = self._compute_one_step_fallback(
+                parent.analysis, child_analysis, child.state
             )
             self._apply_evaluation_result(
                 child,
@@ -1033,6 +1147,7 @@ class E2ABMEDALSearch(ABMEDALSearch):
                 grandchild_entropy=None,
                 lookahead_available=False,
                 lookahead_status="no_legal_actions",
+                common_mask_count=common_mask_count,
             )
             return
 
@@ -1053,8 +1168,8 @@ class E2ABMEDALSearch(ABMEDALSearch):
         if g_key in self.cached_analyses:
             g_analysis = self.cached_analyses[g_key]
             grandchild.analysis = g_analysis
-            reward = self._compute_two_step_reward(
-                parent.analysis.total_entropy, child_analysis.total_entropy, g_analysis.total_entropy
+            reward, common_mask_count = self._compute_two_step_reward(
+                parent.analysis, child_analysis, g_analysis, grandchild.state
             )
             self._apply_evaluation_result(
                 child,
@@ -1066,13 +1181,14 @@ class E2ABMEDALSearch(ABMEDALSearch):
                 grandchild_entropy=g_analysis.total_entropy,
                 lookahead_available=True,
                 lookahead_status="cached_grandchild",
+                common_mask_count=common_mask_count,
             )
             return
 
         # Case C2: Grandchild is uncached (requires 1 new model forward pass)
         if self._at_cap():
-            reward = medal.information_gain(
-                parent.analysis.total_entropy, child_analysis.total_entropy, self.config.epsilon
+            reward, common_mask_count = self._compute_one_step_fallback(
+                parent.analysis, child_analysis, child.state
             )
             self._apply_evaluation_result(
                 child,
@@ -1084,6 +1200,7 @@ class E2ABMEDALSearch(ABMEDALSearch):
                 grandchild_entropy=None,
                 lookahead_available=False,
                 lookahead_status="budget_boundary_fallback",
+                common_mask_count=common_mask_count,
             )
             return
 
@@ -1128,8 +1245,8 @@ class E2ABMEDALSearch(ABMEDALSearch):
         self.cached_analyses[medal._state_key(grandchild.state)] = g_analysis
 
         grandchild_entropy = g_analysis.total_entropy
-        reward = self._compute_two_step_reward(
-            parent.analysis.total_entropy, child_analysis.total_entropy, grandchild_entropy
+        reward, common_mask_count = self._compute_two_step_reward(
+            parent.analysis, child_analysis, g_analysis, grandchild.state
         )
         self._apply_evaluation_result(
             child,
@@ -1141,6 +1258,7 @@ class E2ABMEDALSearch(ABMEDALSearch):
             grandchild_entropy=grandchild_entropy,
             lookahead_available=True,
             lookahead_status=lookahead_status,
+            common_mask_count=common_mask_count,
         )
 
     def _apply_evaluation_result(
@@ -1155,6 +1273,7 @@ class E2ABMEDALSearch(ABMEDALSearch):
         *,
         lookahead_available: bool = True,
         lookahead_status: str = "evaluated_grandchild",
+        common_mask_count: Optional[int] = None,
     ):
         child.analysis = child_analysis
         self.cached_analyses[medal._state_key(child.state)] = child_analysis
@@ -1182,6 +1301,7 @@ class E2ABMEDALSearch(ABMEDALSearch):
             "rig_step2": rig_step2,
             "reward_lambda": self.reward_lambda,
             "reward_mode": self.reward_mode,
+            "common_mask_count": common_mask_count,
             "lookahead_available": lookahead_available,
             "lookahead_status": lookahead_status,
             "reward": reward,

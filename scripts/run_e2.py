@@ -29,6 +29,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 
+from dlm_project.decoding.e2_search import VALID_REWARD_MODES
 from dlm_project.experiments.sweep_report import write_csv
 from dlm_project.tasks.gsm8k.experiment_2 import (
     CHECKPOINT_BUDGETS,
@@ -130,9 +131,9 @@ def main(argv=None) -> int:
     )
     parser.add_argument(
         "--reward-mode",
-        choices=["fig", "srig"],
+        choices=list(VALID_REWARD_MODES),
         default="fig",
-        help="Two-step lookahead reward function: 'fig' (Fractional IG) or 'srig' (Sum of Relative IG).",
+        help="Two-step lookahead reward function: 'fig' (Fractional IG), 'srig' (Sum of Relative IG), or 'cmer' (Common-Mask Entropy Reduction).",
     )
     parser.add_argument(
         "--reward-lambda",

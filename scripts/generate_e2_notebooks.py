@@ -606,29 +606,121 @@ def create_e2_eval_notebook():
     print(f"Generated {out_path} ({len(cells)} cells)")
 
 
-def create_e2_srig_dev_notebook():
+REWARD_NOTEBOOK_SPECS = {
+    "srig": {
+        "mode": "srig",
+        "upper": "SRIG",
+        "full_name": "Sum of Relative Information Gains (SRIG)",
+        "symbol_label": "SRIG / $\\text{Future}R_{ig}$",
+        "dev_filename": "E2_Experiment_SRIG_Dev.ipynb",
+        "eval_filename": "E2_Experiment_SRIG_Eval.ipynb",
+        "dev_output_subdir": "results/e2_srig_dev",
+        "eval_output_subdir": "results/e2_srig_eval",
+        "reward_lambda": 1.0,
+        "dev_equation_md": (
+            "For each candidate child state $s_i$, search projects the highest-confidence action "
+            "$a^*_i \\in A(s_i)$ to form virtual grandchild $g_i^* = s_i \\oplus a^*_i$, "
+            "computing the two-step sum of relative information gains:\n"
+            "$$\n"
+            "\\text{Future}R_{ig}(s, a_i) = R_{ig}(s, s_i) + \\lambda \\, R_{ig}(s_i, g_i^*) "
+            "= \\frac{H(s) - H(s_i)}{\\max(H(s), \\epsilon)} "
+            "+ \\lambda \\frac{H(s_i) - H(g_i^*)}{\\max(H(s_i), \\epsilon)}\n"
+            "$$\n\n"
+        ),
+        "extra_rule_md": (
+            "- **Terminal vs. Actionless Children**: Terminal children ($0$ masks remaining) have "
+            "$H(s_i) = 0$ and $R_{ig}(s_i, g_i^*) = 0$. Actionless non-terminal children fallback to "
+            "1-step $R_{ig}(s, s_i)$ without fabricating $H(g) = 0$.\n"
+        ),
+        "unit_test_md": (
+            "Run unit tests to verify 2-step lookahead SRIG reward computation, "
+            "exact checkpoint boundaries, and state caching."
+        ),
+        "unit_test_eval_md": (
+            "Verify 2-step lookahead SRIG reward computation, state caching, "
+            "and batched parity before loading weights."
+        ),
+        "controls_md": (
+            "Configure 5-question frozen `dev` set, matched search budgets [256, 512], "
+            "SRIG reward mode with $\\lambda=1.0$, and $4B$ simulation cap."
+        ),
+        "controls_eval_md": (
+            "Configure budgets [256, 512], depth 10, batch size 2, SRIG reward mode, "
+            "and load `LLaDA-8B-Instruct` from staged NVMe storage."
+        ),
+    },
+    "cmer": {
+        "mode": "cmer",
+        "upper": "CMER",
+        "full_name": "Common-Mask Entropy Reduction (CMER)",
+        "symbol_label": "CMER ($R_{\\mathrm{CMER}}$)",
+        "dev_filename": "E2_Experiment_CMER_Dev.ipynb",
+        "eval_filename": "E2_Experiment_CMER_Eval.ipynb",
+        "dev_output_subdir": "results/e2_cmer_dev",
+        "eval_output_subdir": "results/e2_cmer_eval",
+        "reward_lambda": 1.0,
+        "dev_equation_md": (
+            "For parent state $s$, expanded child state $s_i$, and greedy virtual grandchild "
+            "$g_i^* = s_i \\oplus a^*_i$ ($a^*_i = A(s_i)[0]$), reward is averaged strictly over "
+            "positions $\\mathcal{M}(g_i^*)$ that remain masked in the grandchild (so merely "
+            "unmasking positions does not yield positive reward):\n"
+            "$$\n"
+            "R_{\\mathrm{CMER}}(s, g_i^*) = \\frac{1}{|\\mathcal{M}(g_i^*)|} "
+            "\\sum_{j \\in \\mathcal{M}(g_i^*)} \\left[ h_j(s) - h_j(g_i^*) \\right], "
+            "\\qquad h_j(s) = -\\sum_v p_\\theta(v \\mid j, s) \\log p_\\theta(v \\mid j, s)\n"
+            "$$\n\n"
+        ),
+        "extra_rule_md": (
+            "- **Position-Wise Entropy Reuse**: `StateAnalysis.entropies` already stores "
+            "$\\mathbf{h}(s)$ from the single forward pass, adding **0 extra NFEs**.\n"
+            "- **Empty Common Masks & Uniform 1-Step CMER Fallback**: When $|\\mathcal{M}(g_i^*)| = 0$ "
+            "(terminal child or grandchild filling the last mask), $R_{\\mathrm{CMER}} = 0.0$. "
+            "When lookahead is unavailable (actionless non-terminal child or NFE boundary fallback), "
+            "reward uses the 1-step CMER fallback $\\frac{1}{|\\mathcal{M}(s_i)|}"
+            "\\sum_{j \\in \\mathcal{M}(s_i)} [h_j(s) - h_j(s_i)]$ (never mixing SRIG/FIG rewards).\n"
+        ),
+        "unit_test_md": (
+            "Run unit tests to verify 2-step lookahead CMER reward computation, 1-step CMER fallback, "
+            "exact checkpoint boundaries, and state caching."
+        ),
+        "unit_test_eval_md": (
+            "Verify 2-step lookahead CMER reward computation, 1-step CMER fallback, state caching, "
+            "and batched parity before loading weights."
+        ),
+        "controls_md": (
+            "Configure 5-question frozen `dev` set, matched search budgets [256, 512], "
+            "CMER reward mode, and $4B$ simulation cap."
+        ),
+        "controls_eval_md": (
+            "Configure budgets [256, 512], depth 10, batch size 2, CMER reward mode, "
+            "and load `LLaDA-8B-Instruct` from staged NVMe storage."
+        ),
+    },
+}
+
+
+def _create_e2_reward_dev_notebook(spec: dict):
+    mode = spec["mode"]
+    upper = spec["upper"]
     nb = nbf.v4.new_notebook()
     cells = []
 
     # Badge & Header
     cells.append(nbf.v4.new_markdown_cell(
-        '<a href="https://colab.research.google.com/github/CooL-Legend/CSCI544-DLM/blob/adi-e2/notebooks/gsm8k/E2_Experiment_SRIG_Dev.ipynb" target="_parent"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open in Colab"/></a>'
+        f'<a href="https://colab.research.google.com/github/CooL-Legend/CSCI544-DLM/blob/adi-e2/notebooks/gsm8k/{spec["dev_filename"]}" target="_parent"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open in Colab"/></a>'
     ))
     cells.append(nbf.v4.new_markdown_cell(
-        "# Experiment 2: Two-Step Lookahead MEDAL vs. AB-MEDAL on GSM8K with Sum of Relative Information Gains (SRIG) — Dev (5 Questions)\n\n"
-        "This notebook evaluates **Experiment 2 (E2)** comparing **MEDAL** and **AB-MEDAL** on GSM8K using the **Two-Step Sum of Relative Information Gains (SRIG / $\\text{Future}R_{ig}$)** reward function with `LLaDA-8B-Instruct`.\n\n"
+        f"# Experiment 2: Two-Step Lookahead MEDAL vs. AB-MEDAL on GSM8K with {spec['full_name']} — Dev (5 Questions)\n\n"
+        f"This notebook evaluates **Experiment 2 (E2)** comparing **MEDAL** and **AB-MEDAL** on GSM8K using the **Two-Step {spec['symbol_label']}** reward function with `LLaDA-8B-Instruct`.\n\n"
         "### Mathematical Formulation:\n"
-        "For each candidate child state $s_i$, search projects the highest-confidence action $a^*_i \\in A(s_i)$ to form virtual grandchild $g_i^* = s_i \\oplus a^*_i$, computing the two-step sum of relative information gains:\n"
-        "$$\n"
-        "\\text{Future}R_{ig}(s, a_i) = R_{ig}(s, s_i) + \\lambda \\, R_{ig}(s_i, g_i^*) = \\frac{H(s) - H(s_i)}{\\max(H(s), \\epsilon)} + \\lambda \\frac{H(s_i) - H(g_i^*)}{\\max(H(s_i), \\epsilon)}\n"
-        "$$\n\n"
-        "### Key Algorithmic & Protocol Rules:\n"
+        + spec["dev_equation_md"]
+        + "### Key Algorithmic & Protocol Rules:\n"
         "- **Search Budget $B \\in \\{256, 512\\}$**: Measured in actual sequence model forward passes (per-sequence NFEs). Caching saves model forwards without consuming budget.\n"
         "- **Simulation Cap Safeguard ($4B$)**: Capped at $4B$ completed simulations per question to prevent nonterminating or runaway tree traversal loops over cached states. The NFE utilization metric $\\frac{\\text{actual NFEs}}{B}$ is monitored to verify whether the cap binds.\n"
         "- **Virtual Grandchildren ($g_i^*$)**: Evaluated and cached in `cached_analyses` to eliminate redundant forwards, but **never attached to the MCTS tree** and never assigned GEN/CONT posteriors.\n"
         "- **AB-MEDAL Second-Step Selection**: On `GEN`, the first step creates child $s_i$. The second step performs a forced greedy GEN ($a_i^* = A(s_i)[0]$) to construct $g_i^*$ without mutating $s_i$'s GEN/CONT posteriors or visit counts.\n"
-        "- **Terminal vs. Actionless Children**: Terminal children ($0$ masks remaining) have $H(s_i) = 0$ and $R_{ig}(s_i, g_i^*) = 0$. Actionless non-terminal children fallback to 1-step $R_{ig}(s, s_i)$ without fabricating $H(g) = 0$.\n"
-        "- **Exact Checkpoint Boundaries**: Snapshots at $B=256$ use non-mutating hypothetical boundary backups on isolated copies so that the snapshot exactly matches an independent $B=256$ run while the live tree continues seamlessly to $B=512$.\n"
+        + spec["extra_rule_md"]
+        + "- **Exact Checkpoint Boundaries**: Snapshots at $B=256$ use non-mutating hypothetical boundary backups on isolated copies so that the snapshot exactly matches an independent $B=256$ run while the live tree continues seamlessly to $B=512$.\n"
     ))
 
     # Section 1: Verify GPU
@@ -697,7 +789,7 @@ def create_e2_srig_dev_notebook():
     ))
 
     # Section 4: Unit tests
-    cells.append(nbf.v4.new_markdown_cell("## 4. Run Algorithmic Pre-Flight Unit Tests\nRun unit tests to verify 2-step lookahead SRIG reward computation, exact checkpoint boundaries, and state caching."))
+    cells.append(nbf.v4.new_markdown_cell(f"## 4. Run Algorithmic Pre-Flight Unit Tests\n{spec['unit_test_md']}"))
     cells.append(nbf.v4.new_code_cell(
         "import subprocess\n"
         "import sys\n\n"
@@ -718,11 +810,11 @@ def create_e2_srig_dev_notebook():
         "from pathlib import Path\n"
         "import os\n\n"
         "DRIVE_ROOT = Path('/content/drive/MyDrive/CSCI544-DLM')\n"
-        "OUTPUT_DIR = Path('results/e2_srig_dev')\n\n"
+        f"OUTPUT_DIR = Path({spec['dev_output_subdir']!r})\n\n"
         "if IN_COLAB:\n"
         "    from google.colab import drive\n"
         "    drive.mount('/content/drive')\n"
-        "    OUTPUT_DIR = DRIVE_ROOT / 'results/e2_srig_dev'\n"
+        f"    OUTPUT_DIR = DRIVE_ROOT / {spec['dev_output_subdir']!r}\n"
         "    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)\n"
         "    cache_dir = DRIVE_ROOT / 'cache/huggingface'\n"
         "    cache_dir.mkdir(parents=True, exist_ok=True)\n"
@@ -732,7 +824,7 @@ def create_e2_srig_dev_notebook():
     ))
 
     # Section 6: Experiment Controls
-    cells.append(nbf.v4.new_markdown_cell("## 6. Experiment Controls & Configuration\nConfigure 5-question frozen `dev` set, matched search budgets [256, 512], SRIG reward mode with $\\lambda=1.0$, and $4B$ simulation cap."))
+    cells.append(nbf.v4.new_markdown_cell(f"## 6. Experiment Controls & Configuration\n{spec['controls_md']}"))
     cells.append(nbf.v4.new_code_cell(
         "from dlm_project.tasks.gsm8k.experiment_2 import (\n"
         "    CHECKPOINT_BUDGETS, MAX_SEARCH_DEPTH, MIN_CANDIDATES, context\n"
@@ -740,8 +832,8 @@ def create_e2_srig_dev_notebook():
         "STAGE = 'dev'\n"
         "METHODS = ('medal', 'ab_medal')\n"
         "BUDGETS = (256, 512)\n"
-        "REWARD_MODE = 'srig'\n"
-        "REWARD_LAMBDA = 1.0\n"
+        f"REWARD_MODE = {mode!r}\n"
+        f"REWARD_LAMBDA = {spec['reward_lambda']}\n"
         "SIM_CAP_MULTIPLIER = 4\n"
         "# On NVIDIA L4 (22.4 GiB VRAM), BATCH_SIZE = 2 is recommended for stability;\n"
         "# BATCH_SIZE = 4 is suited for A100 (40/80 GB) or High-RAM runtimes.\n"
@@ -785,11 +877,11 @@ def create_e2_srig_dev_notebook():
     ))
 
     # Section 8: Execute Full E2 Dev
-    cells.append(nbf.v4.new_markdown_cell("## 8. Execute Experiment 2 (Dev (5 Questions))\nExecute MEDAL and AB-MEDAL with the 2-step lookahead SRIG reward across budgets 256 and 512."))
+    cells.append(nbf.v4.new_markdown_cell(f"## 8. Execute Experiment 2 (Dev (5 Questions))\nExecute MEDAL and AB-MEDAL with the 2-step lookahead {upper} reward across budgets 256 and 512."))
     cells.append(nbf.v4.new_code_cell(
         "from time import perf_counter\n"
         "from dlm_project.tasks.gsm8k.experiment_2 import run_e2_stage\n\n"
-        "print(f'Starting E2 SRIG execution on {len(ctx[\"examples\"])} questions for {METHODS} at budgets {BUDGETS}...')\n"
+        f"print(f'Starting E2 {upper} execution on {{len(ctx[\"examples\"])}} questions for {{METHODS}} at budgets {{BUDGETS}}...')\n"
         "t_start = perf_counter()\n"
         "q_rows, agg_rows = run_e2_stage(\n"
         "    wrapper,\n"
@@ -815,7 +907,7 @@ def create_e2_srig_dev_notebook():
         "agg_file = OUTPUT_DIR / 'summaries' / f'e2_{STAGE}_aggregate.csv'\n"
         "if agg_file.is_file():\n"
         "    df_agg = pd.read_csv(agg_file)\n"
-        "    print('=== E2 Dev Aggregate Metrics (SRIG Reward) ===')\n"
+        f"    print('=== E2 Dev Aggregate Metrics ({upper} Reward) ===')\n"
         "    cols = ['method', 'search_budget', 'sample_count', 'accuracy_percent', 'mean_nfe_utilization', 'mean_search_nfe', 'mean_simulations', 'sim_cap_bind_rate', 'mean_total_nfe', 'mean_selected_depth']\n"
         "    available_cols = [c for c in cols if c in df_agg.columns]\n"
         "    display(df_agg[available_cols])\n\n"
@@ -827,7 +919,7 @@ def create_e2_srig_dev_notebook():
     ))
 
     # Section 10: Search Tree Inspector
-    cells.append(nbf.v4.new_markdown_cell("## 10. Interactive Search Tree & Decision Trace Inspector\nExamine candidate shortlists, 2-step SRIG reward breakdowns, and lookahead state entropy drops."))
+    cells.append(nbf.v4.new_markdown_cell(f"## 10. Interactive Search Tree & Decision Trace Inspector\nExamine candidate shortlists, 2-step {upper} reward breakdowns, and lookahead state entropy drops."))
     cells.append(nbf.v4.new_code_cell(
         "import json\n\n"
         "sample_ex_id = prepared[0]['example']['example_id']\n"
@@ -883,35 +975,36 @@ def create_e2_srig_dev_notebook():
     ))
 
     nb.cells = cells
-    out_path = NOTEBOOKS_DIR / "E2_Experiment_SRIG_Dev.ipynb"
+    out_path = NOTEBOOKS_DIR / spec["dev_filename"]
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with out_path.open("w") as f:
         nbf.write(nb, f)
     print(f"Generated {out_path} ({len(cells)} cells)")
 
 
-def create_e2_srig_eval_notebook():
+def _create_e2_reward_eval_notebook(spec: dict):
+    mode = spec["mode"]
+    upper = spec["upper"]
     nb = nbf.v4.new_notebook()
     cells = []
 
     # Badge & Header
     cells.append(nbf.v4.new_markdown_cell(
-        '<a href="https://colab.research.google.com/github/CooL-Legend/CSCI544-DLM/blob/adi-e2/notebooks/gsm8k/E2_Experiment_SRIG_Eval.ipynb" target="_parent"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open in Colab"/></a>'
+        f'<a href="https://colab.research.google.com/github/CooL-Legend/CSCI544-DLM/blob/adi-e2/notebooks/gsm8k/{spec["eval_filename"]}" target="_parent"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open in Colab"/></a>'
     ))
     cells.append(nbf.v4.new_markdown_cell(
-        "# Experiment 2: Two-Step Lookahead MEDAL vs. AB-MEDAL on GSM8K with Sum of Relative Information Gains (SRIG) — Evaluation (20 Canonical + 50 Extended Questions)\n\n"
-        "This notebook runs **Experiment 2 (E2)** on the GSM8K validation/evaluation pool with `LLaDA-8B-Instruct` using the **Two-Step Sum of Relative Information Gains (SRIG / $\\text{Future}R_{ig}$)** reward function:\n"
-        "$$\n"
-        "\\text{Future}R_{ig}(s, a_i) = R_{ig}(s, s_i) + \\lambda \\, R_{ig}(s_i, g_i^*) = \\frac{H(s) - H(s_i)}{\\max(H(s), \\epsilon)} + \\lambda \\frac{H(s_i) - H(g_i^*)}{\\max(H(s_i), \\epsilon)}\n"
-        "$$\n\n"
-        "### Dataset Split Organization:\n"
+        f"# Experiment 2: Two-Step Lookahead MEDAL vs. AB-MEDAL on GSM8K with {spec['full_name']} — Evaluation (20 Canonical + 50 Extended Questions)\n\n"
+        f"This notebook runs **Experiment 2 (E2)** on the GSM8K validation/evaluation pool with `LLaDA-8B-Instruct` using the **Two-Step {spec['symbol_label']}** reward function:\n"
+        + spec["dev_equation_md"]
+        + "### Dataset Split Organization:\n"
         "1. **Canonical 20 Samples** (`sample_slice=(0, 20)`): The exact 20 evaluation questions from Experiment 1, preserving historical prefix ordering.\n"
         "2. **Additional 50 Samples** (`sample_slice=(20, 70)`): 50 new validation questions sampled under the deterministic `sample_seed=1` order.\n"
         "3. **Combined 70 Samples**: Full validation pool evaluation and paired statistical tests.\n\n"
         "### Guardrails & Protocols:\n"
         "- Capped at $4B$ simulations per question as an exploration runaway safeguard; actual NFE utilization is logged.\n"
         "- Virtual grandchildren are evaluated and cached in `cached_analyses` but never attached to the tree or assigned GEN/CONT posteriors.\n"
-        "- Non-mutating hypothetical boundary snapshots ensure standalone $B=256$ equivalence without altering live tree execution toward $B=512$.\n"
+        + spec["extra_rule_md"]
+        + "- Non-mutating hypothetical boundary snapshots ensure standalone $B=256$ equivalence without altering live tree execution toward $B=512$.\n"
     ))
 
     # Section 1: GPU Hardware
@@ -975,7 +1068,7 @@ def create_e2_srig_eval_notebook():
     ))
 
     # Section 4: Unit tests
-    cells.append(nbf.v4.new_markdown_cell("## 4. Run Algorithmic Pre-Flight Unit Tests\nVerify 2-step lookahead SRIG reward computation, state caching, and batched parity before loading weights."))
+    cells.append(nbf.v4.new_markdown_cell(f"## 4. Run Algorithmic Pre-Flight Unit Tests\n{spec['unit_test_eval_md']}"))
     cells.append(nbf.v4.new_code_cell(
         "import subprocess\n"
         "import sys\n\n"
@@ -996,11 +1089,11 @@ def create_e2_srig_eval_notebook():
         "from pathlib import Path\n"
         "import os\n\n"
         "DRIVE_ROOT = Path('/content/drive/MyDrive/CSCI544-DLM')\n"
-        "OUTPUT_DIR = Path('results/e2_srig_eval')\n\n"
+        f"OUTPUT_DIR = Path({spec['eval_output_subdir']!r})\n\n"
         "if IN_COLAB:\n"
         "    from google.colab import drive\n"
         "    drive.mount('/content/drive')\n"
-        "    OUTPUT_DIR = DRIVE_ROOT / 'results/e2_srig_eval'\n"
+        f"    OUTPUT_DIR = DRIVE_ROOT / {spec['eval_output_subdir']!r}\n"
         "    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)\n"
         "    cache_dir = DRIVE_ROOT / 'cache/huggingface'\n"
         "    cache_dir.mkdir(parents=True, exist_ok=True)\n"
@@ -1010,7 +1103,7 @@ def create_e2_srig_eval_notebook():
     ))
 
     # Section 6: Controls & Model Loading
-    cells.append(nbf.v4.new_markdown_cell("## 6. Experiment Controls & Staged Model Loading\nConfigure budgets [256, 512], depth 10, batch size 2, SRIG reward mode, and load `LLaDA-8B-Instruct` from staged NVMe storage."))
+    cells.append(nbf.v4.new_markdown_cell(f"## 6. Experiment Controls & Staged Model Loading\n{spec['controls_eval_md']}"))
     cells.append(nbf.v4.new_code_cell(
         "import shutil\n"
         "from pathlib import Path\n"
@@ -1021,8 +1114,8 @@ def create_e2_srig_eval_notebook():
         "STAGE = 'evaluation'\n"
         "METHODS = ('medal', 'ab_medal')\n"
         "BUDGETS = (256, 512)\n"
-        "REWARD_MODE = 'srig'\n"
-        "REWARD_LAMBDA = 1.0\n"
+        f"REWARD_MODE = {mode!r}\n"
+        f"REWARD_LAMBDA = {spec['reward_lambda']}\n"
         "SIM_CAP_MULTIPLIER = 4\n"
         "# On NVIDIA L4 (22.4 GiB VRAM), BATCH_SIZE = 2 is recommended for stability;\n"
         "# BATCH_SIZE = 4 is suited for A100 (40/80 GB) or High-RAM runtimes.\n"
@@ -1069,7 +1162,7 @@ def create_e2_srig_eval_notebook():
         "    reward_lambda=REWARD_LAMBDA,\n"
         "    sim_cap_multiplier=SIM_CAP_MULTIPLIER,\n"
         ")\n"
-        "print(f'Starting Part 1 (Canonical 20 Questions) with SRIG reward...')\n"
+        f"print('Starting Part 1 (Canonical 20 Questions) with {upper} reward...')\n"
         "t0 = perf_counter()\n"
         "q_rows_20, agg_rows_20 = run_e2_stage(\n"
         "    wrapper,\n"
@@ -1100,7 +1193,7 @@ def create_e2_srig_eval_notebook():
         "    reward_lambda=REWARD_LAMBDA,\n"
         "    sim_cap_multiplier=SIM_CAP_MULTIPLIER,\n"
         ")\n"
-        "print(f'Starting Part 2 (Additional 50 Questions) with SRIG reward...')\n"
+        f"print('Starting Part 2 (Additional 50 Questions) with {upper} reward...')\n"
         "t0 = perf_counter()\n"
         "q_rows_50, agg_rows_50 = run_e2_stage(\n"
         "    wrapper,\n"
@@ -1130,21 +1223,21 @@ def create_e2_srig_eval_notebook():
         "if paired_20:\n"
         "    df_p20 = pd.DataFrame(paired_20)[['search_budget', 'paired_questions', 'medal_accuracy', 'ab_medal_accuracy', 'accuracy_delta_percent', 'ab_medal_only_correct', 'medal_only_correct', 'mcnemar_exact_p']]\n"
         "    display(df_p20)\n"
-        "    write_csv(summaries_dir / 'e2_srig_canonical_20_paired_comparison.csv', paired_20)\n\n"
+        f"    write_csv(summaries_dir / 'e2_{mode}_canonical_20_paired_comparison.csv', paired_20)\n\n"
         "print('=== Part 2: Additional 50 Questions Paired Comparison ===')\n"
         "paired_50 = compute_paired_comparison(q_rows_50, budgets=BUDGETS)\n"
         "if paired_50:\n"
         "    df_p50 = pd.DataFrame(paired_50)[['search_budget', 'paired_questions', 'medal_accuracy', 'ab_medal_accuracy', 'accuracy_delta_percent', 'ab_medal_only_correct', 'medal_only_correct', 'mcnemar_exact_p']]\n"
         "    display(df_p50)\n"
-        "    write_csv(summaries_dir / 'e2_srig_extended_50_paired_comparison.csv', paired_50)\n\n"
+        f"    write_csv(summaries_dir / 'e2_{mode}_extended_50_paired_comparison.csv', paired_50)\n\n"
         "print('=== Combined Pool (All 70 Questions) Paired Comparison ===')\n"
         "combined_q_rows = q_rows_20 + q_rows_50\n"
         "paired_combined = compute_paired_comparison(combined_q_rows, budgets=BUDGETS)\n"
         "if paired_combined:\n"
         "    df_pcomb = pd.DataFrame(paired_combined)[['search_budget', 'paired_questions', 'medal_accuracy', 'ab_medal_accuracy', 'accuracy_delta_percent', 'ab_medal_only_correct', 'medal_only_correct', 'mcnemar_exact_p']]\n"
         "    display(df_pcomb)\n"
-        "    write_csv(summaries_dir / 'e2_srig_combined_70_paired_comparison.csv', paired_combined)\n"
-        "    write_csv(summaries_dir / 'e2_srig_evaluation_paired_comparison.csv', paired_combined)\n"
+        f"    write_csv(summaries_dir / 'e2_{mode}_combined_70_paired_comparison.csv', paired_combined)\n"
+        f"    write_csv(summaries_dir / 'e2_{mode}_evaluation_paired_comparison.csv', paired_combined)\n"
     ))
 
     # Section 10: Interactive Search Tree & Decision Trace Inspector
@@ -1236,11 +1329,27 @@ def create_e2_srig_eval_notebook():
     ))
 
     nb.cells = cells
-    out_path = NOTEBOOKS_DIR / "E2_Experiment_SRIG_Eval.ipynb"
+    out_path = NOTEBOOKS_DIR / spec["eval_filename"]
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with out_path.open("w") as f:
         nbf.write(nb, f)
     print(f"Generated {out_path} ({len(cells)} cells)")
+
+
+def create_e2_srig_dev_notebook():
+    _create_e2_reward_dev_notebook(REWARD_NOTEBOOK_SPECS["srig"])
+
+
+def create_e2_srig_eval_notebook():
+    _create_e2_reward_eval_notebook(REWARD_NOTEBOOK_SPECS["srig"])
+
+
+def create_e2_cmer_dev_notebook():
+    _create_e2_reward_dev_notebook(REWARD_NOTEBOOK_SPECS["cmer"])
+
+
+def create_e2_cmer_eval_notebook():
+    _create_e2_reward_eval_notebook(REWARD_NOTEBOOK_SPECS["cmer"])
 
 
 def main():
@@ -1248,6 +1357,8 @@ def main():
     create_e2_eval_notebook()
     create_e2_srig_dev_notebook()
     create_e2_srig_eval_notebook()
+    create_e2_cmer_dev_notebook()
+    create_e2_cmer_eval_notebook()
 
 
 if __name__ == "__main__":
