@@ -37,6 +37,9 @@ This repository is private. Authorize Colab to read it through GitHub, or downlo
 
 ## Repository structure
 
+For GPU-backed Jupyter smoke tests, measured batch sizing and the 500-question
+Slurm run, see the [CARC deployment and resource profiling guide](docs/carc.md).
+
 ```text
 src/dlm_project/
 ├── models/                 # LLaDA wrapper, model profiles, snapshot caching

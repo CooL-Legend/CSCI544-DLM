@@ -27,6 +27,13 @@ from dlm_project.decoding.medal_batch import CooperativeMEDALSearch
 from dlm_project.decoding.medal_demo import DecodingResult, run_completion
 from dlm_project.decoding import search_audit
 from dlm_project.experiments.artifacts import save_json
+from dlm_project.experiments.resources import (
+    profiled_stage, resource_phase, watch_checkpoints, record_prepared,
+    record_batch, record_completed, synchronize,
+)
+from dlm_project.experiments.resume import (
+    resume_signature, validate_resume, question_complete, begin_question, finish_question,
+)
 from dlm_project.experiments.manifests import digest
 from dlm_project.experiments.paths import create_run_directory
 from dlm_project.experiments.sweep_report import wilson_interval, write_csv
@@ -122,6 +129,7 @@ def _jsonl(path: Path, rows: Sequence[Dict[str, Any]]):
             f.write(json.dumps(row, allow_nan=False) + "\n")
 
 
+@resource_phase("search")
 def execute_search_checkpointed(wrapper, prepared_item, ctx, method: str,
                                  budgets: Tuple[int, ...] = CHECKPOINT_BUDGETS,
                                  max_depth: int = MAX_SEARCH_DEPTH,
@@ -156,8 +164,11 @@ def execute_search_checkpointed(wrapper, prepared_item, ctx, method: str,
         checkpoint_budgets=tuple(sorted(budgets)),
     )
 
+    sync(wrapper.model)
     t0 = perf_counter()
+    watch_checkpoints(search, wrapper.model, t0)
     search.run()
+    sync(wrapper.model)
     search_time = perf_counter() - t0
 
     # Ensure all requested checkpoints are populated (including early finish)
@@ -168,6 +179,7 @@ def execute_search_checkpointed(wrapper, prepared_item, ctx, method: str,
     return search, search_time
 
 
+@resource_phase("completion")
 def complete_selected_state(wrapper, selected_state, prepared_item, ctx, completion_cache=None):
     """Complete a selected state with caching."""
     s_hash = state_hash(selected_state)
@@ -213,6 +225,7 @@ def complete_selected_state(wrapper, selected_state, prepared_item, ctx, complet
 
 
 @torch.inference_mode()
+@resource_phase("search")
 def execute_search_batch_checkpointed(wrapper, prepared_group, ctx, method: str,
                                       budgets: Tuple[int, ...] = CHECKPOINT_BUDGETS,
                                       max_depth: int = MAX_SEARCH_DEPTH,
@@ -254,6 +267,8 @@ def execute_search_batch_checkpointed(wrapper, prepared_group, ctx, method: str,
     pad_token_id = ctx["pad_token_id"]
     sync(wrapper.model)
     t0 = perf_counter()
+    for tree in trees:
+        watch_checkpoints(tree, wrapper.model, t0)
     search_latencies = [None] * len(trees)
     invocation_id = 0
 
@@ -299,6 +314,7 @@ def execute_search_batch_checkpointed(wrapper, prepared_group, ctx, method: str,
 
 
 @torch.inference_mode()
+@resource_phase("completion")
 def complete_selected_states_batch(wrapper, completion_requests, ctx, completion_cache=None):
     """Complete a batch of (prepared_item, selected_state, budget) requests with caching."""
     results_map = {}
@@ -417,6 +433,7 @@ def complete_selected_states_batch(wrapper, completion_requests, ctx, completion
     return results_map
 
 
+@resource_phase("artifacts")
 def export_question_e1_artifacts(wrapper, search, search_time: float, prepared_item, ctx, method: str,
                                  base_dir: Path,
                                  budgets: Tuple[int, ...] = CHECKPOINT_BUDGETS,
@@ -427,6 +444,7 @@ def export_question_e1_artifacts(wrapper, search, search_time: float, prepared_i
     """Export all per-question and per-checkpoint E1 artifacts from a completed search."""
     q_dir = base_dir / method / prepared_item["example"]["example_id"]
     q_dir.mkdir(parents=True, exist_ok=True)
+    begin_question(q_dir)
 
     # 1. Overall question trace files
     events = [_compact(e) for e in search.trace]
@@ -558,9 +576,9 @@ def export_question_e1_artifacts(wrapper, search, search_time: float, prepared_i
             "search_nfes": budget,
             "completion_nfes": comp_nfes,
             "total_nfes": total_nfes,
-            "search_wall_seconds": search_time * (budget / max(budgets)),
+            "search_wall_seconds": chk["search_elapsed_seconds"],
             "completion_wall_seconds": comp_time,
-            "total_wall_seconds": (search_time * (budget / max(budgets))) + comp_time,
+            "total_wall_seconds": (chk["search_elapsed_seconds"]) + comp_time,
             "max_depth_reached": chk["max_depth_reached"],
             "selected_depth": chk["selected_depth"],
             "selection_depth_gap": chk["selection_depth_gap"],
@@ -581,7 +599,7 @@ def export_question_e1_artifacts(wrapper, search, search_time: float, prepared_i
         checkpoint_results.append(checkpoint_row)
 
         match_sym = "✓" if score["exact_match"] else "✗"
-        total_time = (search_time * (budget / max(budgets))) + comp_time
+        total_time = (chk["search_elapsed_seconds"]) + comp_time
         print(
             f"  [{match_sym} Budget {budget:4d}] Q: {prepared_item['example']['example_id']:<10} | "
             f"Model: {method.upper():8s} | Pred: {score['predicted_answer']!r:<10} | "
@@ -589,6 +607,7 @@ def export_question_e1_artifacts(wrapper, search, search_time: float, prepared_i
             flush=True,
         )
 
+    finish_question(q_dir, method, prepared_item["example"]["example_id"], budgets)
     return checkpoint_results
 
 
@@ -653,21 +672,7 @@ def run_questions_batch_e1(wrapper, prepared_group, ctx, method: str,
 
 
 def is_question_complete(stage_dir: Path, method: str, ex_id: str, budgets: Sequence[int]) -> bool:
-    """Check if all checkpoint artifacts and traces for a question exist and are valid on disk."""
-    q_dir = stage_dir / method / ex_id
-    if not (q_dir / "trace.jsonl").is_file():
-        return False
-    for b in budgets:
-        met_file = q_dir / "checkpoints" / str(b) / "metrics.json"
-        if not met_file.is_file():
-            return False
-        try:
-            row = json.loads(met_file.read_text())
-            if not isinstance(row, dict) or "exact_match" not in row or "predicted_answer" not in row:
-                return False
-        except Exception:
-            return False
-    return True
+    return question_complete(stage_dir, method, ex_id, budgets)
 
 
 def load_completed_question_rows(stage_dir: Path, method: str, ex_id: str, budgets: Sequence[int]) -> List[Dict[str, Any]]:
@@ -718,6 +723,7 @@ def compute_e1_aggregate_rows(all_checkpoint_rows: List[Dict[str, Any]], stage: 
     return agg_rows
 
 
+@resource_phase("artifacts")
 def save_e1_progress(output_dir: Path, summaries_dir: Path, stage: str,
                      all_checkpoint_rows: List[Dict[str, Any]],
                      methods: Sequence[str], budgets: Sequence[int],
@@ -747,10 +753,11 @@ def save_e1_progress(output_dir: Path, summaries_dir: Path, stage: str,
     return agg_rows
 
 
+@profiled_stage
 def run_e1_stage(wrapper, ctx, output_dir: Path, methods=("medal", "ab_medal"),
                  budgets=CHECKPOINT_BUDGETS, max_depth=MAX_SEARCH_DEPTH,
                  num_candidates=MIN_CANDIDATES, resume: bool = True,
-                 batch_size: int = 1):
+                 batch_size: int = 1, profile_resources: bool = False):
     """Execute complete E1 stage for all methods with incremental saving, resumption, and optional cooperative batching."""
     if type(batch_size) is not int or batch_size < 1:
         raise ValueError("batch_size must be a positive integer.")
@@ -760,6 +767,9 @@ def run_e1_stage(wrapper, ctx, output_dir: Path, methods=("medal", "ab_medal"),
     summaries_dir.mkdir(parents=True, exist_ok=True)
 
     prepared = prepare(wrapper, ctx)
+    record_prepared(prepared)
+    signature = resume_signature(ctx, prepared, methods, budgets, max_depth, num_candidates, batch_size)
+    validate_resume(output_dir, ctx["stage"], signature, resume)
     all_checkpoint_rows = []
     completion_cache = {}
 
@@ -776,6 +786,7 @@ def run_e1_stage(wrapper, ctx, output_dir: Path, methods=("medal", "ab_medal"),
         "setup": ctx.get("setup", {}),
         "model": ctx.get("model", {}),
         "status": "in_progress",
+        "resume_signature": signature,
     }
     # Initial save of manifest
     save_json(output_dir / "run_manifest.json", manifest_data)
@@ -821,6 +832,7 @@ def run_e1_stage(wrapper, ctx, output_dir: Path, methods=("medal", "ab_medal"),
                 else:
                     pending_items.append(item)
 
+            record_batch(pending_items, cached_by_ex, method)
             computed_by_ex = defaultdict(list)
             if pending_items:
                 if batch_size == 1 or len(pending_items) == 1:
@@ -840,6 +852,7 @@ def run_e1_stage(wrapper, ctx, output_dir: Path, methods=("medal", "ab_medal"),
                     for r in rows:
                         computed_by_ex[r["example_id"]].append(r)
 
+            record_completed([r for rows in computed_by_ex.values() for r in rows])
             for item in group_items:
                 ex_id = item["example"]["example_id"]
                 rows_by_ex_method[(ex_id, method)] = (
@@ -899,5 +912,11 @@ def load_model(ctx=None, *, model_path=None, device="cuda", local_files_only=Fal
     """Load LLaDA wrapper for E1 experiments."""
     from dlm_project.models.llada import LLaDA
     dtype = ctx["common"]["model"]["dtype"] if ctx and "common" in ctx else "bfloat16"
-    return LLaDA(device=device, model_path=model_path, dtype=dtype, local_files_only=local_files_only)
+    started = perf_counter()
+    wrapper = LLaDA(device=device, model_path=model_path, dtype=dtype, local_files_only=local_files_only)
+    synchronize(wrapper.model)
+    wrapper.model_load_seconds = perf_counter() - started
+    if ctx is not None:
+        ctx.setdefault("setup", {})["model_load_seconds"] = wrapper.model_load_seconds
+    return wrapper
 

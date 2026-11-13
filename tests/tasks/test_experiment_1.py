@@ -266,7 +266,8 @@ def test_e1_test_script_and_gpu_profiler_and_notebooks():
     assert 'STAGE = "test"' in test_nb_src
     assert "NUM_SAMPLES = 2" in test_nb_src
     assert "BUDGETS = [256, 512]" in test_nb_src
-    assert "BATCH_SIZE = 2" in test_nb_src
+    assert "BATCH_SIZE = 4" in test_nb_src
+    assert "profile_resources=PROFILE_RESOURCES" in test_nb_src
 
 
 

@@ -34,6 +34,8 @@ from typing import Any, Dict, List, Sequence
 
 import torch
 
+from dlm_project.experiments.resources import finish_reporting
+
 from dlm_project.experiments.sweep_report import write_csv
 from dlm_project.tasks.gsm8k.e3_analysis import analyze_e3_stage
 from dlm_project.tasks.gsm8k.experiment_1 import (
@@ -117,8 +119,8 @@ def main(argv=None) -> int:
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=2,
-        help="Cooperative multi-question batch size (default: 2).",
+        default=4,
+        help="Cooperative multi-question batch size (default: 4).",
     )
     parser.add_argument(
         "--budgets",
@@ -168,7 +170,10 @@ def main(argv=None) -> int:
         default=True,
         help="Skip offline E3 diagnostic analysis after E1 completes.",
     )
+    parser.add_argument("--profile-resources", action="store_true",
+                        help="Measure actual batch memory, forwards and elapsed time in resource sidecars.")
     args = parser.parse_args(argv)
+    entrypoint_started = perf_counter()
 
     if torch.device(args.device).type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA is requested but unavailable on this host.")
@@ -215,9 +220,12 @@ def main(argv=None) -> int:
         num_candidates=args.num_candidates,
         resume=args.resume,
         batch_size=args.batch_size,
+        profile_resources=args.profile_resources,
     )
     total_time = perf_counter() - started
 
+    reporting_started = perf_counter()
+    offline_seconds = 0.0
     summaries_dir = args.output_dir / "summaries"
     paired_rows = compute_paired_comparison(q_rows, budgets=budgets)
     if paired_rows:
@@ -245,6 +253,7 @@ def main(argv=None) -> int:
             )
 
     if args.run_e3:
+        offline_started = perf_counter()
         print("\nLaunching Offline E3 Diagnostic Analysis (0 extra NFEs)...", flush=True)
         e3_rows, e3_agg = analyze_e3_stage(
             results_dir=args.output_dir / stage,
@@ -255,6 +264,13 @@ def main(argv=None) -> int:
         )
         print(f"E3 Analysis Complete: {len(e3_rows)} question-budget records and 6 figures saved to {summaries_dir / 'figures'}.")
 
+        offline_seconds = perf_counter() - offline_started
+
+    if args.profile_resources:
+        finish_reporting(args.output_dir,
+                         reporting_seconds=perf_counter() - reporting_started - offline_seconds,
+                         offline_seconds=offline_seconds,
+                         total_seconds=perf_counter() - entrypoint_started)
     return 0
 
 

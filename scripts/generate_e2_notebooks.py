@@ -1329,6 +1329,9 @@ def _create_e2_reward_eval_notebook(spec: dict):
     ))
 
     nb.cells = cells
+    if spec["mode"] == "srig":
+        from scripts.carc_notebook import configure_srig_eval
+        configure_srig_eval(nb)
     out_path = NOTEBOOKS_DIR / spec["eval_filename"]
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with out_path.open("w") as f:

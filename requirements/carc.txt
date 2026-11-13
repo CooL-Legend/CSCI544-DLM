@@ -1,0 +1,6 @@
+# Install a CUDA-enabled PyTorch build compatible with the allocated driver first.
+# Reuse the project's pinned LLaDA dependencies, then install the editable package.
+-r llada-colab.txt
+pandas>=2.0,<3.0
+seaborn>=0.13,<1.0
+ipykernel>=6.0,<8.0

@@ -11,6 +11,8 @@ from time import perf_counter
 
 import torch
 
+from dlm_project.experiments.resources import finish_reporting
+
 from dlm_project.tasks.gsm8k.experiment_1 import (
     CHECKPOINT_BUDGETS, MAX_SEARCH_DEPTH, MIN_CANDIDATES,
     context, load_model, run_e1_stage
@@ -33,7 +35,10 @@ def main(argv=None):
     parser.add_argument("--no-resume", action="store_false", dest="resume", default=True,
                         help="Disable checkpoint resumption and force re-running all questions from scratch.")
     parser.add_argument("--run-e3", action="store_true", help="Run E3 offline analysis on completion.")
+    parser.add_argument("--profile-resources", action="store_true",
+                        help="Measure actual batch memory, forwards and elapsed time in resource sidecars.")
     args = parser.parse_args(argv)
+    entrypoint_started = perf_counter()
 
     if torch.device(args.device).type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA is requested but unavailable.")
@@ -60,9 +65,12 @@ def main(argv=None):
         num_candidates=args.num_candidates,
         resume=args.resume,
         batch_size=args.batch_size,
+        profile_resources=args.profile_resources,
     )
     total_time = perf_counter() - started
 
+    reporting_started = perf_counter()
+    offline_seconds = 0.0
     print(f"\nE1 Stage '{args.stage}' Completed in {total_time:.2f}s:")
     print(f"  Total outcomes: {len(q_rows)}")
     print(f"  Artifacts saved to: {args.output_dir}")
@@ -75,6 +83,7 @@ def main(argv=None):
               f"Time={row['mean_total_wall_seconds']:.2f}s")
 
     if args.run_e3:
+        offline_started = perf_counter()
         print("\nLaunching E3 Offline Analysis...")
         from dlm_project.tasks.gsm8k.e3_analysis import analyze_e3_stage
         analyze_e3_stage(
@@ -85,6 +94,13 @@ def main(argv=None):
             budgets=tuple(args.budgets),
         )
 
+        offline_seconds = perf_counter() - offline_started
+
+    if args.profile_resources:
+        finish_reporting(args.output_dir,
+                         reporting_seconds=perf_counter() - reporting_started - offline_seconds,
+                         offline_seconds=offline_seconds,
+                         total_seconds=perf_counter() - entrypoint_started)
     return 0
 
 

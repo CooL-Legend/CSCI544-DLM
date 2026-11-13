@@ -29,6 +29,8 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 
+from dlm_project.experiments.resources import finish_reporting
+
 from dlm_project.decoding.e2_search import VALID_REWARD_MODES
 from dlm_project.experiments.sweep_report import write_csv
 from dlm_project.tasks.gsm8k.experiment_2 import (
@@ -190,7 +192,10 @@ def main(argv=None) -> int:
         action="store_true",
         help="Launch offline E3 diagnostic analysis after E2 completes.",
     )
+    parser.add_argument("--profile-resources", action="store_true",
+                        help="Measure actual batch memory, forwards and elapsed time in resource sidecars.")
     args = parser.parse_args(argv)
+    entrypoint_started = perf_counter()
 
     if torch.device(args.device).type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA is requested but unavailable on this host.")
@@ -252,9 +257,12 @@ def main(argv=None) -> int:
         num_candidates=args.num_candidates,
         resume=args.resume,
         batch_size=args.batch_size,
+        profile_resources=args.profile_resources,
     )
     total_time = perf_counter() - started
 
+    reporting_started = perf_counter()
+    offline_seconds = 0.0
     summaries_dir = args.output_dir / "summaries"
     paired_rows = compute_paired_comparison(q_rows, budgets=budgets)
     if paired_rows:
@@ -282,6 +290,7 @@ def main(argv=None) -> int:
             )
 
     if args.run_e3:
+        offline_started = perf_counter()
         print("\nLaunching Offline Diagnostic Analysis...", flush=True)
         from dlm_project.tasks.gsm8k.e3_analysis import analyze_e3_stage
         analyze_e3_stage(
@@ -292,6 +301,13 @@ def main(argv=None) -> int:
             budgets=budgets,
         )
 
+        offline_seconds = perf_counter() - offline_started
+
+    if args.profile_resources:
+        finish_reporting(args.output_dir,
+                         reporting_seconds=perf_counter() - reporting_started - offline_seconds,
+                         offline_seconds=offline_seconds,
+                         total_seconds=perf_counter() - entrypoint_started)
     return 0
 
 

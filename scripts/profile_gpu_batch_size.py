@@ -147,6 +147,7 @@ def estimate_vram_and_compute(
         sec_per_q_a100 = (total_nfes_per_q * (base_serial_nfe_sec_l4 / 2.45)) / a100_speedup
 
         rows.append({
+            "measurement_scope": "analytical_forward_estimate_not_full_pipeline",
             "batch_size": k,
             "max_seq_len": max_seq_len,
             "static_base_gib": round(static_weights_gib + cuda_context_gib, 2),
@@ -251,6 +252,7 @@ def run_empirical_cuda_sweep(
 
             sec_per_q = total_nfes_per_q / nfes_per_sec
             results.append({
+                "measurement_scope": "synthetic_forward_microbenchmark_not_full_pipeline",
                 "batch_size": k,
                 "status": "OK",
                 "gpu_name": gpu_name,
