@@ -70,6 +70,10 @@ def test_e1_run_question_checkpoints_and_artifacts(tmp_path, method):
         assert r["search_nfes"] == b
         assert r["completion_nfes"] == 256 - r["selected_depth"]
         assert r["total_nfes"] == b + (256 - r["selected_depth"])
+        assert r["nfe_utilization"] == 1.0
+        assert r["simulations_completed"] >= 1
+        assert r["simulation_cap_bound"] is False
+        assert r["reward_mode"] == "normalized_ig"
 
 
 def test_e1_completion_caching(tmp_path):
@@ -109,6 +113,9 @@ def test_e1_run_stage_csv_outputs(tmp_path):
     for row in agg_rows:
         assert 0.0 <= row["accuracy"] <= 1.0
         assert 0.0 <= row["ci_95_low"] <= row["ci_95_high"] <= 1.0
+        assert row["mean_nfe_utilization"] == 1.0
+        assert row["mean_simulations"] >= 1.0
+        assert row["sim_cap_bind_rate"] == 0.0
 
 
 def test_e1_incremental_saving_and_resumption(tmp_path):
@@ -202,6 +209,22 @@ def test_e1_extended_test_500_manifest_support():
     assert len({ex["example_id"] for ex in ctx_500["examples"]}) == 500
 
 
+def test_e1_context_e2_eval_slicing():
+    ctx_default = e1.context(stage="evaluation", methods=("medal", "ab_medal"))
+    ctx_20 = e1.context(stage="evaluation", methods=("medal", "ab_medal"), sample_slice=(0, 20))
+    ctx_50 = e1.context(stage="evaluation", methods=("medal", "ab_medal"), sample_slice=(20, 70))
+    ctx_70 = e1.context(stage="evaluation", methods=("medal", "ab_medal"), sample_slice=(0, 70))
+
+    assert len(ctx_default["examples"]) == 20
+    assert len(ctx_20["examples"]) == 20
+    assert len(ctx_50["examples"]) == 50
+    assert len(ctx_70["examples"]) == 70
+    assert ctx_20["examples"] == ctx_default["examples"]
+    assert ctx_70["examples"][:20] == ctx_20["examples"]
+    assert ctx_70["examples"][20:] == ctx_50["examples"]
+    assert len({ex["example_id"] for ex in ctx_70["examples"]}) == 70
+
+
 def test_e1_test_script_and_gpu_profiler_and_notebooks():
     import ast
     import json
@@ -257,6 +280,17 @@ def test_e1_test_script_and_gpu_profiler_and_notebooks():
         )
         assert "BATCH_SIZE = 4" in nb_src
         assert "batch_size=BATCH_SIZE" in nb_src
+
+    e1_eval_src = "\n".join(
+        "".join(c["source"])
+        for c in json.loads((PROJECT_ROOT / "notebooks/gsm8k/Experiment_1_Eval.ipynb").read_text())["cells"]
+        if c["cell_type"] == "code"
+    )
+    assert "sample_slice=(0, 20)" in e1_eval_src
+    assert "sample_slice=(20, 70)" in e1_eval_src
+    assert "compute_paired_comparison" in e1_eval_src
+    assert "mean_nfe_utilization" in e1_eval_src
+    assert "mean_simulations" in e1_eval_src
 
     test_nb_src = "\n".join(
         "".join(c["source"])
