@@ -23,6 +23,8 @@ from dlm_project.decoding.ab_batch import pack_states, sync
 from dlm_project.decoding.ab_medal import ABMEDALConfig, ABMEDALSearch
 from dlm_project.decoding.common import commit_from_logits
 from dlm_project.decoding.mcts_decoding import MCTSConfig, MCTSSearch, select_deepest_candidates
+# KLASS: Import the stability-based MCTS implementation.
+from dlm_project.decoding.mcts_decoding_klass import MCTSSearch as KLASSMCTSSearch
 from dlm_project.decoding.medal_batch import CooperativeMEDALSearch
 from dlm_project.decoding.medal_demo import DecodingResult, run_completion
 from dlm_project.decoding import search_audit
@@ -74,9 +76,12 @@ def context(*, stage="dev", methods=("medal", "ab_medal"), budgets=None,
     if not examples:
         raise ValueError(f"No examples found for stage {stage}.")
 
+    # KLASS: Allow stability-based MCTS as an experimental method.
     for m in methods:
-        if m not in ("medal", "ab_medal"):
-            raise ValueError(f"Unknown method {m}. Must be 'medal' or 'ab_medal'.")
+        if m not in ("medal", "ab_medal", "klass"):
+            raise ValueError(
+                f"Unknown method {m}. Must be 'medal', 'ab_medal', or 'klass'."
+            )
 
     return {
         "protocol_version": PROTOCOL_VERSION,
@@ -136,11 +141,18 @@ def execute_search_checkpointed(wrapper, prepared_item, ctx, method: str,
         stop_mode="budget",
         max_model_calls=max_budget,
     )
-
+    
     if method == "ab_medal":
         search_cfg = ABMEDALConfig(**cfg_kwargs)
         search_cls = ABMEDALSearch
+
+    elif method == "klass":
+        # KLASS: Use stability-based reward with the original MCTS configuration.
+        search_cfg = MCTSConfig(**cfg_kwargs)
+        search_cls = KLASSMCTSSearch
+
     else:
+        # Original MEDAL baseline.
         search_cfg = MCTSConfig(**cfg_kwargs)
         search_cls = MCTSSearch
 
