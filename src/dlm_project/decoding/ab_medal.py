@@ -377,9 +377,7 @@ class ABMEDALSearch(medal.MCTSSearch):
         if (logits is None) == (analysis is None):
             raise ValueError("Supply exactly one of logits and analysis.")
         if analysis is None:
-            analysis = medal.distribution_from_logits(
-                logits, request.node.state, self.prompt_len, self.mask_id, self.config,
-                search_excluded_token_ids=self.search_excluded_token_ids)[0]
+            analysis = self._analyze_node(request.node, logits=logits)
         child, parent = request.node, request.parent
         if parent is None:
             self.root.analysis = analysis
@@ -391,8 +389,7 @@ class ABMEDALSearch(medal.MCTSSearch):
             self._pending = None
             self._check_checkpoint()
             return
-        evaluation = medal.apply_child_analysis(parent, child, analysis, self.prompt_len,
-                                                 self.mask_id, self.config, signal_nfe=self.model_calls)
+        evaluation = self._apply_child_analysis(parent, child, analysis)
         self._register(child)
         self.simulations_completed += 1
         self._record_evaluated(child)
@@ -442,9 +439,7 @@ class ABMEDALSearch(medal.MCTSSearch):
                 break
             request.attempted = True
             with self._counted.phase(request.phase):
-                analysis = medal.analyze_state(
-                    self._counted, request.node.state, self.prompt_len, self.mask_id, self.config,
-                    search_excluded_token_ids=self.search_excluded_token_ids)
+                analysis = self._analyze_node(request.node)
             self.submit_evaluation(request, analysis=analysis)
             if request.parent is not None:
                 break

@@ -83,8 +83,7 @@ class CooperativeMEDALSearch(medal.MCTSSearch):
     def submit_evaluation(self, request, *, logits):
         if request is not self._pending or not request.attempted:
             raise ValueError('Expected the current dispatched evaluation request.')
-        analysis = medal.distribution_from_logits(logits, request.node.state, self.prompt_len,
-            self.mask_id, self.config, search_excluded_token_ids=self.search_excluded_token_ids)[0]
+        analysis = self._analyze_node(request.node, logits=logits)
         child, parent = request.node, request.parent
         if parent is None:
             self.root.analysis = analysis
@@ -94,8 +93,7 @@ class CooperativeMEDALSearch(medal.MCTSSearch):
             self._pending = None
             self._check_checkpoint()
             return
-        evaluation = medal.apply_child_analysis(parent, child, analysis, self.prompt_len,
-            self.mask_id, self.config, signal_nfe=self.model_calls)
+        evaluation = self._apply_child_analysis(parent, child, analysis)
         self.simulations_completed += 1
         self._record_evaluated(child)
         self._emit('evaluation', parent_id=parent.node_id, child_id=child.node_id, depth=child.depth,

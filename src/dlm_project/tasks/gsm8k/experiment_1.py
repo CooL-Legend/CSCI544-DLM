@@ -23,6 +23,9 @@ from dlm_project.decoding.ab_batch import pack_states, sync
 from dlm_project.decoding.ab_medal import ABMEDALConfig, ABMEDALSearch
 from dlm_project.decoding.common import commit_from_logits
 from dlm_project.decoding.mcts_decoding import MCTSConfig, MCTSSearch, select_deepest_candidates
+from dlm_project.decoding.ig_kl_search import (
+    IGKLMCTSSearch, IGKLABMEDALSearch, CooperativeIGKLMCTSSearch, reward_settings,
+)
 from dlm_project.decoding.medal_batch import CooperativeMEDALSearch
 from dlm_project.decoding.medal_demo import DecodingResult, run_completion
 from dlm_project.decoding import search_audit
@@ -58,8 +61,10 @@ def state_hash(state_tensor):
 
 
 def context(*, stage="dev", methods=("medal", "ab_medal"), budgets=None,
-            max_depth=MAX_SEARCH_DEPTH, num_candidates=MIN_CANDIDATES, num_samples=None):
+            max_depth=MAX_SEARCH_DEPTH, num_candidates=MIN_CANDIDATES, num_samples=None,
+            reward_mode="ig", kl_weight=0.05, kl_top_k=32):
     """Create and validate execution context for E1."""
+    reward = reward_settings(reward_mode, kl_weight, kl_top_k)
     common = load_shared_protocol()
     if budgets is None:
         budgets = tuple(c["budget"] for c in common["search"]["conditions"])
@@ -80,6 +85,7 @@ def context(*, stage="dev", methods=("medal", "ab_medal"), budgets=None,
 
     return {
         "protocol_version": PROTOCOL_VERSION,
+        "reward": reward,
         "stage": stage,
         "methods": list(methods),
         "budgets": list(budgets),
@@ -144,6 +150,12 @@ def execute_search_checkpointed(wrapper, prepared_item, ctx, method: str,
         search_cfg = MCTSConfig(**cfg_kwargs)
         search_cls = MCTSSearch
 
+    reward = _context_reward(ctx)
+    reward_options = {}
+    if reward["reward_mode"] == "ig_kl":
+        search_cls = IGKLABMEDALSearch if method == "ab_medal" else IGKLMCTSSearch
+        reward_options = {key: reward[key] for key in ("kl_weight", "kl_top_k")}
+
     search = search_cls(
         wrapper.model,
         prepared_item["ids"],
@@ -154,6 +166,7 @@ def execute_search_checkpointed(wrapper, prepared_item, ctx, method: str,
         tokenizer=wrapper.tokenizer,
         search_excluded_token_ids=ctx["termination"]["token_ids"],
         checkpoint_budgets=tuple(sorted(budgets)),
+        **reward_options,
     )
 
     t0 = perf_counter()
@@ -235,6 +248,12 @@ def execute_search_batch_checkpointed(wrapper, prepared_group, ctx, method: str,
         search_cfg = MCTSConfig(**cfg_kwargs)
         search_cls = CooperativeMEDALSearch
 
+    reward = _context_reward(ctx)
+    reward_options = {}
+    if reward["reward_mode"] == "ig_kl":
+        search_cls = IGKLABMEDALSearch if method == "ab_medal" else CooperativeIGKLMCTSSearch
+        reward_options = {key: reward[key] for key in ("kl_weight", "kl_top_k")}
+
     trees = [
         search_cls(
             wrapper.model,
@@ -246,56 +265,62 @@ def execute_search_batch_checkpointed(wrapper, prepared_group, ctx, method: str,
             tokenizer=wrapper.tokenizer,
             search_excluded_token_ids=ctx["termination"]["token_ids"],
             checkpoint_budgets=tuple(sorted(budgets)),
+            **reward_options,
         )
         for item in prepared_group
     ]
 
-    device = medal.model_device(wrapper.model)
-    pad_token_id = ctx["pad_token_id"]
-    sync(wrapper.model)
-    t0 = perf_counter()
-    search_latencies = [None] * len(trees)
-    invocation_id = 0
+    try:
+        device = medal.model_device(wrapper.model)
+        pad_token_id = ctx["pad_token_id"]
+        sync(wrapper.model)
+        t0 = perf_counter()
+        search_latencies = [None] * len(trees)
+        invocation_id = 0
 
-    while True:
-        active, requests = [], []
+        while True:
+            active, requests = [], []
+            for index, tree in enumerate(trees):
+                request = tree.next_evaluation()
+                if request is not None:
+                    active.append(index)
+                    requests.append(request)
+                elif search_latencies[index] is None:
+                    sync(wrapper.model)
+                    search_latencies[index] = perf_counter() - t0
+            if not active:
+                break
+            invocation_id += 1
+            current_states = [r.node.state for r in requests]
+            ids, attention, _ = pack_states(current_states, pad_token_id, device)
+            for index, request in zip(active, requests):
+                trees[index].record_external_forward(
+                    request, invocation_id=invocation_id, batch_size=len(active)
+                )
+            prediction = wrapper.model(ids) if len(active) == 1 else wrapper.model(ids, attention_mask=attention)
+            for row, (index, request) in enumerate(zip(active, requests)):
+                trees[index].submit_evaluation(
+                    request, logits=prediction.logits[row, :request.node.state.shape[1]]
+                )
+                if trees[index].done and search_latencies[index] is None:
+                    sync(wrapper.model)
+                    search_latencies[index] = perf_counter() - t0
+            del prediction
+
+        sync(wrapper.model)
+        total_search_time = perf_counter() - t0
         for index, tree in enumerate(trees):
-            request = tree.next_evaluation()
-            if request is not None:
-                active.append(index)
-                requests.append(request)
-            elif search_latencies[index] is None:
-                sync(wrapper.model)
-                search_latencies[index] = perf_counter() - t0
-        if not active:
-            break
-        invocation_id += 1
-        current_states = [r.node.state for r in requests]
-        ids, attention, _ = pack_states(current_states, pad_token_id, device)
-        for index, request in zip(active, requests):
-            trees[index].record_external_forward(
-                request, invocation_id=invocation_id, batch_size=len(active)
-            )
-        prediction = wrapper.model(ids) if len(active) == 1 else wrapper.model(ids, attention_mask=attention)
-        for row, (index, request) in enumerate(zip(active, requests)):
-            trees[index].submit_evaluation(
-                request, logits=prediction.logits[row, :request.node.state.shape[1]]
-            )
-            if trees[index].done and search_latencies[index] is None:
-                sync(wrapper.model)
-                search_latencies[index] = perf_counter() - t0
-        del prediction
+            if search_latencies[index] is None:
+                search_latencies[index] = total_search_time
+            for b in budgets:
+                if b not in tree.checkpoints:
+                    tree.checkpoints[b] = tree._snapshot_checkpoint(b, stop_reason=tree.stop_reason)
 
-    sync(wrapper.model)
-    total_search_time = perf_counter() - t0
-    for index, tree in enumerate(trees):
-        if search_latencies[index] is None:
-            search_latencies[index] = total_search_time
-        for b in budgets:
-            if b not in tree.checkpoints:
-                tree.checkpoints[b] = tree._snapshot_checkpoint(b, stop_reason=tree.stop_reason)
-
-    return list(zip(trees, search_latencies))
+        return list(zip(trees, search_latencies))
+    finally:
+        if reward["reward_mode"] == "ig_kl":
+            for tree in trees:
+                tree._clear_histories()
 
 
 @torch.inference_mode()
@@ -464,6 +489,7 @@ def export_question_e1_artifacts(wrapper, search, search_time: float, prepared_i
 
     for budget in sorted(budgets):
         chk = search.checkpoints[budget]
+        reward_metadata = chk.get("reward_metadata", _context_reward(ctx))
         chk_dir = checkpoints_dir / str(budget)
         chk_dir.mkdir(parents=True, exist_ok=True)
 
@@ -497,6 +523,7 @@ def export_question_e1_artifacts(wrapper, search, search_time: float, prepared_i
         # Save checkpoint artifacts
         selection_record = {
             **chk["selection"],
+            **reward_metadata,
             "selected_q": chk["selected_q"],
             "max_depth_reached": chk["max_depth_reached"],
             "selection_depth_gap": chk["selection_depth_gap"],
@@ -526,10 +553,12 @@ def export_question_e1_artifacts(wrapper, search, search_time: float, prepared_i
                 "action": None if n.action is None else asdict(n.action),
                 "child_ids": [c.node_id for c in n.children],
                 "evaluation_order": n.evaluation_order,
+                **chk.get("node_rewards", {}).get(n.node_id, {}),
             })
 
         save_json(chk_dir / "tree.json", {
             "method": method,
+            **reward_metadata,
             "budget": budget,
             "example_id": prepared_item["example"]["example_id"],
             "seed": prepared_item["seed"],
@@ -545,6 +574,7 @@ def export_question_e1_artifacts(wrapper, search, search_time: float, prepared_i
 
         checkpoint_row = {
             "method": method,
+            **reward_metadata,
             "search_budget": budget,
             "example_id": prepared_item["example"]["example_id"],
             "row_id": prepared_item["example"]["row_id"],
@@ -599,6 +629,10 @@ def run_question_e1(wrapper, prepared_item, ctx, method: str,
                     num_candidates: int = MIN_CANDIDATES,
                     completion_cache=None):
     """Run one question under a method and export all checkpoint and overall artifacts."""
+    q_dir = base_dir / method / prepared_item["example"]["example_id"]
+    q_dir.mkdir(parents=True, exist_ok=True)
+    # Preserve reward identity before inference, including interrupted searches.
+    save_json(q_dir / "config.json", ctx)
     search, search_time = execute_search_checkpointed(
         wrapper, prepared_item, ctx, method, budgets=budgets,
         max_depth=max_depth, num_candidates=num_candidates
@@ -623,6 +657,12 @@ def run_questions_batch_e1(wrapper, prepared_group, ctx, method: str,
             budgets=budgets, max_depth=max_depth, num_candidates=num_candidates,
             completion_cache=completion_cache,
         )
+
+    # Keep each question's reward identity even if the shared forward fails.
+    for item in prepared_group:
+        q_dir = base_dir / method / item["example"]["example_id"]
+        q_dir.mkdir(parents=True, exist_ok=True)
+        save_json(q_dir / "config.json", ctx)
 
     search_pairs = execute_search_batch_checkpointed(
         wrapper, prepared_group, ctx, method, budgets=budgets,
@@ -757,6 +797,7 @@ def run_e1_stage(wrapper, ctx, output_dir: Path, methods=("medal", "ab_medal"),
     output_dir = Path(output_dir)
     stage_dir = output_dir / ctx["stage"]
     summaries_dir = output_dir / "summaries"
+    _validate_reward_directory(output_dir, ctx, methods, batch_size=batch_size)
     summaries_dir.mkdir(parents=True, exist_ok=True)
 
     prepared = prepare(wrapper, ctx)
@@ -765,6 +806,7 @@ def run_e1_stage(wrapper, ctx, output_dir: Path, methods=("medal", "ab_medal"),
 
     manifest_data = {
         "protocol_version": PROTOCOL_VERSION,
+        "reward": _context_reward(ctx),
         "stage": ctx["stage"],
         "methods": list(methods),
         "budgets": list(budgets),
@@ -870,6 +912,35 @@ def run_e1_stage(wrapper, ctx, output_dir: Path, methods=("medal", "ab_medal"),
     print(f"\n✅ All {total_q} questions completed successfully for methods {list(methods)}.", flush=True)
 
     return all_checkpoint_rows, agg_rows
+
+
+def _context_reward(ctx):
+    options = ctx.get("reward", {})
+    return reward_settings(options.get("reward_mode", "ig"),
+                           options.get("kl_weight", 0.05), options.get("kl_top_k", 32))
+
+
+def _validate_reward_directory(output_dir, ctx, methods, *, batch_size=1):
+    """Never resume or overwrite another reward variant, even with resume=False."""
+    expected = _context_reward(ctx)
+    manifest_paths = [output_dir / "run_manifest.json",
+                      output_dir / "summaries" / f"run_manifest_{ctx['stage']}.json"]
+    records = list(manifest_paths)
+    for method in methods:
+        for example in ctx["examples"]:
+            q_dir = output_dir / ctx["stage"] / method / example["example_id"]
+            config_path = q_dir / "config.json"
+            if q_dir.exists() and any(q_dir.iterdir()) and not config_path.is_file():
+                raise ValueError(f"Cannot verify saved reward in {q_dir}; use a new output directory.")
+            records.append(config_path)
+    for path in records:
+        if path.is_file():
+            saved = json.loads(path.read_text())
+            if _context_reward(saved) != expected:
+                raise ValueError(f"Reward settings differ from saved run at {path}; use a new output directory.")
+            if (expected["reward_mode"] == "ig_kl" and path in manifest_paths
+                    and saved.get("batch_size", 1) != batch_size):
+                raise ValueError(f"Batch size differs from saved IG-KL run at {path}; use a new output directory.")
 
 
 def _compact(value):
