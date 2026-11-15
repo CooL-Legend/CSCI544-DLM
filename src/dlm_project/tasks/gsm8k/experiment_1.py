@@ -23,8 +23,13 @@ from dlm_project.decoding.ab_batch import pack_states, sync
 from dlm_project.decoding.ab_medal import ABMEDALConfig, ABMEDALSearch
 from dlm_project.decoding.common import commit_from_logits
 from dlm_project.decoding.mcts_decoding import MCTSConfig, MCTSSearch, select_deepest_candidates
+
 # KLASS: Import the stability-based MCTS implementation.
-from dlm_project.decoding.mcts_decoding_klass import MCTSSearch as KLASSMCTSSearch
+from dlm_project.decoding.mcts_decoding_klass import (
+    MCTSConfig as KLASSMCTSConfig,
+    MCTSSearch as KLASSMCTSSearch,
+)
+
 from dlm_project.decoding.medal_batch import CooperativeMEDALSearch
 from dlm_project.decoding.medal_demo import DecodingResult, run_completion
 from dlm_project.decoding import search_audit
@@ -146,10 +151,12 @@ def execute_search_checkpointed(wrapper, prepared_item, ctx, method: str,
         search_cfg = ABMEDALConfig(**cfg_kwargs)
         search_cls = ABMEDALSearch
 
+
     elif method == "klass":
-        # KLASS: Use stability-based reward with the original MCTS configuration.
-        search_cfg = MCTSConfig(**cfg_kwargs)
+        # KLASS: Use the KLASS-specific MCTSConfig.
+        search_cfg = KLASSMCTSConfig(**cfg_kwargs)
         search_cls = KLASSMCTSSearch
+
 
     else:
         # Original MEDAL baseline.
