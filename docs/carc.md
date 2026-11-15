@@ -1,5 +1,125 @@
 # E1/E2 on USC CARC
 
+## Group 37: submit E1 directly with Slurm
+
+On branch `adi-e2-carc`, `scripts/run_carc_e1_test.sbatch` runs the same E1
+experiment as `notebooks/gsm8k/Experiment_1_Test.ipynb` without starting Jupyter.
+It reuses the prepared environment, model and data. The job does not install
+packages or download assets, and it does not require a benchmark report.
+
+Submit from your `adi-e2-carc` repository root on CARC (adjust the checkout
+directory if you use a different copy):
+
+```bash
+cd /home1/xchen664/CSCI544-DLM
+mkdir -p results/slurm
+REPO_DIR="$PWD" sbatch scripts/run_carc_e1_test.sbatch
+```
+
+The two optional arguments are **number of test questions** (default `2`) and
+**batch size** (default `4`). To test a full batch of four questions:
+
+```bash
+sbatch scripts/run_carc_e1_test.sbatch 4 4
+```
+
+For a first smoke run on `debug`, override the GPU type and time as well as
+the partition. Discovery documents A40 GPUs on `debug` and a one-hour limit;
+L40S GPUs are on `gpu`. Use a separate output directory for this test:
+
+```bash
+cd /home1/xchen664/CSCI544-DLM
+mkdir -p results/slurm
+REPO_DIR="$PWD" ARTIFACT_ROOT="$PWD/results/e1_debug_smoke" sbatch \
+  --partition=debug \
+  --gpus-per-task=a40:1 \
+  --time=01:00:00 \
+  scripts/run_carc_e1_test.sbatch 2 4
+```
+
+This runs two questions across all four method/budget conditions. Use `4 4`
+to test a full batch of four. See the [CARC job limits](https://www.carc.usc.edu/user-guides/hpc-systems/using-our-hpc-systems/running-jobs).
+
+The script requests account `xiangren_1987`, partition `gpu`, one `l40s`,
+four CPU cores, **64 GB host RAM** and **two hours**. Each L40S has **48 GB GPU
+memory**, separate from host RAM. These are initial resource settings, not
+measured memory or runtime guarantees. See the
+[CARC GPU specifications](https://www.carc.usc.edu/user-guides/hpc-systems/discovery/resource-overview-discovery)
+and [GPU job options](https://www.carc.usc.edu/user-guides/advanced-hpc-programming/gpu-programming).
+
+Prepared paths are reused as follows:
+
+| Resource | Default |
+| --- | --- |
+| Python environment | `/project2/xiangren_1987/group_37/envs/dlm` |
+| Model directory | `/project2/xiangren_1987/group_37/model-cache` |
+| Dataset cache | `/project2/xiangren_1987/group_37/datasets` |
+| Experiment results | `REPO_DIR/results/e1_e3_test_slurm` |
+| Runtime Hugging Face metadata/custom code | `REPO_DIR/.cache/carc/huggingface` |
+| Slurm logs | `results/slurm/e1-<jobid>.out` and `.err` |
+
+The existing Group 37 model directory has `config.json`, tokenizer files and
+six weight shards directly in it, so it is loaded as a flat local model.
+A Hugging Face cache with the pinned LLaDA snapshot is also supported.
+`MODEL_DIR` overrides that location;
+`MODEL_PATH` selects an explicit local snapshot. `HF_DATASETS_CACHE` can
+override the dataset-cache location. Set `ARTIFACT_ROOT` for an exact output
+directory, for example:
+
+```bash
+ARTIFACT_ROOT="$PWD/results/e1_other_run" sbatch scripts/run_carc_e1_test.sbatch 4 4
+```
+
+The job runs the environment's Python directly, so `conda activate` is
+unnecessary. Prepare any missing dependencies before submitting, using
+`requirements/carc.txt` and `python -m pip install --no-deps -e .` with that
+environment's Python. Reuse its compatible CUDA-enabled PyTorch.
+
+E1 reads questions and reference answers from the checked-in
+`configs/gsm8k/experiment_samples.json` and `experiment_samples_500.json`.
+It does **not** load a separate Hugging Face dataset or validate a dataset
+cache. The configured dataset cache remains available to other experiments.
+Model loading is offline and uses existing local files without copying weights.
+
+The runner compares **MEDAL** and **AB-MEDAL** at budgets **256 and 512**, with
+`Lc = 10`, minimum candidates `C = 3`, the original normalized IG reward,
+standard LLaDA confidence completion, automatic compatible-run resumption,
+resource profiling and offline E3 analysis. It saves per-question outputs,
+checkpoints, traces, aggregate scores and figures under the results directory.
+Both `/results/` and `.cache/` are ignored by Git.
+
+For larger test sets, pass `200` or `500`. The wall times below are examples;
+adjust them after measuring a smoke run or pilot on the allocated GPU:
+
+```bash
+sbatch --time=24:00:00 scripts/run_carc_e1_test.sbatch 200 4
+sbatch --time=24:00:00 scripts/run_carc_e1_test.sbatch 500 4
+```
+
+Run these as successive stages when extending the same output directory, not
+concurrently. A compatible completed prefix can be reused. Changing batch size
+or experimental settings requires a separate output directory.
+
+Slurm prints a job ID at submission. Monitor it with:
+
+```bash
+squeue -u "$USER"
+tail -f results/slurm/e1-JOB_ID.out
+```
+
+Replace `JOB_ID` with the submitted job ID; errors are in the matching
+`e1-JOB_ID.err`. Create `results/slurm` **before** submission because Slurm
+opens log files before the script starts. Submit from the repository root, or
+set `REPO_DIR` explicitly and provide suitable `sbatch --output` and
+`--error` paths. Slurm executes a spooled copy of the script, so its own file
+location cannot identify the repository.
+
+## Existing notebook and benchmark workflow
+
+The sections below retain the original Jupyter and measured-pilot/production
+workflow. They are separate from the direct notebook-equivalent Slurm entry
+above; its smoke and test runs do not depend on the production benchmark gate.
+
 Use GPU-backed JupyterLab for smoke tests and inspection, and the existing Python
 runners under Slurm for the long experiment. Start with **four questions per
 batch** based on the observed L40 SRIG run. The reported approximately 16 GB is
