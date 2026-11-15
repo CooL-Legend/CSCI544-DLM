@@ -26,9 +26,11 @@ from dlm_project.decoding.ab_medal import ABMEDALConfig
 from dlm_project.decoding.common import commit_from_logits
 from dlm_project.decoding.e2_search import (
     DEFAULT_SIM_CAP_MULTIPLIER,
+    DEFAULT_SWD_BETA,
     E2ABMEDALSearch,
     E2MEDALSearch,
     VALID_REWARD_MODES,
+    _validate_e2_params,
     compute_fig_reward,
     compute_srig_reward,
 )
@@ -83,11 +85,13 @@ def context(
     sample_slice: Optional[Tuple[int, int]] = None,
     reward_mode: str = "fig",
     reward_lambda: float = 1.0,
+    reward_beta: float = DEFAULT_SWD_BETA,
     sim_cap_multiplier: int = SIMULATION_CAP_MULTIPLIER,
 ):
     """Create and validate execution context for E2."""
     if reward_mode not in VALID_REWARD_MODES:
         raise ValueError(f"Unknown reward_mode {reward_mode!r}. Must be one of {VALID_REWARD_MODES}.")
+    _validate_e2_params(reward_mode, reward_lambda, sim_cap_multiplier, reward_beta=reward_beta)
     common = load_shared_protocol()
     if budgets is None:
         budgets = CHECKPOINT_BUDGETS
@@ -119,6 +123,7 @@ def context(
         "num_candidates": num_candidates,
         "reward_mode": reward_mode,
         "reward_lambda": float(reward_lambda),
+        "reward_beta": float(reward_beta),
         "sim_cap_multiplier": int(sim_cap_multiplier),
         "common": common,
         "manifest": manifest["dataset"],
@@ -176,12 +181,14 @@ def execute_search_batch_checkpointed_e2(
     num_candidates: int = MIN_CANDIDATES,
     reward_mode: Optional[str] = None,
     reward_lambda: Optional[float] = None,
+    reward_beta: Optional[float] = None,
     sim_cap_multiplier: Optional[int] = None,
 ):
     """Execute cooperative batched 2-step lookahead search up to max(budgets)."""
     max_budget = max(budgets)
     resolved_reward_mode = reward_mode if reward_mode is not None else ctx.get("reward_mode", "fig")
     resolved_reward_lambda = float(reward_lambda if reward_lambda is not None else ctx.get("reward_lambda", 1.0))
+    resolved_reward_beta = float(reward_beta if reward_beta is not None else ctx.get("reward_beta", DEFAULT_SWD_BETA))
     resolved_sim_mult = int(sim_cap_multiplier if sim_cap_multiplier is not None else ctx.get("sim_cap_multiplier", SIMULATION_CAP_MULTIPLIER))
     max_sims = resolved_sim_mult * max_budget
 
@@ -215,6 +222,7 @@ def execute_search_batch_checkpointed_e2(
             checkpoint_budgets=tuple(sorted(budgets)),
             reward_mode=resolved_reward_mode,
             reward_lambda=resolved_reward_lambda,
+            reward_beta=resolved_reward_beta,
             sim_cap_multiplier=resolved_sim_mult,
         )
         for item in prepared_group
@@ -570,6 +578,7 @@ def export_question_e2_artifacts(
             "simulation_cap_bound": bool(chk.get("stop_reason") == "simulation_budget"),
             "reward_mode": ctx.get("reward_mode", "fig"),
             "reward_lambda": float(ctx.get("reward_lambda", 1.0)),
+            "reward_beta": float(ctx.get("reward_beta", DEFAULT_SWD_BETA)),
             "search_wall_seconds": chk["search_elapsed_seconds"],
             "completion_wall_seconds": comp_time,
             "total_wall_seconds": (chk["search_elapsed_seconds"]) + comp_time,
@@ -770,6 +779,7 @@ def run_e2_stage(
         "num_candidates": num_candidates,
         "reward_mode": ctx.get("reward_mode", "fig"),
         "reward_lambda": float(ctx.get("reward_lambda", 1.0)),
+        "reward_beta": float(ctx.get("reward_beta", DEFAULT_SWD_BETA)),
         "sim_cap_multiplier": int(ctx.get("sim_cap_multiplier", SIMULATION_CAP_MULTIPLIER)),
         "batch_size": batch_size,
         "sample_count": len(prepared),

@@ -1,6 +1,6 @@
 """Two-step lookahead MCTS search for Experiment 2 (E2).
 
-Implements E2MEDALSearch and E2ABMEDALSearch supporting three reward modes:
+Implements E2MEDALSearch and E2ABMEDALSearch supporting four reward modes:
 1. "fig" (Fractional Information Gain):
     R_FIG(s, s_i) = (H(s) - H(g*_i)) / max(H(s), epsilon)
 2. "srig" (Sum of Relative Information Gains / FutureR_ig):
@@ -8,15 +8,19 @@ Implements E2MEDALSearch and E2ABMEDALSearch supporting three reward modes:
                        = (H(s) - H(s_i)) / H(s) + lambda * (H(s_i) - H(g*_i)) / H(s_i)
 3. "cmer" (Common-Mask Entropy Reduction):
     R_CMER(s, g*_i) = (1 / |M(g*_i)|) * sum_{j in M(g*_i)} [h_j(s) - h_j(g*_i)]
+4. "swd" (Stability-Weighted Decoding two-step lookahead):
+    Q_SWD(s, a_i) = sum_{j in M(g*_i)} q^j_{t+2} * exp(-beta * (KL^j(s, s_i) + KL^j(s_i, g*_i)))
+    where q^j_{t+2} = max_v p_{t+2}^j(v) and KL^j(A, B) = D_KL(p_A^j || p_B^j).
 
 Key properties:
-- Virtual grandchildren g*_i are evaluated and cached in `cached_analyses` but never
-  attached to the MCTS tree or assigned GEN/CONT posteriors.
+- Virtual grandchildren g*_i are evaluated and cached in `cached_analyses` (and
+  `cached_swd_states` when reward_mode == "swd") to save redundant forwards, and are
+  never attached to the MCTS tree or assigned GEN/CONT posteriors.
 - Terminal children (0 remaining masks) have H(s_i) = 0 and second-step gain 0 (and
-  R_CMER = 0.0 since |M(g*_i)| = 0).
+  R_CMER = 0.0 / Q_SWD = 0.0 since |M(g*_i)| = 0).
 - Non-terminal children with no legal actions fall back to a reward-consistent 1-step
-  fallback (1-step R_ig for fig/srig; 1-step R_CMER over M(s_i) for cmer) with
-  lookahead_available=False.
+  fallback (1-step R_ig for fig/srig; 1-step R_CMER over M(s_i) for cmer; 1-step
+  R_stability over M(s_i) for swd) with lookahead_available=False.
 - Intermediate checkpoints are enforced before dispatching uncached grandchild forwards
   via isolated hypothetical backups that never mutate the continuing live tree, while
   also enforcing the 4B simulation-cap safeguard after complete simulations.
@@ -24,7 +28,7 @@ Key properties:
 
 from collections import Counter
 import copy
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 import hashlib
 import math
 from typing import Any, Dict, List, Optional, Tuple
@@ -35,8 +39,10 @@ from dlm_project.decoding import mcts_decoding as medal
 from dlm_project.decoding.ab_medal import ABMEDALConfig, ABMEDALSearch, EvaluationRequest
 from dlm_project.decoding.medal_batch import CooperativeMEDALSearch
 
-VALID_REWARD_MODES = ("fig", "srig", "cmer")
+VALID_REWARD_MODES = ("fig", "srig", "cmer", "swd")
 DEFAULT_SIM_CAP_MULTIPLIER = 4
+DEFAULT_SWD_BETA = 1.0
+DEFAULT_SWD_TOPK = 512
 
 
 def compute_fig_reward(parent_entropy: float, grandchild_entropy: float, epsilon: float = 1e-8) -> float:
@@ -95,6 +101,229 @@ def compute_cmer_reward(
     return reward, n_common
 
 
+@dataclass(frozen=True)
+class SWDStateData:
+    """Compact CPU summary of per-position token distributions for SWD KL evaluation."""
+
+    positions: torch.Tensor
+    q_values: torch.Tensor
+    vocab_size: int
+    top_ids: Optional[torch.Tensor]
+    top_probs: Optional[torch.Tensor]
+    tail_prob: Optional[torch.Tensor]
+    dense_probs: Optional[torch.Tensor]
+    pos_lookup: Dict[int, int]
+
+
+def extract_swd_state_data(
+    probabilities: Optional[torch.Tensor],
+    positions: torch.Tensor,
+    *,
+    top_k: Optional[int] = DEFAULT_SWD_TOPK,
+) -> SWDStateData:
+    """Extract exact max-prob q_values and compact distributions from masked-position softmax probabilities."""
+    if probabilities is None or positions.numel() == 0:
+        return SWDStateData(
+            positions=torch.empty(0, dtype=torch.long),
+            q_values=torch.empty(0, dtype=torch.float32),
+            vocab_size=0 if probabilities is None else int(probabilities.shape[-1]),
+            top_ids=None,
+            top_probs=None,
+            tail_prob=None,
+            dense_probs=None,
+            pos_lookup={},
+        )
+
+    pos_cpu = positions.detach().to(dtype=torch.long, device="cpu")
+    pos_list = pos_cpu.tolist()
+    pos_lookup = {pos: idx for idx, pos in enumerate(pos_list)}
+    vocab_size = int(probabilities.shape[-1])
+    q_values = probabilities.max(dim=-1).values.float().cpu()
+
+    if top_k is None or vocab_size <= top_k:
+        dense_cpu = probabilities.detach().float().cpu()
+        return SWDStateData(
+            positions=pos_cpu,
+            q_values=q_values,
+            vocab_size=vocab_size,
+            top_ids=None,
+            top_probs=None,
+            tail_prob=None,
+            dense_probs=dense_cpu,
+            pos_lookup=pos_lookup,
+        )
+
+    top_vals, top_idx = torch.topk(probabilities, k=top_k, dim=-1)
+    sorted_idx, sort_order = torch.sort(top_idx, dim=-1)
+    sorted_vals = torch.gather(top_vals, -1, sort_order)
+
+    probs_cpu = sorted_vals.detach().float().cpu()
+    ids_cpu = sorted_idx.detach().to(dtype=torch.int32, device="cpu")
+    row_sums = probs_cpu.double().sum(dim=-1)
+    over = row_sums > 1.0
+    if over.any():
+        probs_cpu[over] = (probs_cpu[over].double() / row_sums[over].unsqueeze(-1)).float()
+        row_sums = probs_cpu.double().sum(dim=-1)
+    residual = (1.0 - row_sums).clamp(min=0.0)
+    tail_prob = residual / float(vocab_size - top_k)
+
+    return SWDStateData(
+        positions=pos_cpu,
+        q_values=q_values,
+        vocab_size=vocab_size,
+        top_ids=ids_cpu,
+        top_probs=probs_cpu,
+        tail_prob=tail_prob,
+        dense_probs=None,
+        pos_lookup=pos_lookup,
+    )
+
+
+def _expand_swd_rows_to_dense(dist: SWDStateData, row_indices: List[int]) -> torch.Tensor:
+    if dist.dense_probs is not None:
+        return dist.dense_probs[row_indices].double()
+    dense = dist.tail_prob[row_indices].unsqueeze(-1).expand(-1, dist.vocab_size).clone()
+    ids = dist.top_ids[row_indices].to(dtype=torch.long)
+    dense.scatter_(-1, ids, dist.top_probs[row_indices].double())
+    return dense
+
+
+def compute_pairwise_kl(
+    dist_a: SWDStateData,
+    dist_b: SWDStateData,
+    target_positions: torch.Tensor,
+    *,
+    epsilon: float = 1e-8,
+) -> torch.Tensor:
+    """Compute forward KL D_KL(p_A^j || p_B^j) aligned at `target_positions` in float64."""
+    pos_list = target_positions.detach().cpu().tolist()
+    if not pos_list:
+        return torch.empty(0, dtype=torch.float64)
+    if dist_a.vocab_size != dist_b.vocab_size:
+        raise ValueError(f"Vocabulary mismatch in KL calculation: {dist_a.vocab_size} vs {dist_b.vocab_size}")
+    try:
+        idx_a = [dist_a.pos_lookup[p] for p in pos_list]
+        idx_b = [dist_b.pos_lookup[p] for p in pos_list]
+    except KeyError as error:
+        raise ValueError(f"Target position {error} missing from cached SWD distributions.") from error
+
+    if dist_a.dense_probs is not None and dist_b.dense_probs is not None:
+        pa = dist_a.dense_probs[idx_a].double()
+        pb = dist_b.dense_probs[idx_b].double()
+        kl = (pa * (torch.log(pa + epsilon) - torch.log(pb + epsilon))).sum(dim=-1)
+        return kl.clamp(min=0.0)
+
+    if dist_a.dense_probs is None and dist_b.dense_probs is None:
+        ids_a = dist_a.top_ids[idx_a].to(dtype=torch.long)
+        ids_b = dist_b.top_ids[idx_b].to(dtype=torch.long)
+        probs_a = dist_a.top_probs[idx_a].double()
+        probs_b = dist_b.top_probs[idx_b].double()
+        tau_a = dist_a.tail_prob[idx_a]
+        tau_b = dist_b.tail_prob[idx_b]
+
+        k_a = ids_a.shape[-1]
+        k_b = ids_b.shape[-1]
+
+        pos_in_b = torch.searchsorted(ids_b, ids_a).clamp(max=k_b - 1)
+        matched_b = torch.gather(ids_b, -1, pos_in_b) == ids_a
+        pb_at_a = torch.where(matched_b, torch.gather(probs_b, -1, pos_in_b), tau_b.unsqueeze(-1))
+        term_a = (probs_a * (torch.log(probs_a + epsilon) - torch.log(pb_at_a + epsilon))).sum(dim=-1)
+
+        pos_in_a = torch.searchsorted(ids_a, ids_b).clamp(max=k_a - 1)
+        in_a = torch.gather(ids_a, -1, pos_in_a) == ids_b
+        term_b_only = torch.where(
+            ~in_a,
+            tau_a.unsqueeze(-1) * (torch.log(tau_a.unsqueeze(-1) + epsilon) - torch.log(probs_b + epsilon)),
+            0.0,
+        ).sum(dim=-1)
+
+        n_rest = (dist_a.vocab_size - k_a - (~in_a).sum(dim=-1)).double()
+        term_rest = n_rest * tau_a * (torch.log(tau_a + epsilon) - torch.log(tau_b + epsilon))
+        return (term_a + term_b_only + term_rest).clamp(min=0.0)
+
+    pa = _expand_swd_rows_to_dense(dist_a, idx_a)
+    pb = _expand_swd_rows_to_dense(dist_b, idx_b)
+    kl = (pa * (torch.log(pa + epsilon) - torch.log(pb + epsilon))).sum(dim=-1)
+    return kl.clamp(min=0.0)
+
+
+def _validate_reward_beta(reward_beta: float) -> float:
+    if (
+        isinstance(reward_beta, bool)
+        or not isinstance(reward_beta, (int, float))
+        or not math.isfinite(reward_beta)
+        or reward_beta < 0.0
+    ):
+        raise ValueError(f"Invalid reward_beta: {reward_beta}")
+    return float(reward_beta)
+
+
+def compute_swd_reward(
+    parent_swd: Optional[SWDStateData],
+    child_swd: Optional[SWDStateData],
+    grandchild_swd: Optional[SWDStateData],
+    common_mask: torch.Tensor,
+    *,
+    beta: float = DEFAULT_SWD_BETA,
+    epsilon: float = 1e-8,
+) -> Tuple[float, int]:
+    """Compute 2-step Stability-Weighted Decoding (SWD) reward over remaining masks in grandchild:
+        Q_swd(Node, Action) = sum_{j in M(g*)} q^j_{t+2} * exp(-beta * (KL^j(Node, Child) + KL^j(Child, GrandChild)))
+    """
+    beta_val = _validate_reward_beta(beta)
+    mask = common_mask.to(dtype=torch.bool, device="cpu")
+    target_positions = torch.nonzero(mask, as_tuple=False).flatten()
+    n_common = int(target_positions.numel())
+    if n_common == 0:
+        return 0.0, 0
+    if parent_swd is None or child_swd is None or grandchild_swd is None:
+        raise ValueError("2-step SWD reward requires cached SWD distributions for parent, child, and grandchild.")
+
+    kl_pc = compute_pairwise_kl(parent_swd, child_swd, target_positions, epsilon=epsilon)
+    kl_cg = compute_pairwise_kl(child_swd, grandchild_swd, target_positions, epsilon=epsilon)
+    try:
+        idx_g = [grandchild_swd.pos_lookup[p] for p in target_positions.tolist()]
+    except KeyError as error:
+        raise ValueError(f"Target position {error} missing from grandchild SWD q_values.") from error
+    q_t2 = grandchild_swd.q_values[idx_g].double()
+    weights = torch.exp(-beta_val * (kl_pc + kl_cg))
+    reward = float((q_t2 * weights).sum().item())
+    if not math.isfinite(reward):
+        raise ValueError(f"Non-finite SWD reward: common_mask_count={n_common}, beta={beta_val}")
+    return reward, n_common
+
+
+def compute_swd_one_step_fallback(
+    parent_swd: Optional[SWDStateData],
+    child_swd: Optional[SWDStateData],
+    child_mask: torch.Tensor,
+    *,
+    beta: float = DEFAULT_SWD_BETA,
+    epsilon: float = 1e-8,
+) -> Tuple[float, int]:
+    """Compute 1-step stability reward R_stability(Node, Child) when grandchild lookahead is unavailable."""
+    beta_val = _validate_reward_beta(beta)
+    mask = child_mask.to(dtype=torch.bool, device="cpu")
+    target_positions = torch.nonzero(mask, as_tuple=False).flatten()
+    n_common = int(target_positions.numel())
+    if n_common == 0:
+        return 0.0, 0
+    if parent_swd is None or child_swd is None:
+        raise ValueError("1-step SWD fallback requires cached SWD distributions for parent and child.")
+
+    kl_pc = compute_pairwise_kl(parent_swd, child_swd, target_positions, epsilon=epsilon)
+    try:
+        idx_c = [child_swd.pos_lookup[p] for p in target_positions.tolist()]
+    except KeyError as error:
+        raise ValueError(f"Target position {error} missing from child SWD q_values.") from error
+    q_t1 = child_swd.q_values[idx_c].double()
+    weights = torch.exp(-beta_val * kl_pc)
+    reward = float((q_t1 * weights).sum().item())
+    if not math.isfinite(reward):
+        raise ValueError(f"Non-finite 1-step SWD fallback reward: common_mask_count={n_common}, beta={beta_val}")
+    return reward, n_common
+
+
 def _compute_e2_two_step_reward(
     reward_mode: str,
     reward_lambda: float,
@@ -106,8 +335,24 @@ def _compute_e2_two_step_reward(
     grandchild_state: Optional[torch.Tensor] = None,
     prompt_len: int = 0,
     mask_id: int = 0,
+    reward_beta: float = DEFAULT_SWD_BETA,
+    parent_swd: Optional[SWDStateData] = None,
+    child_swd: Optional[SWDStateData] = None,
+    grandchild_swd: Optional[SWDStateData] = None,
 ) -> Tuple[float, Optional[int]]:
     """Compute the 2-step lookahead reward and optional common-mask count."""
+    if reward_mode == "swd":
+        if grandchild_analysis is None or grandchild_state is None:
+            return 0.0, 0
+        common_mask = grandchild_state[0, prompt_len:] == mask_id
+        return compute_swd_reward(
+            parent_swd,
+            child_swd,
+            grandchild_swd,
+            common_mask,
+            beta=reward_beta,
+            epsilon=epsilon,
+        )
     if reward_mode == "cmer":
         if grandchild_analysis is None or grandchild_state is None:
             return 0.0, 0
@@ -137,8 +382,20 @@ def _compute_e2_one_step_fallback(
     child_state: torch.Tensor,
     prompt_len: int,
     mask_id: int,
+    reward_beta: float = DEFAULT_SWD_BETA,
+    parent_swd: Optional[SWDStateData] = None,
+    child_swd: Optional[SWDStateData] = None,
 ) -> Tuple[float, Optional[int]]:
     """Compute a reward-consistent 1-step fallback when 2-step lookahead is unavailable."""
+    if reward_mode == "swd":
+        child_mask = child_state[0, prompt_len:] == mask_id
+        return compute_swd_one_step_fallback(
+            parent_swd,
+            child_swd,
+            child_mask,
+            beta=reward_beta,
+            epsilon=epsilon,
+        )
     if reward_mode == "cmer":
         child_mask = child_state[0, prompt_len:] == mask_id
         return compute_cmer_reward(parent_analysis.entropies, child_analysis.entropies, child_mask)
@@ -148,7 +405,13 @@ def _compute_e2_one_step_fallback(
     )
 
 
-def _validate_e2_params(reward_mode: str, reward_lambda: float, sim_cap_multiplier: int):
+def _validate_e2_params(
+    reward_mode: str,
+    reward_lambda: float,
+    sim_cap_multiplier: int,
+    reward_beta: float = DEFAULT_SWD_BETA,
+    swd_topk: Optional[int] = DEFAULT_SWD_TOPK,
+):
     if reward_mode not in VALID_REWARD_MODES:
         raise ValueError(f"reward_mode must be one of {VALID_REWARD_MODES}, got {reward_mode!r}.")
     if (
@@ -157,6 +420,9 @@ def _validate_e2_params(reward_mode: str, reward_lambda: float, sim_cap_multipli
         or not math.isfinite(reward_lambda)
     ):
         raise ValueError(f"reward_lambda must be a finite number, got {reward_lambda!r}.")
+    _validate_reward_beta(reward_beta)
+    if swd_topk is not None and (type(swd_topk) is not int or swd_topk < 1):
+        raise ValueError(f"swd_topk must be None or a positive integer, got {swd_topk!r}.")
     if type(sim_cap_multiplier) is not int or sim_cap_multiplier < 1:
         raise ValueError(f"sim_cap_multiplier must be a positive integer, got {sim_cap_multiplier!r}.")
 
@@ -237,6 +503,55 @@ def _build_snapshot_from_evaluated(
 class _E2RewardMixin:
     """Shared E2 two-step reward and 1-step fallback computation across tree search policies."""
 
+    def _cache_swd_from_distribution(
+        self,
+        state_key: Tuple[int, ...],
+        positions: torch.Tensor,
+        probabilities: Optional[torch.Tensor],
+    ):
+        if self.reward_mode == "swd" and state_key not in self.cached_swd_states:
+            self.cached_swd_states[state_key] = extract_swd_state_data(
+                probabilities,
+                positions,
+                top_k=self.swd_topk,
+            )
+
+    def _resolve_evaluation_payload(
+        self,
+        request: EvaluationRequest,
+        *,
+        logits: Optional[torch.Tensor] = None,
+        analysis: Optional[medal.StateAnalysis] = None,
+    ) -> medal.StateAnalysis:
+        if request is not self._pending or not request.attempted:
+            raise ValueError("Expected the current dispatched evaluation request.")
+        if (logits is None) == (analysis is None):
+            raise ValueError("Supply exactly one of logits and analysis.")
+
+        if analysis is None:
+            analysis, positions, probabilities, _ = medal.distribution_from_logits(
+                logits,
+                request.node.state,
+                self.prompt_len,
+                self.mask_id,
+                self.config,
+                search_excluded_token_ids=self.search_excluded_token_ids,
+            )
+            if self.reward_mode == "swd":
+                self._cache_swd_from_distribution(analysis.state_key, positions, probabilities)
+            del probabilities
+        elif self.reward_mode == "swd" and analysis.state_key not in self.cached_swd_states:
+            if (request.node.state[0, self.prompt_len:] == self.mask_id).any():
+                raise ValueError(
+                    "SWD reward mode requires logits or cached SWD distribution data for non-terminal states."
+                )
+            self._cache_swd_from_distribution(
+                analysis.state_key,
+                torch.empty(0, dtype=torch.long),
+                None,
+            )
+        return analysis
+
     def _compute_two_step_reward(
         self,
         parent_analysis: medal.StateAnalysis,
@@ -244,6 +559,12 @@ class _E2RewardMixin:
         grandchild_analysis: Optional[medal.StateAnalysis],
         grandchild_state: Optional[torch.Tensor] = None,
     ) -> Tuple[float, Optional[int]]:
+        parent_swd = child_swd = grandchild_swd = None
+        if self.reward_mode == "swd":
+            parent_swd = self.cached_swd_states.get(parent_analysis.state_key)
+            child_swd = self.cached_swd_states.get(child_analysis.state_key)
+            if grandchild_analysis is not None:
+                grandchild_swd = self.cached_swd_states.get(grandchild_analysis.state_key)
         return _compute_e2_two_step_reward(
             self.reward_mode,
             self.reward_lambda,
@@ -254,6 +575,10 @@ class _E2RewardMixin:
             grandchild_state=grandchild_state,
             prompt_len=self.prompt_len,
             mask_id=self.mask_id,
+            reward_beta=self.reward_beta,
+            parent_swd=parent_swd,
+            child_swd=child_swd,
+            grandchild_swd=grandchild_swd,
         )
 
     def _compute_one_step_fallback(
@@ -262,6 +587,10 @@ class _E2RewardMixin:
         child_analysis: medal.StateAnalysis,
         child_state: torch.Tensor,
     ) -> Tuple[float, Optional[int]]:
+        parent_swd = child_swd = None
+        if self.reward_mode == "swd":
+            parent_swd = self.cached_swd_states.get(parent_analysis.state_key)
+            child_swd = self.cached_swd_states.get(child_analysis.state_key)
         return _compute_e2_one_step_fallback(
             self.reward_mode,
             self.config.epsilon,
@@ -270,6 +599,9 @@ class _E2RewardMixin:
             child_state=child_state,
             prompt_len=self.prompt_len,
             mask_id=self.mask_id,
+            reward_beta=self.reward_beta,
+            parent_swd=parent_swd,
+            child_swd=child_swd,
         )
 
 
@@ -282,14 +614,25 @@ class E2MEDALSearch(_E2RewardMixin, CooperativeMEDALSearch):
         reward_mode: str = "fig",
         reward_lambda: float = 1.0,
         sim_cap_multiplier: int = DEFAULT_SIM_CAP_MULTIPLIER,
+        reward_beta: float = DEFAULT_SWD_BETA,
+        swd_topk: Optional[int] = DEFAULT_SWD_TOPK,
         **kwargs,
     ):
-        _validate_e2_params(reward_mode, reward_lambda, sim_cap_multiplier)
+        _validate_e2_params(
+            reward_mode,
+            reward_lambda,
+            sim_cap_multiplier,
+            reward_beta=reward_beta,
+            swd_topk=swd_topk,
+        )
         super().__init__(*args, **kwargs)
         self.reward_mode = reward_mode
         self.reward_lambda = float(reward_lambda)
+        self.reward_beta = float(reward_beta)
+        self.swd_topk = swd_topk
         self.sim_cap_multiplier = sim_cap_multiplier
         self.cached_analyses: Dict[Tuple[int, ...], medal.StateAnalysis] = {}
+        self.cached_swd_states: Dict[Tuple[int, ...], SWDStateData] = {}
         self._pending_grandchild: Optional[Dict[str, Any]] = None
 
     def _snapshot_checkpoint(self, budget: int, stop_reason: str = "model_call_budget") -> Dict[str, Any]:
@@ -367,6 +710,7 @@ class E2MEDALSearch(_E2RewardMixin, CooperativeMEDALSearch):
             "rig_step1": rig_step1,
             "rig_step2": 0.0,
             "reward_lambda": self.reward_lambda,
+            "reward_beta": self.reward_beta,
             "reward_mode": self.reward_mode,
             "common_mask_count": common_mask_count,
             "lookahead_available": False,
@@ -572,6 +916,8 @@ class E2MEDALSearch(_E2RewardMixin, CooperativeMEDALSearch):
         if g_remaining_masks == 0 and g_key not in self.cached_analyses:
             zero_entropies = torch.zeros(grandchild.state.shape[1] - self.prompt_len)
             self.cached_analyses[g_key] = medal.StateAnalysis(zero_entropies, (), g_key, 0.0)
+        if g_remaining_masks == 0 and self.reward_mode == "swd" and g_key not in self.cached_swd_states:
+            self._cache_swd_from_distribution(g_key, torch.empty(0, dtype=torch.long), None)
 
         # Case C1: Grandchild is already cached (or terminal with 0 masks) -> resolve with 0 extra NFEs
         if g_key in self.cached_analyses:
@@ -700,6 +1046,7 @@ class E2MEDALSearch(_E2RewardMixin, CooperativeMEDALSearch):
             "rig_step1": rig_step1,
             "rig_step2": rig_step2,
             "reward_lambda": self.reward_lambda,
+            "reward_beta": self.reward_beta,
             "reward_mode": self.reward_mode,
             "common_mask_count": common_mask_count,
             "lookahead_available": lookahead_available,
@@ -754,20 +1101,7 @@ class E2MEDALSearch(_E2RewardMixin, CooperativeMEDALSearch):
         logits: Optional[torch.Tensor] = None,
         analysis: Optional[medal.StateAnalysis] = None,
     ):
-        if request is not self._pending or not request.attempted:
-            raise ValueError("Expected the current dispatched evaluation request.")
-        if (logits is None) == (analysis is None):
-            raise ValueError("Supply exactly one of logits and analysis.")
-
-        if analysis is None:
-            analysis = medal.distribution_from_logits(
-                logits,
-                request.node.state,
-                self.prompt_len,
-                self.mask_id,
-                self.config,
-                search_excluded_token_ids=self.search_excluded_token_ids,
-            )[0]
+        analysis = self._resolve_evaluation_payload(request, logits=logits, analysis=analysis)
 
         child, parent = request.node, request.parent
 
@@ -820,14 +1154,25 @@ class E2ABMEDALSearch(_E2RewardMixin, ABMEDALSearch):
         reward_mode: str = "fig",
         reward_lambda: float = 1.0,
         sim_cap_multiplier: int = DEFAULT_SIM_CAP_MULTIPLIER,
+        reward_beta: float = DEFAULT_SWD_BETA,
+        swd_topk: Optional[int] = DEFAULT_SWD_TOPK,
         **kwargs,
     ):
-        _validate_e2_params(reward_mode, reward_lambda, sim_cap_multiplier)
+        _validate_e2_params(
+            reward_mode,
+            reward_lambda,
+            sim_cap_multiplier,
+            reward_beta=reward_beta,
+            swd_topk=swd_topk,
+        )
         super().__init__(*args, **kwargs)
         self.reward_mode = reward_mode
         self.reward_lambda = float(reward_lambda)
+        self.reward_beta = float(reward_beta)
+        self.swd_topk = swd_topk
         self.sim_cap_multiplier = sim_cap_multiplier
         self.cached_analyses: Dict[Tuple[int, ...], medal.StateAnalysis] = {}
+        self.cached_swd_states: Dict[Tuple[int, ...], SWDStateData] = {}
         self._pending_grandchild: Optional[Dict[str, Any]] = None
 
     def _snapshot_checkpoint(self, budget: int, stop_reason: str = "model_call_budget") -> Dict[str, Any]:
@@ -939,6 +1284,7 @@ class E2ABMEDALSearch(_E2RewardMixin, ABMEDALSearch):
             "rig_step1": rig_step1,
             "rig_step2": 0.0,
             "reward_lambda": self.reward_lambda,
+            "reward_beta": self.reward_beta,
             "reward_mode": self.reward_mode,
             "common_mask_count": common_mask_count,
             "lookahead_available": False,
@@ -1163,6 +1509,8 @@ class E2ABMEDALSearch(_E2RewardMixin, ABMEDALSearch):
         if g_remaining_masks == 0 and g_key not in self.cached_analyses:
             zero_entropies = torch.zeros(grandchild.state.shape[1] - self.prompt_len)
             self.cached_analyses[g_key] = medal.StateAnalysis(zero_entropies, (), g_key, 0.0)
+        if g_remaining_masks == 0 and self.reward_mode == "swd" and g_key not in self.cached_swd_states:
+            self._cache_swd_from_distribution(g_key, torch.empty(0, dtype=torch.long), None)
 
         # Case C1: Grandchild is already cached (or terminal with 0 masks) -> resolve with 0 extra NFEs
         if g_key in self.cached_analyses:
@@ -1300,6 +1648,7 @@ class E2ABMEDALSearch(_E2RewardMixin, ABMEDALSearch):
             "rig_step1": rig_step1,
             "rig_step2": rig_step2,
             "reward_lambda": self.reward_lambda,
+            "reward_beta": self.reward_beta,
             "reward_mode": self.reward_mode,
             "common_mask_count": common_mask_count,
             "lookahead_available": lookahead_available,
@@ -1376,20 +1725,7 @@ class E2ABMEDALSearch(_E2RewardMixin, ABMEDALSearch):
         logits: Optional[torch.Tensor] = None,
         analysis: Optional[medal.StateAnalysis] = None,
     ):
-        if request is not self._pending or not request.attempted:
-            raise ValueError("Expected the current dispatched evaluation request.")
-        if (logits is None) == (analysis is None):
-            raise ValueError("Supply exactly one of logits and analysis.")
-
-        if analysis is None:
-            analysis = medal.distribution_from_logits(
-                logits,
-                request.node.state,
-                self.prompt_len,
-                self.mask_id,
-                self.config,
-                search_excluded_token_ids=self.search_excluded_token_ids,
-            )[0]
+        analysis = self._resolve_evaluation_payload(request, logits=logits, analysis=analysis)
 
         child, parent = request.node, request.parent
 
@@ -1426,14 +1762,26 @@ class E2ABMEDALSearch(_E2RewardMixin, ABMEDALSearch):
                 break
             request.attempted = True
             with self._counted.phase(request.phase):
-                analysis = medal.analyze_state(
-                    self._counted,
-                    request.node.state,
-                    self.prompt_len,
-                    self.mask_id,
-                    self.config,
-                    search_excluded_token_ids=self.search_excluded_token_ids,
-                )
+                if self.reward_mode == "swd":
+                    analysis, positions, probabilities, _ = medal._distribution(
+                        self._counted,
+                        request.node.state,
+                        self.prompt_len,
+                        self.mask_id,
+                        self.config,
+                        search_excluded_token_ids=self.search_excluded_token_ids,
+                    )
+                    self._cache_swd_from_distribution(analysis.state_key, positions, probabilities)
+                    del probabilities
+                else:
+                    analysis = medal.analyze_state(
+                        self._counted,
+                        request.node.state,
+                        self.prompt_len,
+                        self.mask_id,
+                        self.config,
+                        search_excluded_token_ids=self.search_excluded_token_ids,
+                    )
             self.submit_evaluation(request, logits=None, analysis=analysis)
             if request.parent is not None and self._pending_grandchild is None:
                 break

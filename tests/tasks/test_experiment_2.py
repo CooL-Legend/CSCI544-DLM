@@ -12,9 +12,14 @@ from dlm_project.decoding.e2_search import (
     E2MEDALSearch,
     compute_cmer_reward,
     compute_fig_reward,
+    compute_pairwise_kl,
     compute_srig_reward,
+    compute_swd_one_step_fallback,
+    compute_swd_reward,
+    extract_swd_state_data,
 )
 from dlm_project.decoding.mcts_decoding import MCTSConfig, StateAnalysis, _state_key
+from dlm_project.experiments.resume import resume_signature
 from dlm_project.tasks.gsm8k import experiment_2 as e2
 from tests.decoding.test_ab_batch import BatchModel
 from tests.tasks.test_experiment_1 import mock_wrapper
@@ -560,6 +565,337 @@ def test_e2_cmer_actionless_nonterminal_fallback():
     )
     assert ev["common_mask_count"] == expected_count
     assert abs(ev["reward"] - expected_1step) < 1e-6
+
+
+def test_swd_reward_and_kl_formulas():
+    """Verify Q_swd, 1-step R_stability, sparse top-K tail KL parity, and parameter checks."""
+    eps = 1e-8
+    positions_all = torch.tensor([0, 1, 2, 3], dtype=torch.long)
+    p_parent = torch.tensor([
+        [0.7, 0.2, 0.05, 0.05],
+        [0.5, 0.3, 0.1, 0.1],
+        [0.6, 0.2, 0.1, 0.1],
+        [0.4, 0.3, 0.2, 0.1],
+    ])
+    p_child = torch.tensor([
+        [0.8, 0.1, 0.05, 0.05],
+        [0.5, 0.3, 0.1, 0.1],
+        [0.2, 0.5, 0.2, 0.1],
+        [0.4, 0.3, 0.2, 0.1],
+    ])
+    positions_gc = torch.tensor([1, 3], dtype=torch.long)
+    p_gc = torch.tensor([
+        [0.5, 0.3, 0.1, 0.1],  # identical to parent/child -> KL = 0, q = 0.5
+        [0.7, 0.15, 0.1, 0.05],  # shifted -> positive KL, q = 0.7
+    ])
+
+    swd_p = extract_swd_state_data(p_parent, positions_all, top_k=None)
+    swd_c = extract_swd_state_data(p_child, positions_all, top_k=None)
+    swd_g = extract_swd_state_data(p_gc, positions_gc, top_k=None)
+
+    common_mask = torch.tensor([False, True, False, True])
+    reward, count = compute_swd_reward(swd_p, swd_c, swd_g, common_mask, beta=1.0, epsilon=eps)
+    assert count == 2
+
+    # Position 1 has identical distributions -> KL = 0 -> contribution = 0.5 * 1.0
+    # Position 3 has p_p==p_c (KL_pc=0), p_c -> p_g positive forward KL
+    p3_c = p_child[3].double()
+    p3_g = p_gc[1].double()
+    kl_cg_3 = float((p3_c * (torch.log(p3_c + eps) - torch.log(p3_g + eps))).sum().item())
+    expected = 0.5 + 0.7 * math.exp(-1.0 * kl_cg_3)
+    assert abs(reward - expected) < 1e-6
+
+    # Beta = 0 collapses weights to 1 -> pure sum of q^j_{t+2}
+    r_b0, _ = compute_swd_reward(swd_p, swd_c, swd_g, common_mask, beta=0.0, epsilon=eps)
+    assert abs(r_b0 - (0.5 + 0.7)) < 1e-6
+
+    # Empty mask returns (0.0, 0)
+    r_empty, c_empty = compute_swd_reward(swd_p, swd_c, swd_g, torch.tensor([False, False, False, False]))
+    assert (r_empty, c_empty) == (0.0, 0)
+
+    # Sparse Top-K + analytical uniform tail matches exact full dense when tails are uniform
+    # p_a top-4 = {0,1,2,3} (sum=0.90), p_b top-4 = {0,2,4,5} (sum=0.88) -> partial overlap test
+    p_a = torch.tensor([[0.50, 0.25, 0.10, 0.05] + [0.10 / 6] * 6])
+    p_b = torch.tensor([[0.40, 0.02, 0.30, 0.02, 0.10, 0.08, 0.02, 0.02, 0.02, 0.02]])
+    pos1 = torch.tensor([0], dtype=torch.long)
+    dense_a = extract_swd_state_data(p_a, pos1, top_k=None)
+    dense_b = extract_swd_state_data(p_b, pos1, top_k=None)
+    sparse_a = extract_swd_state_data(p_a, pos1, top_k=4)
+    sparse_b = extract_swd_state_data(p_b, pos1, top_k=4)
+    kl_dense = compute_pairwise_kl(dense_a, dense_b, pos1, epsilon=eps)
+    kl_sparse = compute_pairwise_kl(sparse_a, sparse_b, pos1, epsilon=eps)
+    assert abs(float(kl_dense.item()) - float(kl_sparse.item())) < 1e-6
+
+    with pytest.raises(ValueError, match="Invalid reward_beta"):
+        compute_swd_reward(swd_p, swd_c, swd_g, common_mask, beta=-0.5)
+    with pytest.raises(ValueError, match="Invalid reward_beta"):
+        compute_swd_reward(swd_p, swd_c, swd_g, common_mask, beta=float("nan"))
+    with pytest.raises(ValueError, match="Invalid reward_beta"):
+        compute_swd_one_step_fallback(swd_p, swd_c, torch.ones(4, dtype=torch.bool), beta=True)
+
+
+@pytest.mark.parametrize("method", ["medal", "ab_medal"])
+def test_e2_swd_search_execution(method):
+    """Verify SWD 2-step search execution reuses compact distributions with 0 extra NFEs."""
+    m = BatchModel()
+    prompt = torch.tensor([[3, 3, 3]])
+    cfg_kwargs = dict(init_tokens=4, max_model_calls=10, stop_mode="budget")
+
+    if method == "medal":
+        tree = E2MEDALSearch(
+            m, prompt, 0, 50, MCTSConfig(**cfg_kwargs), seed=1, reward_mode="swd", reward_beta=1.0
+        )
+    else:
+        tree = E2ABMEDALSearch(
+            m, prompt, 0, 50, ABMEDALConfig(**cfg_kwargs), seed=1, reward_mode="swd", reward_beta=1.0
+        )
+
+    tree.step()
+
+    assert tree.model_calls == 3
+    child = tree.nodes[1]
+    assert child.immediate_reward is not None
+    assert math.isfinite(child.immediate_reward)
+
+    eval_events = [e for e in tree.trace if e.get("stage") == "evaluation"]
+    assert len(eval_events) == 1
+    ev = eval_events[0]
+    assert ev["reward_mode"] == "swd"
+    assert ev["reward_beta"] == 1.0
+    assert ev["lookahead_available"] is True
+    assert ev["common_mask_count"] == 48
+
+    g_action = tree.cached_analyses[_state_key(child.state)].actions[0]
+    g_state = child.state.clone()
+    g_state[0, tree.prompt_len + g_action.output_position] = g_action.token_id
+    g_key = _state_key(g_state)
+    g_mask = g_state[0, tree.prompt_len:] == tree.mask_id
+
+    expected_reward, expected_count = compute_swd_reward(
+        tree.cached_swd_states[_state_key(tree.root.state)],
+        tree.cached_swd_states[_state_key(child.state)],
+        tree.cached_swd_states[g_key],
+        g_mask,
+        beta=1.0,
+        epsilon=tree.config.epsilon,
+    )
+    assert ev["common_mask_count"] == expected_count
+    assert abs(ev["reward"] - expected_reward) < 1e-6
+
+    if method == "ab_medal":
+        child_models = tree.posteriors[child.node_id]
+        assert child_models["GEN"].kappa == 1.0
+        assert child_models["CONT"].kappa == 1.0
+
+
+@pytest.mark.parametrize("method", ["medal", "ab_medal"])
+def test_e2_swd_empty_common_masks_terminal_grandchild(method):
+    """When child is terminal or grandchild fills final mask (|M(g*)| == 0), SWD reward is 0.0."""
+    from dlm_project.decoding.mcts_decoding import Action, expand_node
+
+    m = BatchModel()
+    prompt = torch.tensor([[3, 3, 3]])
+    cfg_kwargs = dict(init_tokens=4, max_model_calls=6, stop_mode="budget")
+
+    def _make_tree():
+        if method == "medal":
+            t = E2MEDALSearch(m, prompt, 0, 5, MCTSConfig(**cfg_kwargs), seed=1, reward_mode="swd")
+        else:
+            t = E2ABMEDALSearch(m, prompt, 0, 5, ABMEDALConfig(**cfg_kwargs), seed=1, reward_mode="swd")
+        req_root = t.next_evaluation()
+        t.record_external_forward(req_root, invocation_id=1, batch_size=1)
+        with torch.no_grad():
+            t.submit_evaluation(req_root, logits=m(req_root.node.state).logits[0])
+        return t
+
+    # Case 1: Child with 1 mask left whose greedy action fills it -> |M(g*)| == 0 -> Q_swd = 0.0
+    tree1 = _make_tree()
+    near_terminal = expand_node(tree1.root, Action(0, 10, 0.9, 0.0, 0.1), 1, tree1.prompt_len, tree1.mask_id, 5)
+    near_terminal.state[0, tree1.prompt_len : tree1.prompt_len + 4] = torch.tensor([10, 11, 12, 13])
+    tree1.nodes.append(near_terminal)
+    c_key = _state_key(near_terminal.state)
+    c_analysis = StateAnalysis(
+        torch.tensor([0.0, 0.0, 0.0, 0.0, 0.9]), (Action(4, 14, 0.95, 0.0, 0.1),), c_key, 0.95
+    )
+    tree1.cached_swd_states[c_key] = extract_swd_state_data(
+        torch.tensor([[0.05, 0.05, 0.1, 0.1, 0.5, 0.2]]), torch.tensor([4], dtype=torch.long)
+    )
+    if method == "medal":
+        tree1._prepare_grandchild_or_finalize(near_terminal, tree1.root, c_analysis)
+    else:
+        tree1._prepare_grandchild_or_finalize(near_terminal, tree1.root, [tree1.root], ["GEN"], c_analysis)
+    evals1 = [e for e in tree1.trace if e.get("stage") == "evaluation"]
+    assert len(evals1) == 1
+    assert evals1[0]["common_mask_count"] == 0
+    assert evals1[0]["reward"] == 0.0
+
+    # Case 2: Already terminal child -> Q_swd = 0.0
+    tree2 = _make_tree()
+    terminal_child = expand_node(tree2.root, Action(0, 10, 0.9, 0.0, 0.1), 1, tree2.prompt_len, tree2.mask_id, 5)
+    terminal_child.state[0, tree2.prompt_len :] = torch.tensor([10, 11, 12, 13, 14])
+    tree2.nodes.append(terminal_child)
+    t_analysis = StateAnalysis(torch.zeros(5), (), _state_key(terminal_child.state), 0.0)
+    if method == "medal":
+        tree2._prepare_grandchild_or_finalize(terminal_child, tree2.root, t_analysis)
+    else:
+        tree2._prepare_grandchild_or_finalize(terminal_child, tree2.root, [tree2.root], ["GEN"], t_analysis)
+    evals2 = [e for e in tree2.trace if e.get("stage") == "evaluation"]
+    assert len(evals2) == 1
+    assert evals2[0]["lookahead_status"] == "terminal_child"
+    assert evals2[0]["common_mask_count"] == 0
+    assert evals2[0]["reward"] == 0.0
+
+
+@pytest.mark.parametrize("method", ["medal", "ab_medal"])
+def test_e2_swd_boundary_fallback_and_checkpoint_equivalence(method):
+    """Verify 1-step R_stability fallback at NFE boundary B=2 and exact checkpoint parity."""
+    m = BatchModel()
+    prompt = torch.tensor([[3, 3, 3]])
+
+    def _build(max_calls, checkpoint_budgets=None):
+        cfg_kwargs = dict(init_tokens=4, max_model_calls=max_calls, stop_mode="budget")
+        if method == "medal":
+            return E2MEDALSearch(
+                m, prompt, 0, 50, MCTSConfig(**cfg_kwargs), checkpoint_budgets=checkpoint_budgets, seed=1, reward_mode="swd"
+            )
+        return E2ABMEDALSearch(
+            m, prompt, 0, 50, ABMEDALConfig(**cfg_kwargs), checkpoint_budgets=checkpoint_budgets, seed=1, reward_mode="swd"
+        )
+
+    cont_tree = _build(max_calls=6, checkpoint_budgets=(2,))
+    while not cont_tree.done:
+        cont_tree.step()
+
+    ind_tree = _build(max_calls=2, checkpoint_budgets=None)
+    while not ind_tree.done:
+        ind_tree.step()
+
+    chk_2 = cont_tree.checkpoints[2]
+    assert chk_2["model_calls"] == 2
+    assert chk_2["stop_reason"] == "model_call_budget"
+
+    chk_evals = [e for e in chk_2["trace"] if e.get("stage") == "evaluation"]
+    ind_evals = [e for e in ind_tree.trace if e.get("stage") == "evaluation"]
+    assert len(chk_evals) == len(ind_evals) == 1
+
+    fallback_ev = chk_evals[0]
+    assert fallback_ev["reward_mode"] == "swd"
+    assert fallback_ev["reward_beta"] == 1.0
+    assert fallback_ev["lookahead_available"] is False
+    assert fallback_ev["lookahead_status"] == "budget_boundary_fallback"
+    assert fallback_ev["common_mask_count"] == 49
+    assert abs(fallback_ev["reward"] - ind_evals[0]["reward"]) < 1e-6
+
+    node1 = [n for n in cont_tree.nodes if n.node_id == fallback_ev["child_id"]][0]
+    expected_1step, _ = compute_swd_one_step_fallback(
+        cont_tree.cached_swd_states[_state_key(cont_tree.root.state)],
+        cont_tree.cached_swd_states[_state_key(node1.state)],
+        node1.state[0, cont_tree.prompt_len:] == cont_tree.mask_id,
+        beta=1.0,
+        epsilon=cont_tree.config.epsilon,
+    )
+    assert abs(fallback_ev["reward"] - expected_1step) < 1e-6
+
+
+def test_e2_swd_actionless_nonterminal_fallback():
+    """Non-terminal child with no legal actions uses 1-step R_stability fallback over M(c)."""
+    m = BatchModel()
+    prompt = torch.tensor([[3, 3, 3]])
+    tree = E2MEDALSearch(
+        m, prompt, 0, 50, MCTSConfig(init_tokens=4, max_model_calls=10, stop_mode="budget"), seed=1, reward_mode="swd"
+    )
+
+    req_root = tree.next_evaluation()
+    tree.record_external_forward(req_root, invocation_id=1, batch_size=1)
+    with torch.no_grad():
+        tree.submit_evaluation(req_root, logits=m(req_root.node.state).logits[0])
+    req_child = tree.next_evaluation()
+    child, parent = req_child.node, req_child.parent
+    c_key = _state_key(child.state)
+    c_entropies = torch.zeros(50)
+    c_entropies[child.state[0, tree.prompt_len:] == tree.mask_id] = 0.7
+    actionless_analysis = StateAnalysis(c_entropies, (), c_key, 0.0)
+
+    with torch.no_grad():
+        c_logits = m(child.state).logits[0, tree.prompt_len:]
+    c_probs = torch.softmax(c_logits.float(), dim=-1)
+    c_pos = torch.nonzero(child.state[0, tree.prompt_len:] == tree.mask_id, as_tuple=False).flatten()
+    tree._cache_swd_from_distribution(c_key, c_pos, c_probs[c_pos])
+    tree._prepare_grandchild_or_finalize(child, parent, actionless_analysis)
+
+    eval_events = [e for e in tree.trace if e.get("stage") == "evaluation"]
+    assert len(eval_events) == 1
+    ev = eval_events[0]
+    assert ev["lookahead_available"] is False
+    assert ev["lookahead_status"] == "no_legal_actions"
+    expected_1step, expected_count = compute_swd_one_step_fallback(
+        tree.cached_swd_states[_state_key(parent.state)],
+        tree.cached_swd_states[c_key],
+        child.state[0, tree.prompt_len:] == tree.mask_id,
+        beta=1.0,
+        epsilon=tree.config.epsilon,
+    )
+    assert ev["common_mask_count"] == expected_count
+    assert abs(ev["reward"] - expected_1step) < 1e-6
+
+
+def test_e2_swd_context_and_resume_signature():
+    """Verify SWD context parameters and resume signature compatibility."""
+    ctx_swd_1 = e2.context(stage="dev", num_samples=2, reward_mode="swd", reward_beta=1.0)
+    ctx_swd_2 = e2.context(stage="dev", num_samples=2, reward_mode="swd", reward_beta=2.0)
+    ctx_fig_a = e2.context(stage="dev", num_samples=2, reward_mode="fig")
+    ctx_fig_b = e2.context(stage="dev", num_samples=2, reward_mode="fig", reward_beta=9.0)
+
+    w = mock_wrapper()
+    prep = e2.prepare(w, ctx_swd_1)
+    sig_swd_1 = resume_signature(ctx_swd_1, prep, ("medal", "ab_medal"), (256, 512), 10, 3, 2)
+    sig_swd_2 = resume_signature(ctx_swd_2, prep, ("medal", "ab_medal"), (256, 512), 10, 3, 2)
+    sig_fig_a = resume_signature(ctx_fig_a, prep, ("medal", "ab_medal"), (256, 512), 10, 3, 2)
+    sig_fig_b = resume_signature(ctx_fig_b, prep, ("medal", "ab_medal"), (256, 512), 10, 3, 2)
+
+    assert sig_swd_1["settings_hash"] != sig_swd_2["settings_hash"]
+    assert sig_fig_a["settings_hash"] == sig_fig_b["settings_hash"]
+    assert "reward_beta" not in sig_fig_a["settings"]
+
+    with pytest.raises(ValueError, match="Invalid reward_beta"):
+        e2.context(stage="dev", reward_mode="swd", reward_beta=-1.0)
+
+
+@pytest.mark.parametrize("method", ["medal", "ab_medal"])
+def test_e2_swd_batched_parity_with_serial(method):
+    """Verify batched cooperative SWD execution matches serial step() exactly."""
+    m = BatchModel()
+    prompts = [torch.tensor([[3, 3, 3]]), torch.tensor([[3, 2, 3, 4]])]
+    cfg_kwargs = dict(init_tokens=4, max_model_calls=12, stop_mode="budget")
+
+    serial_rewards = []
+    for seed, prompt in enumerate(prompts, start=1):
+        if method == "medal":
+            t = E2MEDALSearch(m, prompt, 0, 50, MCTSConfig(**cfg_kwargs), seed=seed, reward_mode="swd", reward_beta=1.0)
+        else:
+            t = E2ABMEDALSearch(m, prompt, 0, 50, ABMEDALConfig(**cfg_kwargs), seed=seed, reward_mode="swd", reward_beta=1.0)
+        while not t.done:
+            t.step()
+        serial_rewards.append([e["reward"] for e in t.trace if e.get("stage") == "evaluation"])
+
+    batched_trees = []
+    for seed, prompt in enumerate(prompts, start=1):
+        if method == "medal":
+            batched_trees.append(
+                E2MEDALSearch(m, prompt, 0, 50, MCTSConfig(**cfg_kwargs), seed=seed, reward_mode="swd", reward_beta=1.0)
+            )
+        else:
+            batched_trees.append(
+                E2ABMEDALSearch(m, prompt, 0, 50, ABMEDALConfig(**cfg_kwargs), seed=seed, reward_mode="swd", reward_beta=1.0)
+            )
+    execute_trees(batched_trees, pad_token_id=4)
+    batched_rewards = [
+        [e["reward"] for e in t.trace if e.get("stage") == "evaluation"]
+        for t in batched_trees
+    ]
+    assert batched_rewards == serial_rewards
+
+
 
 
 
