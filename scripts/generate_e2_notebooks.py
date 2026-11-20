@@ -696,6 +696,58 @@ REWARD_NOTEBOOK_SPECS = {
             "and load `LLaDA-8B-Instruct` from staged NVMe storage."
         ),
     },
+    "swd": {
+        "mode": "swd",
+        "upper": "SWD",
+        "full_name": "Stability-Weighted Decoding (SWD)",
+        "symbol_label": "SWD ($Q_{\\mathrm{swd}}$)",
+        "dev_filename": "E2_Experiment_SWD_Dev.ipynb",
+        "eval_filename": "E2_Experiment_SWD_Eval.ipynb",
+        "dev_output_subdir": "results/e2_swd_dev",
+        "eval_output_subdir": "results/e2_swd_eval",
+        "reward_lambda": 1.0,
+        "reward_beta": 1.0,
+        "dev_equation_md": (
+            "For parent node $s$, candidate child $c = s \\oplus a_1$, and greedy virtual "
+            "grandchild $g^* = c \\oplus a_2^*$ ($a_2^* = A(c)[0]$), reward weights the "
+            "grandchild token confidence $q^j_{t+2} = \\max_v p^j_{t+2}(v)$ by trajectory "
+            "distributional stability across positions $\\mathcal{M}(g^*)$ remaining masked in $g^*$:\n"
+            "$$\n"
+            "Q_{\\mathrm{swd}}(\\text{Node}, \\text{Action}) = "
+            "\\sum_{j \\in \\mathcal{M}(g^*)} q^j_{t+2} \\cdot "
+            "\\exp\\!\\Big(-\\beta\\,\\big(\\mathrm{KL}^j(\\text{Node}, \\text{Child}) "
+            "+ \\mathrm{KL}^j(\\text{Child}, \\text{GrandChild})\\big)\\Big)\n"
+            "$$\n"
+            "where $\\mathrm{KL}^j(A, B) = D_{\\mathrm{KL}}(p_A^j \\,\\|\\, p_B^j)$ is the forward "
+            "KL divergence along $s \\xrightarrow{a_1} c \\xrightarrow{a_2^*} g^*$ and $\\beta = 1.0$.\n\n"
+        ),
+        "extra_rule_md": (
+            "- **Compact Distribution Cache (0 Extra NFEs)**: Top-$512$ token probabilities plus exact "
+            "residual uniform tail and exact $q^j_t = \\max_v p^j_t(v)$ are cached per state directly from the single forward pass.\n"
+            "- **Empty Masks & 1-Step $R_{\\mathrm{stability}}$ Fallback**: When $|\\mathcal{M}(g^*)| = 0$ "
+            "(terminal child or grandchild filling the last mask), $Q_{\\mathrm{swd}} = 0.0$. "
+            "When lookahead is unavailable (actionless non-terminal child or NFE boundary fallback), "
+            "reward uses the 1-step stability objective "
+            "$R_{\\mathrm{stability}}(\\text{Node}, \\text{Child}) = "
+            "\\sum_{j \\in \\mathcal{M}(c)} q^j_{t+1} \\cdot \\exp(-\\beta\\,\\mathrm{KL}^j(\\text{Node}, \\text{Child}))$.\n"
+        ),
+        "unit_test_md": (
+            "Run unit tests to verify 2-step lookahead SWD KL-stability reward computation, 1-step $R_{\\mathrm{stability}}$ fallback, "
+            "exact checkpoint boundaries, and state caching."
+        ),
+        "unit_test_eval_md": (
+            "Verify 2-step lookahead SWD KL-stability reward computation, 1-step $R_{\\mathrm{stability}}$ fallback, state caching, "
+            "and batched parity before loading weights."
+        ),
+        "controls_md": (
+            "Configure 5-question frozen `dev` set, matched search budgets [256, 512], "
+            "SWD reward mode with $\\beta=1.0$, and $4B$ simulation cap."
+        ),
+        "controls_eval_md": (
+            "Configure budgets [256, 512], depth 10, batch size 2, SWD reward mode ($\\beta=1.0$), "
+            "and load `LLaDA-8B-Instruct` from staged NVMe storage."
+        ),
+    },
 }
 
 
@@ -825,6 +877,9 @@ def _create_e2_reward_dev_notebook(spec: dict):
 
     # Section 6: Experiment Controls
     cells.append(nbf.v4.new_markdown_cell(f"## 6. Experiment Controls & Configuration\n{spec['controls_md']}"))
+    beta_const = f"REWARD_BETA = {spec['reward_beta']}\n" if "reward_beta" in spec else ""
+    beta_arg = "    reward_beta=REWARD_BETA,\n" if "reward_beta" in spec else ""
+    beta_print = " | β={REWARD_BETA}" if "reward_beta" in spec else ""
     cells.append(nbf.v4.new_code_cell(
         "from dlm_project.tasks.gsm8k.experiment_2 import (\n"
         "    CHECKPOINT_BUDGETS, MAX_SEARCH_DEPTH, MIN_CANDIDATES, context\n"
@@ -834,7 +889,8 @@ def _create_e2_reward_dev_notebook(spec: dict):
         "BUDGETS = (256, 512)\n"
         f"REWARD_MODE = {mode!r}\n"
         f"REWARD_LAMBDA = {spec['reward_lambda']}\n"
-        "SIM_CAP_MULTIPLIER = 4\n"
+        + beta_const
+        + "SIM_CAP_MULTIPLIER = 4\n"
         "# On NVIDIA L4 (22.4 GiB VRAM), BATCH_SIZE = 2 is recommended for stability;\n"
         "# BATCH_SIZE = 4 is suited for A100 (40/80 GB) or High-RAM runtimes.\n"
         "BATCH_SIZE = 2\n"
@@ -847,9 +903,10 @@ def _create_e2_reward_dev_notebook(spec: dict):
         "    num_candidates=MIN_CANDIDATES,\n"
         "    reward_mode=REWARD_MODE,\n"
         "    reward_lambda=REWARD_LAMBDA,\n"
-        "    sim_cap_multiplier=SIM_CAP_MULTIPLIER,\n"
+        + beta_arg
+        + "    sim_cap_multiplier=SIM_CAP_MULTIPLIER,\n"
         ")\n"
-        "print(f'Stage: {ctx[\"stage\"]} | Questions: {len(ctx[\"examples\"])} | Budgets: {BUDGETS} | Methods: {METHODS} | Reward: {REWARD_MODE} (λ={REWARD_LAMBDA}) | Sim Cap: {SIM_CAP_MULTIPLIER}B | Batch Size: {BATCH_SIZE}')\n"
+        + f"print(f'Stage: {{ctx[\"stage\"]}} | Questions: {{len(ctx[\"examples\"])}} | Budgets: {{BUDGETS}} | Methods: {{METHODS}} | Reward: {{REWARD_MODE}} (λ={{REWARD_LAMBDA}}{beta_print}) | Sim Cap: {{SIM_CAP_MULTIPLIER}}B | Batch Size: {{BATCH_SIZE}}')\n"
     ))
 
     # Section 7: Load Model
@@ -1104,6 +1161,8 @@ def _create_e2_reward_eval_notebook(spec: dict):
 
     # Section 6: Controls & Model Loading
     cells.append(nbf.v4.new_markdown_cell(f"## 6. Experiment Controls & Staged Model Loading\n{spec['controls_eval_md']}"))
+    beta_const = f"REWARD_BETA = {spec['reward_beta']}\n" if "reward_beta" in spec else ""
+    beta_arg = "    reward_beta=REWARD_BETA,\n" if "reward_beta" in spec else ""
     cells.append(nbf.v4.new_code_cell(
         "import shutil\n"
         "from pathlib import Path\n"
@@ -1116,7 +1175,8 @@ def _create_e2_reward_eval_notebook(spec: dict):
         "BUDGETS = (256, 512)\n"
         f"REWARD_MODE = {mode!r}\n"
         f"REWARD_LAMBDA = {spec['reward_lambda']}\n"
-        "SIM_CAP_MULTIPLIER = 4\n"
+        + beta_const
+        + "SIM_CAP_MULTIPLIER = 4\n"
         "# On NVIDIA L4 (22.4 GiB VRAM), BATCH_SIZE = 2 is recommended for stability;\n"
         "# BATCH_SIZE = 4 is suited for A100 (40/80 GB) or High-RAM runtimes.\n"
         "BATCH_SIZE = 2\n"
@@ -1128,7 +1188,8 @@ def _create_e2_reward_eval_notebook(spec: dict):
         "    budgets=BUDGETS,\n"
         "    reward_mode=REWARD_MODE,\n"
         "    reward_lambda=REWARD_LAMBDA,\n"
-        "    sim_cap_multiplier=SIM_CAP_MULTIPLIER,\n"
+        + beta_arg
+        + "    sim_cap_multiplier=SIM_CAP_MULTIPLIER,\n"
         ")\n\n"
         "profile = get_profile('llada')\n"
         "model_name = profile['repo_id'].split('/')[-1]\n"
@@ -1160,7 +1221,8 @@ def _create_e2_reward_eval_notebook(spec: dict):
         "    sample_slice=(0, 20),\n"
         "    reward_mode=REWARD_MODE,\n"
         "    reward_lambda=REWARD_LAMBDA,\n"
-        "    sim_cap_multiplier=SIM_CAP_MULTIPLIER,\n"
+        + beta_arg
+        + "    sim_cap_multiplier=SIM_CAP_MULTIPLIER,\n"
         ")\n"
         f"print('Starting Part 1 (Canonical 20 Questions) with {upper} reward...')\n"
         "t0 = perf_counter()\n"
@@ -1191,7 +1253,8 @@ def _create_e2_reward_eval_notebook(spec: dict):
         "    sample_slice=(20, 70),\n"
         "    reward_mode=REWARD_MODE,\n"
         "    reward_lambda=REWARD_LAMBDA,\n"
-        "    sim_cap_multiplier=SIM_CAP_MULTIPLIER,\n"
+        + beta_arg
+        + "    sim_cap_multiplier=SIM_CAP_MULTIPLIER,\n"
         ")\n"
         f"print('Starting Part 2 (Additional 50 Questions) with {upper} reward...')\n"
         "t0 = perf_counter()\n"
@@ -1355,6 +1418,14 @@ def create_e2_cmer_eval_notebook():
     _create_e2_reward_eval_notebook(REWARD_NOTEBOOK_SPECS["cmer"])
 
 
+def create_e2_swd_dev_notebook():
+    _create_e2_reward_dev_notebook(REWARD_NOTEBOOK_SPECS["swd"])
+
+
+def create_e2_swd_eval_notebook():
+    _create_e2_reward_eval_notebook(REWARD_NOTEBOOK_SPECS["swd"])
+
+
 def main():
     create_e2_dev_notebook()
     create_e2_eval_notebook()
@@ -1362,6 +1433,8 @@ def main():
     create_e2_srig_eval_notebook()
     create_e2_cmer_dev_notebook()
     create_e2_cmer_eval_notebook()
+    create_e2_swd_dev_notebook()
+    create_e2_swd_eval_notebook()
 
 
 if __name__ == "__main__":

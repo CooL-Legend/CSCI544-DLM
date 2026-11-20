@@ -20,6 +20,8 @@ def resume_signature(ctx, prepared, methods, budgets, max_depth, num_candidates,
         "sim_cap_multiplier": ctx.get("sim_cap_multiplier"),
         "source_fingerprint": source_fingerprint(),
     }
+    if ctx.get("reward_mode") == "swd":
+        settings["reward_beta"] = ctx.get("reward_beta")
     return {"settings_hash": digest(settings), "settings": settings,
             "examples": [{"example_id": p["example"]["example_id"],
                           "identity_hash": digest({"example": p["example"], "seed": p["seed"],

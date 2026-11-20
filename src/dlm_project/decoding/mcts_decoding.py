@@ -673,9 +673,12 @@ class MCTSSearch:
                                 for n in evaluated]
         }
 
+        actual_calls = min(self.model_calls, budget)
         return {
             "budget": budget,
-            "model_calls": min(self.model_calls, budget),
+            "model_calls": actual_calls,
+            "simulations_completed": self.simulations_completed,
+            "nfe_utilization": (actual_calls / budget) if budget > 0 else 1.0,
             "nodes": evaluated,
             "candidates": candidates,
             "shortlist": shortlist,

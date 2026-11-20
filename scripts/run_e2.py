@@ -135,13 +135,19 @@ def main(argv=None) -> int:
         "--reward-mode",
         choices=list(VALID_REWARD_MODES),
         default="fig",
-        help="Two-step lookahead reward function: 'fig' (Fractional IG), 'srig' (Sum of Relative IG), or 'cmer' (Common-Mask Entropy Reduction).",
+        help="Two-step lookahead reward function: 'fig' (Fractional IG), 'srig' (Sum of Relative IG), 'cmer' (Common-Mask Entropy Reduction), or 'swd' (Stability-Weighted Decoding).",
     )
     parser.add_argument(
         "--reward-lambda",
         type=float,
         default=1.0,
         help="Weight lambda for the second-step relative IG term in SRIG mode (default: 1.0).",
+    )
+    parser.add_argument(
+        "--reward-beta",
+        type=float,
+        default=1.0,
+        help="Stability KL decay weight beta for SWD mode (default: 1.0).",
     )
     parser.add_argument(
         "--sim-cap-multiplier",
@@ -234,6 +240,7 @@ def main(argv=None) -> int:
         sample_slice=sample_slice,
         reward_mode=args.reward_mode,
         reward_lambda=args.reward_lambda,
+        reward_beta=args.reward_beta,
         sim_cap_multiplier=args.sim_cap_multiplier,
     )
 

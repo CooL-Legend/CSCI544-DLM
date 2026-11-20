@@ -8,13 +8,14 @@ import argparse
 from collections import defaultdict
 import copy
 from dataclasses import asdict
+import gc
 import hashlib
 import json
 import os
 from pathlib import Path
 from time import perf_counter
 from types import SimpleNamespace
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 
@@ -40,8 +41,9 @@ from dlm_project.experiments.sweep_report import wilson_interval, write_csv
 from dlm_project.tasks.gsm8k.e0_tokens import resolve_termination_tokens, decode_output
 from dlm_project.tasks.gsm8k.evaluation import score_answer
 from dlm_project.tasks.gsm8k.experiment_protocol import (
-    EXTENDED_TEST_COUNT, STAGE_COUNTS,
-    load_shared_protocol, get_extended_manifest, get_manifest, select_examples, build_prompt, example_seed
+    E2_EVALUATION_COUNT, E2_STAGE_COUNTS, EXTENDED_TEST_COUNT, STAGE_COUNTS,
+    load_shared_protocol, get_e2_manifest, get_extended_manifest, get_manifest,
+    select_examples, build_prompt, example_seed
 )
 
 PROTOCOL_VERSION = "e1_unified_fixed_depth_v1"
@@ -65,21 +67,35 @@ def state_hash(state_tensor):
 
 
 def context(*, stage="dev", methods=("medal", "ab_medal"), budgets=None,
-            max_depth=MAX_SEARCH_DEPTH, num_candidates=MIN_CANDIDATES, num_samples=None):
+            max_depth=MAX_SEARCH_DEPTH, num_candidates=MIN_CANDIDATES, num_samples=None,
+            sample_slice: Optional[Tuple[int, int]] = None):
     """Create and validate execution context for E1."""
     common = load_shared_protocol()
     if budgets is None:
         budgets = tuple(c["budget"] for c in common["search"]["conditions"])
-    if stage == "test" and num_samples is not None and num_samples > STAGE_COUNTS["test"]:
+    norm_stage = "evaluation" if stage in ("eval", "evaluation") else stage
+    if norm_stage == "test" and num_samples is not None and num_samples > STAGE_COUNTS["test"]:
         manifest = get_extended_manifest(common=common, test_count=EXTENDED_TEST_COUNT)
-        examples = select_examples(manifest, stage, expected_count=EXTENDED_TEST_COUNT)
+        examples = select_examples(manifest, norm_stage, expected_count=EXTENDED_TEST_COUNT)
+    elif norm_stage == "evaluation" and (
+        sample_slice is not None or (num_samples is not None and num_samples > STAGE_COUNTS["evaluation"])
+    ):
+        manifest = get_e2_manifest(common=common)
+        examples = select_examples(
+            manifest,
+            norm_stage,
+            expected_count=E2_STAGE_COUNTS.get(norm_stage, STAGE_COUNTS[norm_stage]),
+        )
     else:
         manifest = get_manifest(common=common)
-        examples = select_examples(manifest, stage)
-    if num_samples is not None:
+        examples = select_examples(manifest, norm_stage)
+    if sample_slice is not None:
+        start, end = sample_slice
+        examples = examples[start:end]
+    elif num_samples is not None:
         examples = examples[:num_samples]
     if not examples:
-        raise ValueError(f"No examples found for stage {stage}.")
+        raise ValueError(f"No examples found for stage {stage} (slice={sample_slice}, num_samples={num_samples}).")
 
     for m in methods:
         if m not in ("medal", "ab_medal"):
@@ -88,10 +104,12 @@ def context(*, stage="dev", methods=("medal", "ab_medal"), budgets=None,
     return {
         "protocol_version": PROTOCOL_VERSION,
         "stage": stage,
+        "norm_stage": norm_stage,
         "methods": list(methods),
         "budgets": list(budgets),
         "max_depth": max_depth,
         "num_candidates": num_candidates,
+        "reward_mode": "normalized_ig",
         "common": common,
         "manifest": manifest["dataset"],
         "manifest_hash": digest(manifest),
@@ -285,6 +303,12 @@ def execute_search_batch_checkpointed(wrapper, prepared_group, ctx, method: str,
         if not active:
             break
         invocation_id += 1
+        if invocation_id % 25 == 0 or invocation_id == 1:
+            calls_str = ", ".join(
+                f"Q{i}:{tree.model_calls}/{max_budget} NFEs, {tree.simulations_completed} sims ({len(tree.nodes)} nodes)"
+                for i, tree in enumerate(trees)
+            )
+            print(f"  [{method.upper()} Step {invocation_id}] Active: {len(active)}/{len(trees)} | {calls_str}", flush=True)
         current_states = [r.node.state for r in requests]
         ids, attention, _ = pack_states(current_states, pad_token_id, device)
         for index, request in zip(active, requests):
@@ -300,8 +324,11 @@ def execute_search_batch_checkpointed(wrapper, prepared_group, ctx, method: str,
                 sync(wrapper.model)
                 search_latencies[index] = perf_counter() - t0
         del prediction
+        del ids, attention, current_states
 
     sync(wrapper.model)
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     total_search_time = perf_counter() - t0
     for index, tree in enumerate(trees):
         if search_latencies[index] is None:
@@ -362,6 +389,12 @@ def complete_selected_states_batch(wrapper, completion_requests, ctx, completion
             if not active:
                 break
             invocation_id += 1
+            if invocation_id % 50 == 0 or invocation_id == 1:
+                masks_left = [
+                    int((unique_uncached[i]["state"][0, unique_uncached[i]["prompt_len"]:] == mask_id).sum().item())
+                    for i in active
+                ]
+                print(f"  [Completion Step {invocation_id}] Active: {len(active)} | Masks remaining: {masks_left}", flush=True)
             current_states = [unique_uncached[i]["state"] for i in active]
             ids, attention, _ = pack_states(current_states, pad_token_id, device)
             for i in active:
@@ -402,8 +435,11 @@ def complete_selected_states_batch(wrapper, completion_requests, ctx, completion
                     sync(wrapper.model)
                     entry["comp_time"] = perf_counter() - t0
             del prediction
+            del ids, attention, current_states
 
         sync(wrapper.model)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         total_comp_time = perf_counter() - t0
         for entry in unique_uncached:
             comp_time = entry["comp_time"] if entry["comp_time"] is not None else total_comp_time
@@ -494,8 +530,9 @@ def export_question_e1_artifacts(wrapper, search, search_time: float, prepared_i
                 wrapper, selected_node.state, prepared_item, ctx, completion_cache=completion_cache
             )
 
-        comp_nfes = 256 - selected_node.depth
-        total_nfes = budget + comp_nfes
+        actual_search_nfes = int(chk.get("model_calls", budget))
+        comp_nfes = getattr(completion, "model_calls", 256 - selected_node.depth)
+        total_nfes = actual_search_nfes + comp_nfes
 
         # Build checkpoint search_audit
         chk_trace = chk["trace"] + [chk["selection"]]
@@ -506,7 +543,7 @@ def export_question_e1_artifacts(wrapper, search, search_time: float, prepared_i
             gen_length=ctx["common"]["generation"]["gen_length"],
             requested_depth=max_depth,
             requested_budget=budget,
-            search_nfes=budget,
+            search_nfes=actual_search_nfes,
             adaptive=(method == "ab_medal"),
             shortlist_limit=num_candidates,
         )
@@ -561,6 +598,9 @@ def export_question_e1_artifacts(wrapper, search, search_time: float, prepared_i
                 for node_id, models in chk["posteriors"].items()
             })
 
+        sim_completed = chk.get("simulations_completed", getattr(search, "simulations_completed", 0))
+        nfe_util = chk.get("nfe_utilization", (actual_search_nfes / budget) if budget else 1.0)
+
         checkpoint_row = {
             "method": method,
             "search_budget": budget,
@@ -573,9 +613,14 @@ def export_question_e1_artifacts(wrapper, search, search_time: float, prepared_i
             "reference_answer": score["reference_answer"],
             "exact_match": bool(score["exact_match"]),
             "parse_success": bool(score["parse_success"]),
-            "search_nfes": budget,
+            "search_nfes": actual_search_nfes,
             "completion_nfes": comp_nfes,
             "total_nfes": total_nfes,
+            "nfe_utilization": float(nfe_util),
+            "simulations_completed": int(sim_completed),
+            "simulation_cap": None,
+            "simulation_cap_bound": bool(chk.get("stop_reason") == "simulation_budget"),
+            "reward_mode": ctx.get("reward_mode", "normalized_ig"),
             "search_wall_seconds": chk["search_elapsed_seconds"],
             "completion_wall_seconds": comp_time,
             "total_wall_seconds": (chk["search_elapsed_seconds"]) + comp_time,
@@ -668,6 +713,12 @@ def run_questions_batch_e1(wrapper, prepared_group, ctx, method: str,
         )
         batch_rows.extend(rows)
 
+    del search_pairs
+    del precomputed_completions
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
     return batch_rows
 
 
@@ -713,6 +764,12 @@ def compute_e1_aggregate_rows(all_checkpoint_rows: List[Dict[str, Any]], stage: 
                 "mean_search_nfe": sum(r["search_nfes"] for r in subset) / n,
                 "mean_completion_nfe": sum(r["completion_nfes"] for r in subset) / n,
                 "mean_total_nfe": sum(r["total_nfes"] for r in subset) / n,
+                "mean_nfe_utilization": sum(
+                    r.get("nfe_utilization", (r["search_nfes"] / budget) if budget else 1.0)
+                    for r in subset
+                ) / n,
+                "mean_simulations": sum(r.get("simulations_completed", 0) for r in subset) / n,
+                "sim_cap_bind_rate": sum(bool(r.get("simulation_cap_bound", False)) for r in subset) / n,
                 "mean_search_wall_seconds": sum(r["search_wall_seconds"] for r in subset) / n,
                 "mean_completion_wall_seconds": sum(r["completion_wall_seconds"] for r in subset) / n,
                 "mean_total_wall_seconds": sum(r["total_wall_seconds"] for r in subset) / n,
@@ -780,6 +837,7 @@ def run_e1_stage(wrapper, ctx, output_dir: Path, methods=("medal", "ab_medal"),
         "budgets": list(budgets),
         "max_depth": max_depth,
         "num_candidates": num_candidates,
+        "reward_mode": ctx.get("reward_mode", "normalized_ig"),
         "batch_size": batch_size,
         "sample_count": len(prepared),
         "examples": [p["example"]["example_id"] for p in prepared],
@@ -875,6 +933,7 @@ def run_e1_stage(wrapper, ctx, output_dir: Path, methods=("medal", "ab_medal"),
             print(f"  💾 Saved progress to CSV ({len(all_checkpoint_rows)} rows recorded). Disk synced.", flush=True)
 
     manifest_data["status"] = "completed"
+    manifest_data["completion_timestamp"] = perf_counter()
     agg_rows = save_e1_progress(
         output_dir, summaries_dir, ctx["stage"],
         all_checkpoint_rows, methods, budgets,
