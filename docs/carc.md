@@ -114,6 +114,112 @@ set `REPO_DIR` explicitly and provide suitable `sbatch --output` and
 `--error` paths. Slurm executes a spooled copy of the script, so its own file
 location cannot identify the repository.
 
+## Group 37: two-step SWD on the same 500 test questions
+
+`scripts/run_carc_e2_swd_test.sbatch` runs the **two-step SWD reward from
+`notebooks/gsm8k/E2_Experiment_SWD_Eval.ipynb`** on the same frozen 500-question
+GSM8K test pool and ordering used by the E1 run. The original notebook's
+20 + 50 evaluation split remains unchanged. The CARC launcher selects
+`--stage test --num-samples 500` for the larger comparison.
+
+The notebook's reward sums grandchild confidence weighted by stability along
+the parent → child → virtual-grandchild trajectory, with **beta = 1.0**.
+This entry runs that E2 implementation, including its one-step stability
+fallback and compact distribution cache. It does not select the separate
+`IG − lambda * KL` reward modification from `sean-1114`.
+
+The requested production defaults are:
+
+| Setting | Value |
+| --- | --- |
+| Slurm account / partition | `xiangren_1987` / `gpu` |
+| GPU / wall time | one `a40` / `24:00:00` |
+| CPU cores / host RAM | `4` / `64G` |
+| Questions / batch size | `500` / `8` |
+| Methods / search checkpoints | MEDAL + AB-MEDAL / `256`, `512` |
+| Search depth / minimum candidates | `10` / `3` |
+| Reward | `swd`, beta `1.0`, lambda `1.0` |
+| Simulation cap | `4 * B` per question |
+| Results | `REPO_DIR/results/e2_swd_test_500` |
+| Logs | `results/slurm/e2-swd-<jobid>.out` and `.err` |
+
+Lambda is passed for consistency with the notebook; beta controls the SWD
+stability penalty. The simulation cap can stop a search before its NFE budget
+is exhausted; E2 reports the actual search NFE and utilization.
+
+Submit all 500 questions from the CARC checkout:
+
+```bash
+cd /home1/xchen664/CSCI544-DLM
+mkdir -p results/slurm
+ARTIFACT_ROOT="$PWD/results/e2_swd_test_500" \
+  sbatch scripts/run_carc_e2_swd_test.sbatch 500 8
+```
+
+Omitting both positional arguments also selects `500 8`. The arguments are
+question count and batch size; `NUM_SAMPLES` and `BATCH_SIZE` can provide
+defaults when the corresponding positional argument is omitted.
+
+For a two-question smoke run in its own output directory:
+
+```bash
+cd /home1/xchen664/CSCI544-DLM
+mkdir -p results/slurm
+ARTIFACT_ROOT="$PWD/results/e2_swd_debug_smoke" sbatch \
+  --partition=debug --gpus-per-task=a40:1 --time=01:00:00 \
+  scripts/run_carc_e2_swd_test.sbatch 2 2
+```
+
+The launcher reuses the existing environment
+`/project2/xiangren_1987/group_37/envs/dlm` and model
+`/project2/xiangren_1987/group_37/model-cache`. It keeps the configured dataset
+cache at `/project2/xiangren_1987/group_37/datasets`, while reading all test
+questions and reference answers directly from the repository manifests.
+It performs no package installation, model download, dataset download or
+Google Drive operation. Model weights are read in place, and writable runtime
+metadata goes to `REPO_DIR/.cache/carc` as in the E1 launcher. The same
+`REPO_DIR`, `ENV_DIR`/`DLM_ENV`, `MODEL_DIR`, `MODEL_PATH`, `HF_DATASETS_CACHE`,
+`RESULTS_DIR`, `ARTIFACT_ROOT` and `PERSIST_ROOT` overrides are supported.
+
+The job runs GPU search and standard LLaDA confidence completion, saves
+checkpoints and resource profiles, and then generates paired comparisons and
+offline E3 diagnostics. Its outputs include:
+
+| Output under `results/e2_swd_test_500/` | Contents |
+| --- | --- |
+| `summaries/e2_test_aggregate.csv` | Accuracy, parse rate, NFE, timing and search statistics by method/budget |
+| `summaries/e2_test_paired_comparison.csv` | Same-question MEDAL vs. AB-MEDAL comparison at each budget |
+| `summaries/e2_test_per_question.csv` | Per-question predictions, references and scores |
+| `summaries/e3_test_aggregate.csv` | Offline search-tree metrics |
+| `summaries/e3_figures/` | Six diagnostic figures, PNG and PDF |
+| `test/<method>/<example_id>/` | Per-question traces, completion markers and checkpoints |
+| `run_manifest.json` | Configuration, sample identities and run completion status |
+| `resource_summary.json`, `resource_attempts/` | Current and historical attempt resource measurements |
+
+The shared E3 renderer retains historical labels such as `ig_mean` and
+"Negative IG"; for this run they describe the stored **SWD immediate reward**,
+not raw information gain. Its depth/root-subtree counts describe attached
+search-tree nodes rather than exact forward allocation, because E2 also
+evaluates virtual grandchildren and reuses cached states. Use E2 search NFE,
+utilization and resource profiles to compare compute usage.
+
+A complete run has four aggregate rows with `sample_count=500`, two paired
+rows with `paired_questions=500`, and `run_manifest.json` status `completed`.
+There are 2,000 question/method/budget outcomes. Slurm should also show
+`COMPLETED` with exit code `0:0` when reporting and E3 analysis have finished.
+
+If the job times out, resubmit the **same command, output directory, batch size
+and source/configuration**. Compatible completed question/method results are
+reused; interrupted searches are recomputed. A completed E1 directory such as
+`results/e1_test_500` is not an SWD resume directory. Keep it for comparison.
+Changing SWD settings or batch size requires a separate output directory.
+
+The default batch size 8 is the requested setting; the two-question smoke run
+does not establish full-batch GPU memory or runtime. Inspect the resource
+measurements for the new SWD run rather than treating E1 measurements as SWD
+measurements. This direct launcher does not depend on the separate benchmark
+gate described below.
+
 ## Existing notebook and benchmark workflow
 
 The sections below retain the original Jupyter and measured-pilot/production

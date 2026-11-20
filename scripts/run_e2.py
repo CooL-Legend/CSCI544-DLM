@@ -1,7 +1,7 @@
-"""CLI entry point for Experiment 2 (E2: Two-Step Lookahead FIG Reward).
+"""CLI entry point for Experiment 2 (E2: Two-Step Lookahead Rewards).
 
-Compares MEDAL vs. AB-MEDAL under a two-step lookahead Fractional Information Gain (FIG)
-reward function across matched search budgets (B in {256, 512}).
+Compares MEDAL vs. AB-MEDAL under FIG, SRIG, CMER or SWD rewards across matched
+search budgets (B in {256, 512}).
 
 Examples:
     # 2-example smoke test on Dev (B=256, B=512):
@@ -18,6 +18,10 @@ Examples:
 
     # Full Evaluation run (all 70 questions):
     python scripts/run_e2.py --stage eval --eval-split all_70 --batch-size 4
+
+    # SWD on the same frozen 500-question test pool as E1:
+    python scripts/run_e2.py --stage test --num-samples 500 --batch-size 8 \\
+        --reward-mode swd --reward-beta 1.0 --run-e3 --output-dir results/e2_swd_test_500
 """
 
 import argparse
@@ -107,15 +111,15 @@ def main(argv=None) -> int:
     )
     parser.add_argument(
         "--stage",
-        choices=("dev", "eval", "evaluation"),
+        choices=("dev", "eval", "evaluation", "test"),
         default="dev",
-        help="Experiment stage: 'dev' (5 questions) or 'eval'/'evaluation' (up to 70 questions).",
+        help="Experiment stage: 'dev' (5), 'eval'/'evaluation' (70), or 'test' (200 by default; up to 500 with --num-samples).",
     )
     parser.add_argument(
         "--eval-split",
         choices=("canonical_20", "extended_50", "all_70"),
         default="all_70",
-        help="Evaluation split slice: 'canonical_20' (first 20 questions), 'extended_50' (questions 20 to 70), or 'all_70' (all 70).",
+        help="For eval/evaluation only: 'canonical_20' (first 20), 'extended_50' (questions 20 to 70), or 'all_70' (all 70).",
     )
     parser.add_argument(
         "--methods",
@@ -166,7 +170,7 @@ def main(argv=None) -> int:
     parser.add_argument(
         "--num-samples",
         type=int,
-        help="Optional prefix count to limit the number of questions for testing.",
+        help="Prefix count within the selected split: dev <= 5, eval <= 70, test <= 500. Test defaults to the canonical 200 questions.",
     )
     parser.add_argument(
         "--model-path",
@@ -207,6 +211,8 @@ def main(argv=None) -> int:
         raise RuntimeError("CUDA is requested but unavailable on this host.")
 
     norm_stage = "evaluation" if args.stage in ("eval", "evaluation") else args.stage
+    if norm_stage != "evaluation" and args.eval_split != "all_70":
+        parser.error("--eval-split is only available for eval/evaluation stages.")
     sample_slice: Optional[Tuple[int, int]] = None
     if norm_stage == "evaluation":
         if args.eval_split == "canonical_20":
@@ -226,6 +232,7 @@ def main(argv=None) -> int:
         print(f"  Eval Split     : {args.eval_split} (slice: {sample_slice})")
     print(f"  Configurations : {len(methods) * len(budgets)} ({[f'{m}@{b}' for b in budgets for m in methods]})")
     print(f"  Search Depth   : L_c = {args.max_depth} | Min Candidates C = {args.num_candidates}")
+    print(f"  Reward         : {args.reward_mode} | beta={args.reward_beta} | lambda={args.reward_lambda} | simulation cap={args.sim_cap_multiplier}B")
     print(f"  Batch Size     : {args.batch_size} | Resume: {args.resume}")
     print(f"  Output Dir     : {args.output_dir.resolve()}")
     print("=" * 78, flush=True)
@@ -244,7 +251,7 @@ def main(argv=None) -> int:
         sim_cap_multiplier=args.sim_cap_multiplier,
     )
 
-    print(f"\nPrepared {len(ctx['examples'])} questions for evaluation.")
+    print(f"\nPrepared {len(ctx['examples'])} questions for stage {norm_stage!r}.")
     print(f"Loading model on {args.device} (local_files_only={args.local_files_only})...", flush=True)
     wrapper = load_model(
         ctx,
