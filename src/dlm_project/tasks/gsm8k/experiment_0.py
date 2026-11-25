@@ -1,27 +1,54 @@
 """E0: LLaDA Confidence primary baseline and optional LLaDA Entropy baseline."""
 
 import argparse
+from collections import defaultdict
 import copy
+import gc
 import json
+from math import comb
+import os
 from pathlib import Path
 import signal
 import subprocess
 from time import perf_counter
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 
-from dlm_project.decoding import confidence, entropy
-from dlm_project.decoding.common import validate_generation
+from dlm_project.decoding import confidence, entropy, mcts_decoding as medal
+from dlm_project.decoding.ab_batch import pack_states, sync
+from dlm_project.decoding.common import commit_from_logits, initialize_state, validate_generation
 from dlm_project.decoding.decoder_result import CountingModel
+from dlm_project.decoding.medal_demo import DecodingResult
 from dlm_project.experiments.artifacts import save_json
 from dlm_project.experiments.config import load_config
 from dlm_project.experiments.manifests import digest
 from dlm_project.experiments.paths import create_run_directory
+from dlm_project.experiments.resources import (
+    profiled_stage,
+    record_batch,
+    record_completed,
+    record_prepared,
+    resource_phase,
+    synchronize,
+)
+from dlm_project.experiments.resume import begin_question, resume_signature, validate_resume
+from dlm_project.experiments.sweep_report import wilson_interval, write_csv
 from dlm_project.models.profiles import get_profile
 from dlm_project.paths import PROJECT_ROOT
 from dlm_project.tasks.gsm8k.experiment_protocol import (
-    STAGE_COUNTS, get_manifest, select_examples, build_prompt as build_e0_prompt,
-    example_seed, resolve_common_reference,
+    E2_EVALUATION_COUNT,
+    E2_STAGE_COUNTS,
+    EXTENDED_TEST_COUNT,
+    STAGE_COUNTS,
+    build_prompt as build_e0_prompt,
+    example_seed,
+    get_e2_manifest,
+    get_extended_manifest,
+    get_manifest,
+    load_shared_protocol,
+    resolve_common_reference,
+    select_examples,
 )
 from dlm_project.tasks.gsm8k.e0_tokens import decode_output, resolve_termination_tokens
 from dlm_project.tasks.gsm8k.evaluation import score_answer
@@ -29,6 +56,7 @@ from dlm_project.tasks.gsm8k.evaluation import score_answer
 
 PROTOCOL_VERSION = "e0_fixed_budget_v6"
 DECODERS = {"confidence": confidence.decode, "entropy": entropy.decode}
+SELECTION_RULES = {"confidence": "token_probability", "entropy": "lowest_entropy"}
 MIGRATION = ("E0 focuses on search-free baselines (LLaDA Confidence, optional Entropy). "
              "MEDAL search has migrated to Experiment 1 (scripts/run_e1_e3.py).")
 
@@ -406,4 +434,685 @@ def main():
                        run_manifest=args.run_manifest)
     finally:
         signal.signal(signal.SIGTERM, previous)
+
+
+# ---------------------------------------------------------------------------
+# Unified Stage-Runner API for E0 (Search-Free LLaDA Confidence & Entropy)
+# Aligned with Experiment 1 & Experiment 2 test/evaluation protocols
+# ---------------------------------------------------------------------------
+
+
+def context(
+    *,
+    stage: str = "test",
+    methods: Sequence[str] = ("confidence",),
+    num_samples: Optional[int] = None,
+    sample_slice: Optional[Tuple[int, int]] = None,
+) -> Dict[str, Any]:
+    """Create and validate execution context for E0 across dev, evaluation, or test splits."""
+    common = load_shared_protocol()
+    norm_stage = "evaluation" if stage in ("eval", "evaluation") else stage
+    stage_limits = {
+        "dev": STAGE_COUNTS["dev"],
+        "evaluation": E2_EVALUATION_COUNT,
+        "test": EXTENDED_TEST_COUNT,
+    }
+    if norm_stage not in stage_limits:
+        raise ValueError("Stage must be dev, eval, evaluation, or test.")
+    limit = stage_limits[norm_stage]
+
+    if num_samples is not None and (type(num_samples) is not int or not 1 <= num_samples <= limit):
+        raise ValueError(f"num_samples for stage {stage!r} must be an integer from 1 to {limit}.")
+    if sample_slice is not None:
+        if (
+            not isinstance(sample_slice, (tuple, list))
+            or len(sample_slice) != 2
+            or any(type(value) is not int for value in sample_slice)
+            or not 0 <= sample_slice[0] < sample_slice[1] <= limit
+        ):
+            raise ValueError(f"sample_slice for stage {stage!r} must satisfy 0 <= start < end <= {limit}.")
+
+    if norm_stage == "test":
+        requested_end = sample_slice[1] if sample_slice is not None else num_samples
+        if requested_end is not None and requested_end > STAGE_COUNTS["test"]:
+            manifest = get_extended_manifest(common=common, test_count=EXTENDED_TEST_COUNT)
+            expected_count = EXTENDED_TEST_COUNT
+        else:
+            manifest = get_manifest(common=common)
+            expected_count = STAGE_COUNTS["test"]
+    elif norm_stage == "evaluation":
+        requested_end = sample_slice[1] if sample_slice is not None else num_samples
+        if sample_slice is not None or (requested_end is not None and requested_end > STAGE_COUNTS["evaluation"]):
+            manifest = get_e2_manifest(common=common)
+            expected_count = E2_STAGE_COUNTS["evaluation"]
+        else:
+            manifest = get_manifest(common=common)
+            expected_count = STAGE_COUNTS["evaluation"]
+    else:
+        manifest = get_manifest(common=common)
+        expected_count = STAGE_COUNTS["dev"]
+
+    examples = select_examples(manifest, norm_stage, expected_count=expected_count)
+    if sample_slice is not None:
+        start, end = sample_slice
+        examples = examples[start:end]
+    if num_samples is not None:
+        if num_samples > len(examples):
+            raise ValueError(f"num_samples={num_samples} exceeds the selected split of {len(examples)} questions.")
+        examples = examples[:num_samples]
+    if not examples:
+        raise ValueError(f"No examples found for stage {stage} (slice={sample_slice}, num_samples={num_samples}).")
+
+    if isinstance(methods, str):
+        methods = (methods,)
+    methods_list = list(methods)
+    if not methods_list:
+        raise ValueError("At least one E0 baseline method ('confidence' or 'entropy') must be specified.")
+    for m in methods_list:
+        if m not in SELECTION_RULES:
+            raise ValueError(f"Unknown E0 baseline method {m!r}. Must be 'confidence' or 'entropy'.")
+
+    return {
+        "protocol_version": PROTOCOL_VERSION,
+        "stage": stage,
+        "norm_stage": norm_stage,
+        "methods": methods_list,
+        "budgets": [0],
+        "max_depth": 0,
+        "num_candidates": 1,
+        "reward_mode": "none",
+        "common": common,
+        "manifest": manifest["dataset"],
+        "manifest_hash": digest(manifest),
+        "prompt_template_hash": digest(common["prompt"]["template"]),
+        "examples": examples,
+        "setup": {},
+    }
+
+
+def load_model(ctx: Optional[Dict[str, Any]] = None, *, model_path=None, device: str = "cuda", local_files_only: bool = False):
+    """Load LLaDA wrapper for E0 experiments."""
+    from dlm_project.models.llada import LLaDA
+
+    dtype = ctx["common"]["model"]["dtype"] if ctx and "common" in ctx else "bfloat16"
+    started = perf_counter()
+    wrapper = LLaDA(device=device, model_path=model_path, dtype=dtype, local_files_only=local_files_only)
+    synchronize(wrapper.model)
+    wrapper.model_load_seconds = perf_counter() - started
+    if ctx is not None:
+        ctx.setdefault("setup", {})["model_load_seconds"] = wrapper.model_load_seconds
+    return wrapper
+
+
+def prepare(wrapper, ctx: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Tokenize and format prompts for all examples in the stage."""
+    termination = resolve_termination_tokens(wrapper.tokenizer, wrapper.model, wrapper.mask_id)
+    pad = getattr(wrapper.tokenizer, "pad_token_id", None) or termination["eos_token_id"]
+    prepared = []
+    for example in ctx["examples"]:
+        prompt = build_e0_prompt(example["question"], ctx["common"]["prompt"])
+        ids = wrapper.encode_prompt(prompt)
+        prepared.append({
+            "example": example,
+            "text": prompt,
+            "ids": ids,
+            "prompt_ids": ids[0].cpu().tolist(),
+            "prompt_hash": digest(prompt),
+            "prompt_ids_hash": digest(ids.cpu().tolist()),
+            "seed": example_seed(example["row_id"]),
+            "prompt_template_hash": ctx["prompt_template_hash"],
+        })
+    ctx.update(termination=termination, pad_token_id=pad, model=wrapper.identity)
+    return prepared
+
+
+def _jsonl(path: Path, rows: Sequence[Dict[str, Any]]) -> None:
+    with path.open("w") as f:
+        for row in rows:
+            f.write(json.dumps(row, allow_nan=False) + "\n")
+
+
+@torch.inference_mode()
+@resource_phase("completion")
+def decode_states_batch_e0(wrapper, prepared_group: Sequence[Dict[str, Any]], ctx: Dict[str, Any], method: str):
+    """Execute search-free LLaDA decoding at T=0 across a batch of questions."""
+    if method not in SELECTION_RULES:
+        raise ValueError(f"Unknown E0 baseline method {method!r}. Must be 'confidence' or 'entropy'.")
+    selection_rule = SELECTION_RULES[method]
+    gen_length = int(ctx["common"]["generation"]["gen_length"])
+    device = medal.model_device(wrapper.model)
+    pad_token_id = ctx["pad_token_id"]
+    mask_id = wrapper.mask_id
+
+    entries = []
+    for item in prepared_group:
+        prompt_len = item["ids"].shape[1]
+        state = initialize_state(item["ids"], mask_id, gen_length, device)
+        entries.append({
+            "item": item,
+            "prompt_len": prompt_len,
+            "state": state,
+            "calls": 0,
+            "trace": [],
+            "comp_time": None,
+        })
+
+    if entries:
+        sync(wrapper.model)
+        t0 = perf_counter()
+        invocation_id = 0
+
+        while True:
+            active = [
+                i for i, entry in enumerate(entries)
+                if (entry["state"][0, entry["prompt_len"]:] == mask_id).any()
+            ]
+            if not active:
+                break
+            invocation_id += 1
+            if invocation_id % 50 == 0 or invocation_id == 1:
+                masks_left = [
+                    int((entries[i]["state"][0, entries[i]["prompt_len"]:] == mask_id).sum().item())
+                    for i in active
+                ]
+                print(
+                    f"  [{method.upper()} Decode Step {invocation_id}] Active: {len(active)}/{len(entries)} | "
+                    f"Masks remaining: {masks_left}",
+                    flush=True,
+                )
+            current_states = [entries[i]["state"] for i in active]
+            ids, attention, _ = pack_states(current_states, pad_token_id, device)
+            for i in active:
+                entries[i]["calls"] += 1
+                entries[i]["trace"].append({
+                    "stage": "forward",
+                    "phase": "completion",
+                    "model_calls": entries[i]["calls"],
+                    "invocation_id": invocation_id,
+                    "batch_size": len(active),
+                })
+            prediction = wrapper.model(ids) if len(active) == 1 else wrapper.model(ids, attention_mask=attention)
+            for row, i in enumerate(active):
+                entry = entries[i]
+                state = entry["state"]
+                prompt_len = entry["prompt_len"]
+                positions = torch.nonzero(state[0, prompt_len:] == mask_id, as_tuple=False).flatten() + prompt_len
+                actions, signals = commit_from_logits(
+                    state,
+                    prediction.logits[row, :state.shape[1]],
+                    prompt_len,
+                    mask_id,
+                    positions,
+                    1,
+                    selection_rule=selection_rule,
+                    temperature=0.0,
+                )
+                entry["trace"].append(_compact_event({
+                    "stage": "commit",
+                    "block": 0,
+                    "step": entry["calls"] - 1,
+                    "model_calls": entry["calls"],
+                    "actions": actions,
+                    **signals,
+                    "remaining_masks": int((state[0, prompt_len:] == mask_id).sum().item()),
+                }))
+                if not (state[0, prompt_len:] == mask_id).any():
+                    sync(wrapper.model)
+                    entry["comp_time"] = perf_counter() - t0
+            del prediction
+            del ids, attention, current_states
+
+        sync(wrapper.model)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        total_comp_time = perf_counter() - t0
+    else:
+        total_comp_time = 0.0
+
+    results = []
+    for entry in entries:
+        comp_time = entry["comp_time"] if entry["comp_time"] is not None else total_comp_time
+        item = entry["item"]
+        prompt_len = entry["prompt_len"]
+        token_ids = entry["state"].detach().cpu()
+        completion = DecodingResult(
+            token_ids=token_ids,
+            model_calls=entry["calls"],
+            wall_seconds=comp_time,
+            method=method,
+            trace=entry["trace"],
+        )
+        decoded = decode_output(
+            wrapper.tokenizer,
+            completion.token_ids[0, prompt_len:].tolist(),
+            ctx["termination"]["token_ids"],
+        )
+        score = score_answer(decoded["scoring_text"], item["example"]["reference_solution"])
+        results.append((item, completion, decoded, score, comp_time))
+    return results
+
+
+@resource_phase("artifacts")
+def export_question_e0_artifacts(
+    wrapper,
+    completion: DecodingResult,
+    decoded: Dict[str, Any],
+    score: Dict[str, Any],
+    comp_time: float,
+    prepared_item: Dict[str, Any],
+    ctx: Dict[str, Any],
+    method: str,
+    base_dir: Path,
+) -> Dict[str, Any]:
+    """Export per-question E0 artifacts and completion marker."""
+    ex_id = prepared_item["example"]["example_id"]
+    q_dir = base_dir / method / ex_id
+    q_dir.mkdir(parents=True, exist_ok=True)
+    begin_question(q_dir)
+
+    events = [_compact_event(e) for e in completion.trace]
+    _jsonl(q_dir / "trace.jsonl", events)
+
+    prompt_record = {k: v for k, v in prepared_item.items() if k != "ids"}
+    prompt_record.update(mask_id=wrapper.mask_id, gen_length=ctx["common"]["generation"]["gen_length"])
+    save_json(q_dir / "prompt.json", prompt_record)
+    save_json(q_dir / "config.json", ctx)
+
+    comp_nfes = int(getattr(completion, "model_calls", ctx["common"]["generation"]["gen_length"]))
+    completion_record = {
+        **decoded,
+        "score": score,
+        "token_ids": completion.token_ids.tolist(),
+        "completion_nfes": comp_nfes,
+        "completion_wall_seconds": comp_time,
+        "was_cached": False,
+    }
+    save_json(q_dir / "completion.json", completion_record)
+
+    metrics_row = {
+        "method": method,
+        "condition": f"{method}_t0",
+        "selection_rule": SELECTION_RULES[method],
+        "search_budget": 0,
+        "example_id": ex_id,
+        "row_id": prepared_item["example"]["row_id"],
+        "question": prepared_item["example"]["question"],
+        "reference_solution": prepared_item["example"]["reference_solution"],
+        "scoring_text": decoded["scoring_text"],
+        "raw_output": decoded["raw_output"],
+        "first_terminator_position": decoded["first_terminator_position"],
+        "predicted_answer": score["predicted_answer"],
+        "reference_answer": score["reference_answer"],
+        "exact_match": bool(score["exact_match"]),
+        "parse_success": bool(score["parse_success"]),
+        "search_nfes": 0,
+        "completion_nfes": comp_nfes,
+        "total_nfes": comp_nfes,
+        "nfe_utilization": 1.0,
+        "simulations_completed": 0,
+        "simulation_cap": None,
+        "simulation_cap_bound": False,
+        "reward_mode": "none",
+        "search_wall_seconds": 0.0,
+        "completion_wall_seconds": comp_time,
+        "total_wall_seconds": comp_time,
+        "max_depth_reached": 0,
+        "selected_depth": 0,
+        "selection_depth_gap": 0,
+        "selected_q": 0.0,
+        "fallback_used": False,
+        "stop_reason": "all_masks_filled",
+        "was_cached": False,
+        "artifact_directory": str(q_dir),
+    }
+    save_json(q_dir / "metrics.json", metrics_row)
+    save_json(q_dir / "complete.json", {"method": method, "example_id": ex_id, "budgets": [0]})
+
+    match_sym = "✓" if score["exact_match"] else "✗"
+    print(
+        f"  [{match_sym} E0 {method.upper():10s}] Q: {ex_id:<10} | "
+        f"Pred: {score['predicted_answer']!r:<10} | Ref: {score['reference_answer']!r:<10} | "
+        f"Match: {str(score['exact_match']):<5} | NFEs: {comp_nfes} | Time: {comp_time:.1f}s",
+        flush=True,
+    )
+    return metrics_row
+
+
+def run_question_e0(wrapper, prepared_item: Dict[str, Any], ctx: Dict[str, Any], method: str, base_dir: Path) -> Dict[str, Any]:
+    """Run a single question under an E0 search-free baseline method."""
+    results = decode_states_batch_e0(wrapper, [prepared_item], ctx, method)
+    _, completion, decoded, score, comp_time = results[0]
+    return export_question_e0_artifacts(
+        wrapper, completion, decoded, score, comp_time, prepared_item, ctx, method, base_dir
+    )
+
+
+def run_questions_batch_e0(
+    wrapper,
+    prepared_group: Sequence[Dict[str, Any]],
+    ctx: Dict[str, Any],
+    method: str,
+    base_dir: Path,
+) -> List[Dict[str, Any]]:
+    """Run a batch of questions cooperatively under an E0 search-free baseline method."""
+    if len(prepared_group) == 1:
+        return [run_question_e0(wrapper, prepared_group[0], ctx, method, base_dir)]
+
+    decoded_batch = decode_states_batch_e0(wrapper, prepared_group, ctx, method)
+    batch_rows = []
+    for item, completion, decoded, score, comp_time in decoded_batch:
+        row = export_question_e0_artifacts(
+            wrapper, completion, decoded, score, comp_time, item, ctx, method, base_dir
+        )
+        batch_rows.append(row)
+
+    del decoded_batch
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    return batch_rows
+
+
+def is_question_complete(stage_dir: Path, method: str, ex_id: str, budgets: Sequence[int] = (0,)) -> bool:
+    """Verify whether all per-question E0 artifacts and completion marker are valid on disk."""
+    q_dir = Path(stage_dir) / method / ex_id
+    try:
+        marker = json.loads((q_dir / "complete.json").read_text())
+        if marker != {"method": method, "example_id": ex_id, "budgets": sorted(budgets)}:
+            return False
+        trace = [json.loads(line) for line in (q_dir / "trace.jsonl").read_text().splitlines() if line.strip()]
+        if not trace or not all(isinstance(row, dict) for row in trace):
+            return False
+        metrics = json.loads((q_dir / "metrics.json").read_text())
+        completion = json.loads((q_dir / "completion.json").read_text())
+        if (
+            metrics["method"] != method
+            or metrics["example_id"] != ex_id
+            or metrics["search_budget"] != 0
+            or not isinstance(metrics["exact_match"], bool)
+            or metrics["predicted_answer"] != completion["score"]["predicted_answer"]
+            or metrics["exact_match"] != completion["score"]["exact_match"]
+            or not completion["token_ids"]
+        ):
+            return False
+        return True
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return False
+
+
+def load_completed_question_row(stage_dir: Path, method: str, ex_id: str) -> Dict[str, Any]:
+    """Load cached E0 per-question metrics row from disk."""
+    met_file = Path(stage_dir) / method / ex_id / "metrics.json"
+    return json.loads(met_file.read_text())
+
+
+def compute_e0_aggregate_rows(
+    all_rows: Sequence[Dict[str, Any]],
+    stage: str,
+    methods: Sequence[str],
+) -> List[Dict[str, Any]]:
+    """Compute aggregate accuracy, Wilson 95% CIs, parse rate, NFEs, and latencies for E0."""
+    agg_rows = []
+    for method in methods:
+        subset = [r for r in all_rows if r["method"] == method]
+        n = len(subset)
+        if not n:
+            continue
+        correct_cnt = sum(bool(r["exact_match"]) for r in subset)
+        parsed_cnt = sum(bool(r["parse_success"]) for r in subset)
+        ci_low, ci_high = wilson_interval(correct_cnt, n)
+
+        agg_rows.append({
+            "stage": stage,
+            "method": method,
+            "condition": f"{method}_t0",
+            "search_budget": 0,
+            "sample_count": n,
+            "correct_count": correct_cnt,
+            "accuracy": correct_cnt / n,
+            "accuracy_percent": 100.0 * correct_cnt / n,
+            "ci_95_low": ci_low,
+            "ci_95_high": ci_high,
+            "parse_rate": parsed_cnt / n,
+            "mean_search_nfe": sum(r["search_nfes"] for r in subset) / n,
+            "mean_completion_nfe": sum(r["completion_nfes"] for r in subset) / n,
+            "mean_total_nfe": sum(r["total_nfes"] for r in subset) / n,
+            "mean_nfe_utilization": 1.0,
+            "mean_simulations": 0.0,
+            "sim_cap_bind_rate": 0.0,
+            "mean_search_wall_seconds": 0.0,
+            "mean_completion_wall_seconds": sum(r["completion_wall_seconds"] for r in subset) / n,
+            "mean_total_wall_seconds": sum(r["total_wall_seconds"] for r in subset) / n,
+            "mean_selected_depth": 0.0,
+            "fallback_rate": 0.0,
+        })
+    return agg_rows
+
+
+def mcnemar_exact_pvalue(b_wins: int, c_losses: int) -> float:
+    """Two-sided exact binomial McNemar p-value on discordant pairs."""
+    n = b_wins + c_losses
+    if n == 0:
+        return 1.0
+    k = min(b_wins, c_losses)
+    tail = sum(comb(n, i) for i in range(k + 1)) * (0.5 ** n)
+    return min(1.0, 2.0 * tail)
+
+
+def compute_paired_comparison(
+    q_rows: Sequence[Dict[str, Any]],
+    baseline_method: str = "confidence",
+    comparison_method: str = "entropy",
+) -> List[Dict[str, Any]]:
+    """Compute paired comparison and McNemar stats between two E0 baseline methods."""
+    by_key = {(r["example_id"], r["method"]): r for r in q_rows}
+    ex_ids = sorted({r["example_id"] for r in q_rows})
+    pairs = [
+        (by_key[(ex_id, baseline_method)], by_key[(ex_id, comparison_method)])
+        for ex_id in ex_ids
+        if (ex_id, baseline_method) in by_key and (ex_id, comparison_method) in by_key
+    ]
+    if not pairs:
+        return []
+    n = len(pairs)
+    both_correct = sum(1 for base, comp in pairs if base["exact_match"] and comp["exact_match"])
+    comp_only = sum(1 for base, comp in pairs if (not base["exact_match"]) and comp["exact_match"])
+    base_only = sum(1 for base, comp in pairs if base["exact_match"] and (not comp["exact_match"]))
+    both_wrong = sum(1 for base, comp in pairs if (not base["exact_match"]) and (not comp["exact_match"]))
+
+    base_acc = (both_correct + base_only) / n
+    comp_acc = (both_correct + comp_only) / n
+    delta_acc = comp_acc - base_acc
+    p_val = mcnemar_exact_pvalue(comp_only, base_only)
+
+    return [{
+        "search_budget": 0,
+        "paired_questions": n,
+        "baseline_method": baseline_method,
+        "comparison_method": comparison_method,
+        f"{baseline_method}_accuracy": base_acc,
+        f"{comparison_method}_accuracy": comp_acc,
+        "accuracy_delta": delta_acc,
+        "accuracy_delta_percent": 100.0 * delta_acc,
+        "both_correct": both_correct,
+        f"{comparison_method}_only_correct": comp_only,
+        f"{baseline_method}_only_correct": base_only,
+        "both_wrong": both_wrong,
+        "mcnemar_exact_p": p_val,
+    }]
+
+
+@resource_phase("artifacts")
+def save_e0_progress(
+    output_dir: Path,
+    summaries_dir: Path,
+    stage: str,
+    all_rows: List[Dict[str, Any]],
+    methods: Sequence[str],
+    manifest_data: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    """Immediately write and flush per-question and aggregate CSVs and manifest, syncing OS buffers."""
+    summaries_dir.mkdir(parents=True, exist_ok=True)
+    agg_rows = []
+    if all_rows:
+        per_q_path = summaries_dir / f"e0_{stage}_per_question.csv"
+        write_csv(per_q_path, all_rows)
+        write_csv(summaries_dir / "e0_per_question.csv", all_rows)
+
+        agg_rows = compute_e0_aggregate_rows(all_rows, stage, methods)
+        agg_path = summaries_dir / f"e0_{stage}_aggregate.csv"
+        write_csv(agg_path, agg_rows)
+        write_csv(summaries_dir / "e0_aggregate.csv", agg_rows)
+
+    if manifest_data is not None:
+        save_json(output_dir / "run_manifest.json", manifest_data)
+        save_json(summaries_dir / f"run_manifest_{stage}.json", manifest_data)
+
+    try:
+        os.sync()
+    except (AttributeError, OSError):
+        pass
+
+    return agg_rows
+
+
+@profiled_stage
+def run_e0_stage(
+    wrapper,
+    ctx: Dict[str, Any],
+    output_dir: Path,
+    methods: Optional[Sequence[str]] = None,
+    resume: bool = True,
+    batch_size: int = 1,
+    profile_resources: bool = False,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Execute complete E0 stage for search-free baseline methods with incremental saving, resumption, and cooperative batching."""
+    if type(batch_size) is not int or batch_size < 1:
+        raise ValueError("batch_size must be a positive integer.")
+    resolved_methods = tuple(methods) if methods is not None else tuple(ctx["methods"])
+    for m in resolved_methods:
+        if m not in SELECTION_RULES:
+            raise ValueError(f"Unknown E0 baseline method {m!r}. Must be 'confidence' or 'entropy'.")
+
+    output_dir = Path(output_dir)
+    stage_dir = output_dir / ctx["stage"]
+    summaries_dir = output_dir / "summaries"
+    summaries_dir.mkdir(parents=True, exist_ok=True)
+
+    prepared = prepare(wrapper, ctx)
+    record_prepared(prepared)
+    signature = resume_signature(ctx, prepared, resolved_methods, (0,), 0, 1, batch_size)
+    validate_resume(output_dir, ctx["stage"], signature, resume)
+
+    manifest_data = {
+        "protocol_version": PROTOCOL_VERSION,
+        "stage": ctx["stage"],
+        "methods": list(resolved_methods),
+        "budgets": [0],
+        "max_depth": 0,
+        "num_candidates": 1,
+        "reward_mode": "none",
+        "batch_size": batch_size,
+        "sample_count": len(prepared),
+        "examples": [p["example"]["example_id"] for p in prepared],
+        "setup": ctx.get("setup", {}),
+        "model": ctx.get("model", {}),
+        "status": "in_progress",
+        "resume_signature": signature,
+    }
+    save_json(output_dir / "run_manifest.json", manifest_data)
+    save_json(summaries_dir / f"run_manifest_{ctx['stage']}.json", manifest_data)
+
+    total_q = len(prepared)
+    rows_by_ex_method: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    ordered_ex_ids = [p["example"]["example_id"] for p in prepared]
+    all_rows: List[Dict[str, Any]] = []
+    agg_rows: List[Dict[str, Any]] = []
+
+    for start_idx in range(0, total_q, batch_size):
+        group_items = prepared[start_idx : start_idx + batch_size]
+        end_idx = start_idx + len(group_items)
+        group_ex_ids = [item["example"]["example_id"] for item in group_items]
+
+        for method in resolved_methods:
+            if len(group_items) == 1:
+                print(
+                    f"\n[Progress {end_idx}/{total_q}] Question: {group_ex_ids[0]} | Baseline: {method.upper()}",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"\n[Progress {start_idx + 1}-{end_idx}/{total_q} | batch_size={len(group_items)}] "
+                    f"Questions: {', '.join(group_ex_ids)} | Baseline: {method.upper()}",
+                    flush=True,
+                )
+
+            cached_by_ex: Dict[str, List[Dict[str, Any]]] = {}
+            pending_items = []
+            for item in group_items:
+                ex_id = item["example"]["example_id"]
+                if resume and is_question_complete(stage_dir, method, ex_id):
+                    cached_row = load_completed_question_row(stage_dir, method, ex_id)
+                    match_sym = "✓" if cached_row["exact_match"] else "✗"
+                    print(
+                        f"  [{match_sym} Cached E0 {method.upper():10s}] Q: {ex_id:<10} | "
+                        f"Pred: {cached_row['predicted_answer']!r:<10} | "
+                        f"Ref: {cached_row['reference_answer']!r:<10} | "
+                        f"Match: {str(cached_row['exact_match']):<5} | (loaded from disk)",
+                        flush=True,
+                    )
+                    cached_by_ex[ex_id] = [cached_row]
+                else:
+                    pending_items.append(item)
+
+            record_batch(pending_items, cached_by_ex, method)
+            computed_by_ex: Dict[str, Dict[str, Any]] = {}
+            if pending_items:
+                if batch_size == 1 or len(pending_items) == 1:
+                    item = pending_items[0]
+                    row = run_question_e0(wrapper, item, ctx, method, stage_dir)
+                    computed_by_ex[item["example"]["example_id"]] = row
+                else:
+                    rows = run_questions_batch_e0(wrapper, pending_items, ctx, method, stage_dir)
+                    for r in rows:
+                        computed_by_ex[r["example_id"]] = r
+
+            record_completed(list(computed_by_ex.values()))
+            for item in group_items:
+                ex_id = item["example"]["example_id"]
+                rows_by_ex_method[(ex_id, method)] = (
+                    cached_by_ex[ex_id][0] if ex_id in cached_by_ex else computed_by_ex[ex_id]
+                )
+
+            all_rows = [
+                rows_by_ex_method[(ex_id, m)]
+                for ex_id in ordered_ex_ids
+                for m in resolved_methods
+                if (ex_id, m) in rows_by_ex_method
+            ]
+            manifest_data["completed_examples_count"] = end_idx
+            agg_rows = save_e0_progress(
+                output_dir,
+                summaries_dir,
+                ctx["stage"],
+                all_rows,
+                resolved_methods,
+                manifest_data=manifest_data,
+            )
+            print(f"  💾 Saved progress to CSV ({len(all_rows)} rows recorded). Disk synced.", flush=True)
+
+    manifest_data["status"] = "completed"
+    manifest_data["completion_timestamp"] = perf_counter()
+    agg_rows = save_e0_progress(
+        output_dir,
+        summaries_dir,
+        ctx["stage"],
+        all_rows,
+        resolved_methods,
+        manifest_data=manifest_data,
+    )
+    print(f"\n✅ All {total_q} questions completed successfully for E0 methods {list(resolved_methods)}.", flush=True)
+    return all_rows, agg_rows
+
 
