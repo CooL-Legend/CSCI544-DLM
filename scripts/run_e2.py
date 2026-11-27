@@ -18,6 +18,16 @@ Examples:
 
     # Full Evaluation run (all 70 questions):
     python scripts/run_e2.py --stage eval --eval-split all_70 --batch-size 4
+
+    # Primary Test run (200 predetermined test questions) with CMER or SRIG:
+    python scripts/run_e2.py --stage test --test-split primary_200 --reward-mode cmer --batch-size 4
+    python scripts/run_e2.py --stage test --test-split primary_200 --reward-mode srig --batch-size 4
+
+    # Extended Test run (additional 300 test questions, 200..500):
+    python scripts/run_e2.py --stage test --test-split extended_300 --reward-mode cmer --batch-size 4
+
+    # Full 500-question Test run:
+    python scripts/run_e2.py --stage test --test-split all_500 --reward-mode srig --batch-size 4
 """
 
 import argparse
@@ -107,15 +117,21 @@ def main(argv=None) -> int:
     )
     parser.add_argument(
         "--stage",
-        choices=("dev", "eval", "evaluation"),
+        choices=("dev", "eval", "evaluation", "test"),
         default="dev",
-        help="Experiment stage: 'dev' (5 questions) or 'eval'/'evaluation' (up to 70 questions).",
+        help="Experiment stage: 'dev' (5 questions), 'eval'/'evaluation' (up to 70 questions), or 'test' (200 primary / 500 extended).",
     )
     parser.add_argument(
         "--eval-split",
         choices=("canonical_20", "extended_50", "all_70"),
         default="all_70",
         help="Evaluation split slice: 'canonical_20' (first 20 questions), 'extended_50' (questions 20 to 70), or 'all_70' (all 70).",
+    )
+    parser.add_argument(
+        "--test-split",
+        choices=("primary_200", "extended_300", "all_500"),
+        default=None,
+        help="Optional test split slice when --stage test: 'primary_200' (first 200 questions), 'extended_300' (questions 200 to 500), or 'all_500' (all 500).",
     )
     parser.add_argument(
         "--methods",
@@ -215,6 +231,13 @@ def main(argv=None) -> int:
             sample_slice = (20, 70)
         elif args.eval_split == "all_70":
             sample_slice = (0, 70)
+    elif norm_stage == "test" and args.test_split is not None:
+        if args.test_split == "primary_200":
+            sample_slice = (0, 200)
+        elif args.test_split == "extended_300":
+            sample_slice = (200, 500)
+        elif args.test_split == "all_500":
+            sample_slice = (0, 500)
 
     methods = tuple(args.methods)
     budgets = tuple(sorted(args.budgets))
@@ -224,6 +247,8 @@ def main(argv=None) -> int:
     print(f"  Stage          : {args.stage} (normalized: {norm_stage})")
     if norm_stage == "evaluation":
         print(f"  Eval Split     : {args.eval_split} (slice: {sample_slice})")
+    elif norm_stage == "test" and args.test_split is not None:
+        print(f"  Test Split     : {args.test_split} (slice: {sample_slice})")
     print(f"  Configurations : {len(methods) * len(budgets)} ({[f'{m}@{b}' for b in budgets for m in methods]})")
     print(f"  Search Depth   : L_c = {args.max_depth} | Min Candidates C = {args.num_candidates}")
     print(f"  Batch Size     : {args.batch_size} | Resume: {args.resume}")

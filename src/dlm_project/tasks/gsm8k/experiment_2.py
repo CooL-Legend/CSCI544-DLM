@@ -53,11 +53,13 @@ from dlm_project.tasks.gsm8k.evaluation import score_answer
 from dlm_project.tasks.gsm8k.experiment_protocol import (
     E2_EVALUATION_COUNT,
     E2_STAGE_COUNTS,
+    EXTENDED_TEST_COUNT,
     FIXED_DEPTH,
     STAGE_COUNTS,
     build_prompt,
     example_seed,
     get_e2_manifest,
+    get_extended_manifest,
     get_manifest,
     load_shared_protocol,
     select_examples,
@@ -96,14 +98,47 @@ def context(
     if budgets is None:
         budgets = CHECKPOINT_BUDGETS
 
-    manifest = get_e2_manifest(common=common)
     norm_stage = "evaluation" if stage in ("eval", "evaluation") else stage
-    examples = select_examples(manifest, norm_stage, expected_count=E2_STAGE_COUNTS.get(norm_stage, STAGE_COUNTS[norm_stage]))
+    stage_limits = {
+        "dev": STAGE_COUNTS["dev"],
+        "evaluation": E2_EVALUATION_COUNT,
+        "test": EXTENDED_TEST_COUNT,
+    }
+    if norm_stage not in stage_limits:
+        raise ValueError("Stage must be dev, eval, evaluation, or test.")
+    limit = stage_limits[norm_stage]
+
+    if num_samples is not None and (type(num_samples) is not int or not 1 <= num_samples <= limit):
+        raise ValueError(f"num_samples for stage {stage!r} must be an integer from 1 to {limit}.")
+    if sample_slice is not None:
+        if (
+            not isinstance(sample_slice, (tuple, list))
+            or len(sample_slice) != 2
+            or any(type(value) is not int for value in sample_slice)
+            or not 0 <= sample_slice[0] < sample_slice[1] <= limit
+        ):
+            raise ValueError(f"sample_slice for stage {stage!r} must satisfy 0 <= start < end <= {limit}.")
+
+    if norm_stage == "test":
+        requested_end = sample_slice[1] if sample_slice is not None else num_samples
+        if requested_end is not None and requested_end > STAGE_COUNTS["test"]:
+            manifest = get_extended_manifest(common=common, test_count=EXTENDED_TEST_COUNT)
+            expected_count = EXTENDED_TEST_COUNT
+        else:
+            manifest = get_manifest(common=common)
+            expected_count = STAGE_COUNTS["test"]
+    else:
+        manifest = get_e2_manifest(common=common)
+        expected_count = E2_STAGE_COUNTS.get(norm_stage, STAGE_COUNTS[norm_stage])
+
+    examples = select_examples(manifest, norm_stage, expected_count=expected_count)
 
     if sample_slice is not None:
         start, end = sample_slice
         examples = examples[start:end]
-    elif num_samples is not None:
+    if num_samples is not None:
+        if num_samples > len(examples):
+            raise ValueError(f"num_samples={num_samples} exceeds the selected split of {len(examples)} questions.")
         examples = examples[:num_samples]
 
     if not examples:

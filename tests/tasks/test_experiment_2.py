@@ -896,6 +896,136 @@ def test_e2_swd_batched_parity_with_serial(method):
     assert batched_rewards == serial_rewards
 
 
+@pytest.mark.parametrize("reward_mode", ["cmer", "srig"])
+@pytest.mark.parametrize("count", [None, 2, 200, 201, 500])
+def test_e2_test_pool_matches_e1_content_order_and_prompts(reward_mode, count):
+    """Verify E2 test stage (200 primary and 500 extended) aligns 100% with E1 and E0."""
+    from dlm_project.tasks.gsm8k import experiment_0 as e0, experiment_1 as e1
+    from dlm_project.tasks.gsm8k.experiment_protocol import build_prompt, example_seed
+
+    ref_e1 = e1.context(stage="test", num_samples=count)
+    ref_e0 = e0.context(stage="test", methods=("confidence",), num_samples=count)
+    actual = e2.context(stage="test", num_samples=count, reward_mode=reward_mode)
+
+    assert actual["stage"] == actual["norm_stage"] == "test"
+    assert actual["reward_mode"] == reward_mode
+    assert actual["examples"] == ref_e1["examples"] == ref_e0["examples"]
+    assert actual["manifest_hash"] == ref_e1["manifest_hash"] == ref_e0["manifest_hash"]
+    assert actual["manifest"] == ref_e1["manifest"] == ref_e0["manifest"]
+    assert actual["common"] == ref_e1["common"] == ref_e0["common"]
+    assert actual["prompt_template_hash"] == ref_e1["prompt_template_hash"]
+    assert len(actual["examples"]) == (count if count is not None else 200)
+    assert len({row["example_id"] for row in actual["examples"]}) == len(actual["examples"])
+    for row, old in zip(actual["examples"], ref_e1["examples"]):
+        assert build_prompt(row["question"], actual["common"]["prompt"]) == build_prompt(
+            old["question"], ref_e1["common"]["prompt"]
+        )
+        assert example_seed(row["row_id"]) == example_seed(old["row_id"])
+
+
+@pytest.mark.parametrize("reward_mode", ["cmer", "srig"])
+def test_e2_test_slices_primary_200_and_extended_300_equal_full_500(reward_mode):
+    """Verify primary_200 (0..200) + extended_300 (200..500) == full_500 (0..500)."""
+    from dlm_project.tasks.gsm8k import experiment_1 as e1
+
+    ref_500 = e1.context(stage="test", num_samples=500)
+    primary_200 = e2.context(stage="test", sample_slice=(0, 200), reward_mode=reward_mode)
+    extended_300 = e2.context(stage="test", sample_slice=(200, 500), reward_mode=reward_mode)
+    full_500 = e2.context(stage="test", sample_slice=(0, 500), reward_mode=reward_mode)
+
+    assert len(primary_200["examples"]) == 200
+    assert len(extended_300["examples"]) == 300
+    assert primary_200["examples"] + extended_300["examples"] == full_500["examples"]
+    assert full_500["examples"] == ref_500["examples"]
+
+
+@pytest.mark.parametrize("options", [
+    {"stage": "test", "num_samples": 0},
+    {"stage": "test", "num_samples": -1},
+    {"stage": "test", "num_samples": 501},
+    {"stage": "test", "num_samples": True},
+    {"stage": "test", "sample_slice": (-1, 2)},
+    {"stage": "test", "sample_slice": (0, 501)},
+    {"stage": "test", "sample_slice": (10, 10)},
+    {"stage": "unknown"},
+])
+def test_e2_context_rejects_invalid_test_requests(options):
+    with pytest.raises(ValueError):
+        e2.context(**options)
+
+
+@pytest.mark.parametrize("reward_mode", ["cmer", "srig"])
+def test_e2_test_stage_execution_and_resumption(tmp_path, monkeypatch, reward_mode):
+    """Verify end-to-end E2 test stage execution and zero-forward resumption for CMER and SRIG."""
+    monkeypatch.setattr(e2.os, "sync", lambda: None, raising=False)
+    w = mock_wrapper()
+    ctx = e2.context(stage="test", methods=("medal", "ab_medal"), num_samples=2, reward_mode=reward_mode)
+    ctx["common"]["generation"] = {"gen_length": 8, "steps": 8, "block_length": 8}
+    budgets = (4, 8)
+
+    q_rows, agg_rows = e2.run_e2_stage(
+        w,
+        ctx,
+        tmp_path,
+        methods=("medal", "ab_medal"),
+        budgets=budgets,
+        max_depth=4,
+        num_candidates=2,
+        batch_size=2,
+    )
+    assert len(q_rows) == 8
+    assert len(agg_rows) == 4
+    assert all(r["reward_mode"] == reward_mode for r in q_rows)
+    assert (tmp_path / "summaries" / "e2_test_per_question.csv").is_file()
+    assert (tmp_path / "summaries" / "e2_test_aggregate.csv").is_file()
+
+    calls_before = len(w.model.calls)
+    resumed_rows, _ = e2.run_e2_stage(
+        w,
+        ctx,
+        tmp_path,
+        methods=("medal", "ab_medal"),
+        budgets=budgets,
+        max_depth=4,
+        num_candidates=2,
+        batch_size=2,
+        resume=True,
+    )
+    assert len(w.model.calls) == calls_before
+    assert [r["selected_state_hash"] for r in resumed_rows] == [r["selected_state_hash"] for r in q_rows]
+
+
+@pytest.mark.parametrize("filename,expected_mode", [
+    ("E2_Experiment_CMER_Test.ipynb", "cmer"),
+    ("E2_Experiment_SRIG_Test.ipynb", "srig"),
+])
+def test_generated_e2_test_notebooks_are_valid_and_compile(filename, expected_mode):
+    """Verify generated E2 CMER and SRIG Test notebooks pass schema validation and compile."""
+    import nbformat
+    from dlm_project.paths import PROJECT_ROOT
+
+    nb_path = PROJECT_ROOT / "notebooks/gsm8k" / filename
+    assert nb_path.is_file(), f"Missing generated notebook: {nb_path}"
+    notebook = nbformat.read(nb_path, as_version=4)
+    nbformat.validate(notebook)
+
+    full_source = []
+    for idx, cell in enumerate(notebook.cells):
+        if cell.cell_type == "code":
+            compile(cell.source, f"{filename}:cell_{idx}", "exec")
+            full_source.append(cell.source)
+
+    joined = "\n".join(full_source)
+    assert "STAGE = 'test'" in joined
+    assert f"REWARD_MODE = {expected_mode!r}" in joined
+    assert "METHODS = ('medal', 'ab_medal')" in joined
+    assert "BUDGETS = (256, 512)" in joined
+    assert "sample_slice=(0, 200)" in joined
+    assert "sample_slice=(200, 500)" in joined
+    assert "run_e2_stage" in joined
+    assert "analyze_e3_stage" in joined
+
+
 
 
 

@@ -614,8 +614,10 @@ REWARD_NOTEBOOK_SPECS = {
         "symbol_label": "SRIG / $\\text{Future}R_{ig}$",
         "dev_filename": "E2_Experiment_SRIG_Dev.ipynb",
         "eval_filename": "E2_Experiment_SRIG_Eval.ipynb",
+        "test_filename": "E2_Experiment_SRIG_Test.ipynb",
         "dev_output_subdir": "results/e2_srig_dev",
         "eval_output_subdir": "results/e2_srig_eval",
+        "test_output_subdir": "results/e2_srig_test",
         "reward_lambda": 1.0,
         "dev_equation_md": (
             "For each candidate child state $s_i$, search projects the highest-confidence action "
@@ -640,6 +642,10 @@ REWARD_NOTEBOOK_SPECS = {
             "Verify 2-step lookahead SRIG reward computation, state caching, "
             "and batched parity before loading weights."
         ),
+        "unit_test_test_md": (
+            "Verify 2-step lookahead SRIG reward computation, test-split alignment (200 primary and 500 extended manifests), "
+            "state caching, and batched parity before loading weights."
+        ),
         "controls_md": (
             "Configure 5-question frozen `dev` set, matched search budgets [256, 512], "
             "SRIG reward mode with $\\lambda=1.0$, and $4B$ simulation cap."
@@ -647,6 +653,10 @@ REWARD_NOTEBOOK_SPECS = {
         "controls_eval_md": (
             "Configure budgets [256, 512], depth 10, batch size 2, SRIG reward mode, "
             "and load `LLaDA-8B-Instruct` from staged NVMe storage."
+        ),
+        "controls_test_md": (
+            "Configure `test` stage (200 primary + 300 extended = 500 test questions), budgets [256, 512], "
+            "depth 10, batch size 2, SRIG reward mode ($\\lambda=1.0$), and load `LLaDA-8B-Instruct` from staged NVMe storage."
         ),
     },
     "cmer": {
@@ -656,8 +666,10 @@ REWARD_NOTEBOOK_SPECS = {
         "symbol_label": "CMER ($R_{\\mathrm{CMER}}$)",
         "dev_filename": "E2_Experiment_CMER_Dev.ipynb",
         "eval_filename": "E2_Experiment_CMER_Eval.ipynb",
+        "test_filename": "E2_Experiment_CMER_Test.ipynb",
         "dev_output_subdir": "results/e2_cmer_dev",
         "eval_output_subdir": "results/e2_cmer_eval",
+        "test_output_subdir": "results/e2_cmer_test",
         "reward_lambda": 1.0,
         "dev_equation_md": (
             "For parent state $s$, expanded child state $s_i$, and greedy virtual grandchild "
@@ -687,6 +699,10 @@ REWARD_NOTEBOOK_SPECS = {
             "Verify 2-step lookahead CMER reward computation, 1-step CMER fallback, state caching, "
             "and batched parity before loading weights."
         ),
+        "unit_test_test_md": (
+            "Verify 2-step lookahead CMER reward computation, 1-step CMER fallback, test-split alignment (200 primary and 500 extended manifests), "
+            "state caching, and batched parity before loading weights."
+        ),
         "controls_md": (
             "Configure 5-question frozen `dev` set, matched search budgets [256, 512], "
             "CMER reward mode, and $4B$ simulation cap."
@@ -694,6 +710,10 @@ REWARD_NOTEBOOK_SPECS = {
         "controls_eval_md": (
             "Configure budgets [256, 512], depth 10, batch size 2, CMER reward mode, "
             "and load `LLaDA-8B-Instruct` from staged NVMe storage."
+        ),
+        "controls_test_md": (
+            "Configure `test` stage (200 primary + 300 extended = 500 test questions), budgets [256, 512], "
+            "depth 10, batch size 2, CMER reward mode, and load `LLaDA-8B-Instruct` from staged NVMe storage."
         ),
     },
     "swd": {
@@ -1402,6 +1422,434 @@ def _create_e2_reward_eval_notebook(spec: dict):
     print(f"Generated {out_path} ({len(cells)} cells)")
 
 
+def _create_e2_reward_test_notebook(spec: dict) -> Path:
+    mode = spec["mode"]
+    upper = spec["upper"]
+    nb = nbf.v4.new_notebook()
+    cells = []
+
+    # Badge & Header
+    cells.append(nbf.v4.new_markdown_cell(
+        f'<a href="https://colab.research.google.com/github/CooL-Legend/CSCI544-DLM/blob/adi-e2/notebooks/gsm8k/{spec["test_filename"]}" target="_parent"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open in Colab"/></a>'
+    ))
+    cells.append(nbf.v4.new_markdown_cell(
+        f"# Experiment 2: Two-Step Lookahead MEDAL vs. AB-MEDAL on GSM8K with {spec['full_name']} — Test Split (200 Primary + 300 Extended Questions)\n\n"
+        f"This notebook runs **Experiment 2 (E2)** on the predetermined GSM8K `test` split with `LLaDA-8B-Instruct` using the **Two-Step {spec['symbol_label']}** reward function:\n"
+        + spec["dev_equation_md"]
+        + "### Test Dataset Split Organization (Aligned with E0 & E1 Test Runs):\n"
+        "1. **Primary 200 Test Samples** (`sample_slice=(0, 200)`): The exact 200 predetermined test questions from `configs/gsm8k/experiment_samples.json` (`sample_seed=1`).\n"
+        "2. **Extended 300 Test Samples** (`sample_slice=(200, 500)`): 300 additional held-out test questions from `configs/gsm8k/experiment_samples_500.json` under the identical `sample_seed=1` ordering.\n"
+        "3. **Combined 500 Test Samples**: Full 500-question test pool evaluation, Wilson 95% confidence intervals, and paired McNemar statistical tests.\n\n"
+        "### Guardrails & Protocols:\n"
+        "- **Matched Search Budgets**: Continuous search to $B = 512$ with prefix checkpoints at $B \\in \\{256, 512\\}$ across both **MEDAL** and **AB-MEDAL**.\n"
+        "- **Simulation Cap Safeguard ($4B$)**: Capped at $4B$ simulations per question as an exploration runaway safeguard; actual NFE utilization is logged.\n"
+        "- **Virtual Grandchildren ($g_i^*$)**: Evaluated and cached in `cached_analyses` but never attached to the tree or assigned GEN/CONT posteriors.\n"
+        + spec["extra_rule_md"]
+        + "- **Exact Checkpoint Boundaries**: Non-mutating hypothetical boundary snapshots ensure standalone $B=256$ equivalence without altering live tree execution toward $B=512$.\n"
+        "- **Cooperative Varlen FlashAttention-2 Batching & Incremental Google Drive Resumption**: Packs active states across questions in each batch (`BATCH_SIZE = 2` on L4, `4` or `6` on A100) and saves per-question artifacts after every batch so interrupted sessions resume automatically with 0 redundant forward passes.\n"
+    ))
+
+    # Section 1: GPU Hardware
+    cells.append(nbf.v4.new_markdown_cell(
+        "## 1. Verify GPU Hardware\n"
+        "Verify CUDA GPU supporting bfloat16 (recommended: L4 or A100 with $\\ge 22$ GiB VRAM)."
+    ))
+    cells.append(nbf.v4.new_code_cell(
+        "import torch\n\n"
+        "if not torch.cuda.is_available():\n"
+        "    raise RuntimeError('Select a CUDA GPU runtime in Colab (L4 or A100), then reconnect.')\n"
+        "gpu = torch.cuda.get_device_properties(0)\n"
+        "vram_gb = gpu.total_memory / (1024 ** 3)\n"
+        "print(f'GPU: {gpu.name} | Total VRAM: {vram_gb:.2f} GiB')\n"
+        "if vram_gb < 20.0:\n"
+        "    raise RuntimeError('This notebook uses unquantized BF16 weights. Select an L4 or A100 GPU runtime.')\n"
+        "if not torch.cuda.is_bf16_supported():\n"
+        "    raise RuntimeError('This GPU does not support bfloat16 inference.')\n"
+        "print('✓ GPU hardware verification passed.')\n"
+    ))
+
+    # Section 2: Repo Setup
+    cells.append(nbf.v4.new_markdown_cell(
+        "## 2. Repository Setup\n"
+        "Clone or update the GitHub repository on branch `adi-e2`."
+    ))
+    cells.append(nbf.v4.new_code_cell(
+        "from pathlib import Path\n"
+        "import os\n"
+        "import subprocess\n"
+        "import sys\n\n"
+        "IN_COLAB = 'google.colab' in sys.modules\n"
+        "REPO_URL = 'https://github.com/CooL-Legend/CSCI544-DLM.git'\n"
+        "BRANCH = 'adi-e2'\n"
+        "REPO_DIR = Path('/content/CSCI544-DLM') if IN_COLAB else Path.cwd().resolve()\n\n"
+        "if IN_COLAB:\n"
+        "    if not (REPO_DIR / '.git').exists():\n"
+        "        token = os.environ.get('GITHUB_TOKEN', '')\n"
+        "        if not token:\n"
+        "            try:\n"
+        "                from google.colab import userdata\n"
+        "                token = userdata.get('GITHUB_TOKEN')\n"
+        "            except Exception:\n"
+        "                pass\n"
+        "        clone_url = REPO_URL.replace('https://', f'https://{token}@') if token else REPO_URL\n"
+        "        subprocess.run(['git', 'clone', '-b', BRANCH, clone_url, str(REPO_DIR)], check=True)\n"
+        "    else:\n"
+        "        subprocess.run(['git', '-C', str(REPO_DIR), 'fetch', 'origin', BRANCH], check=True)\n"
+        "        subprocess.run(['git', '-C', str(REPO_DIR), 'checkout', BRANCH], check=True)\n"
+        "        subprocess.run(['git', '-C', str(REPO_DIR), 'pull', 'origin', BRANCH], check=True)\n"
+        "    os.chdir(REPO_DIR)\n"
+        "    if str(REPO_DIR / 'src') not in sys.path:\n"
+        "        sys.path.insert(0, str(REPO_DIR / 'src'))\n\n"
+        "print(f'Working directory: {Path.cwd()}')\n"
+    ))
+
+    # Section 3: Dependencies
+    cells.append(nbf.v4.new_markdown_cell(
+        "## 3. Install Dependencies\n"
+        "Install pinned dependencies and editable package."
+    ))
+    cells.append(nbf.v4.new_code_cell(
+        "import site\n"
+        "import subprocess\n"
+        "import sys\n\n"
+        "if IN_COLAB:\n"
+        "    subprocess.run([sys.executable, '-m', 'pip', 'install', '-q', '-r', str(REPO_DIR / 'requirements/llada-colab.txt')], check=True)\n"
+        "    subprocess.run([sys.executable, '-m', 'pip', 'install', '-q', '-e', str(REPO_DIR)], check=True)\n"
+        "    import importlib\n"
+        "    importlib.invalidate_caches()\n"
+        "    user_site = site.getusersitepackages()\n"
+        "    if user_site not in sys.path:\n"
+        "        sys.path.append(user_site)\n"
+        "print('Dependencies installed successfully.')\n"
+    ))
+
+    # Section 4: Unit tests
+    cells.append(nbf.v4.new_markdown_cell(
+        f"## 4. Run Algorithmic Pre-Flight Unit Tests\n{spec['unit_test_test_md']}"
+    ))
+    cells.append(nbf.v4.new_code_cell(
+        "import subprocess\n"
+        "import sys\n\n"
+        "res = subprocess.run(\n"
+        "    [sys.executable, '-m', 'pytest', 'tests/tasks/test_experiment_2.py', '-v'],\n"
+        "    capture_output=True, text=True\n"
+        ")\n"
+        "print(res.stdout)\n"
+        "if res.returncode != 0:\n"
+        "    print(res.stderr)\n"
+        "    raise RuntimeError('Pre-flight E2 unit tests failed!')\n"
+        "print('All E2 algorithmic unit tests passed.')\n"
+    ))
+
+    # Section 5: Mount Drive
+    cells.append(nbf.v4.new_markdown_cell(
+        "## 5. Mount Google Drive & Configure Cache\n"
+        "Mount Google Drive for persistent artifact and model caching."
+    ))
+    cells.append(nbf.v4.new_code_cell(
+        "from pathlib import Path\n"
+        "import os\n\n"
+        "DRIVE_ROOT = Path('/content/drive/MyDrive/CSCI544-DLM')\n"
+        f"OUTPUT_DIR = Path({spec['test_output_subdir']!r})\n\n"
+        "if IN_COLAB:\n"
+        "    from google.colab import drive\n"
+        "    drive.mount('/content/drive')\n"
+        f"    OUTPUT_DIR = DRIVE_ROOT / {spec['test_output_subdir']!r}\n"
+        "    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)\n"
+        "    cache_dir = DRIVE_ROOT / 'cache/huggingface'\n"
+        "    cache_dir.mkdir(parents=True, exist_ok=True)\n"
+        "    os.environ['HF_HOME'] = str(cache_dir)\n"
+        "    os.environ['HUGGINGFACE_HUB_CACHE'] = str(cache_dir)\n\n"
+        "print(f'Output directory: {OUTPUT_DIR.resolve()}')\n"
+    ))
+
+    # Section 6: Controls & Model Loading
+    cells.append(nbf.v4.new_markdown_cell(
+        f"## 6. Experiment Controls & Staged Model Loading\n{spec['controls_test_md']}"
+    ))
+    beta_const = f"REWARD_BETA = {spec['reward_beta']}\n" if "reward_beta" in spec else ""
+    beta_arg = "    reward_beta=REWARD_BETA,\n" if "reward_beta" in spec else ""
+    beta_print = " | β={REWARD_BETA}" if "reward_beta" in spec else ""
+    cells.append(nbf.v4.new_code_cell(
+        "import shutil\n"
+        "import subprocess\n"
+        "import sys\n"
+        "from pathlib import Path\n"
+        "from dlm_project.models.profiles import get_profile\n"
+        "from dlm_project.tasks.gsm8k.experiment_2 import (\n"
+        "    CHECKPOINT_BUDGETS, MAX_SEARCH_DEPTH, MIN_CANDIDATES, context, load_model\n"
+        ")\n\n"
+        "STAGE = 'test'\n"
+        "METHODS = ('medal', 'ab_medal')\n"
+        "BUDGETS = (256, 512)\n"
+        f"REWARD_MODE = {mode!r}\n"
+        f"REWARD_LAMBDA = {spec['reward_lambda']}\n"
+        + beta_const
+        + "SIM_CAP_MULTIPLIER = 4\n"
+        "# On NVIDIA L4 (22.4 GiB VRAM), BATCH_SIZE = 2 is recommended for stability;\n"
+        "# BATCH_SIZE = 4 or 6 is suited for A100 (40/80 GB) or High-RAM runtimes.\n"
+        "BATCH_SIZE = 2\n"
+        "RESUME = True\n\n"
+        "# Load base context on the 500-question test split to initialize model identity\n"
+        "base_ctx = context(\n"
+        "    stage=STAGE,\n"
+        "    methods=METHODS,\n"
+        "    budgets=BUDGETS,\n"
+        "    sample_slice=(0, 500),\n"
+        "    reward_mode=REWARD_MODE,\n"
+        "    reward_lambda=REWARD_LAMBDA,\n"
+        + beta_arg
+        + "    sim_cap_multiplier=SIM_CAP_MULTIPLIER,\n"
+        ")\n\n"
+        "profile = get_profile('llada')\n"
+        "model_name = profile['repo_id'].split('/')[-1]\n"
+        "drive_model_dir = DRIVE_ROOT / 'models' / model_name\n"
+        "runtime_model_dir = Path('/content/models') / model_name\n\n"
+        "# Fast local NVMe cache in Colab runtime if available on Drive (or cache to Drive first)\n"
+        "if IN_COLAB:\n"
+        "    if not (drive_model_dir / 'config.json').is_file() and not (runtime_model_dir / 'config.json').is_file():\n"
+        "        subprocess.run([\n"
+        "            sys.executable, '-u', str(REPO_DIR / 'scripts/cache_model.py'),\n"
+        "            '--model', 'llada', '--drive-dir', str(drive_model_dir),\n"
+        "            '--runtime-dir', str(runtime_model_dir),\n"
+        "        ], check=True)\n"
+        "    elif drive_model_dir.is_dir() and not (runtime_model_dir / 'config.json').is_file():\n"
+        "        print(f'Copying model from Google Drive to local fast runtime storage: {runtime_model_dir}...')\n"
+        "        shutil.copytree(drive_model_dir, runtime_model_dir)\n\n"
+        "MODEL_PATH = str(runtime_model_dir if runtime_model_dir.is_dir() else (drive_model_dir if drive_model_dir.is_dir() else profile['repo_id']))\n"
+        "print('Using model location:', MODEL_PATH)\n"
+        "print('Loading LLaDA-8B-Instruct wrapper on GPU in bfloat16...')\n"
+        "wrapper = load_model(base_ctx, model_path=MODEL_PATH, device='cuda', local_files_only=Path(MODEL_PATH).is_dir())\n"
+        "print(f'✓ Model loaded: {wrapper.identity[\"family\"]} ({wrapper.identity[\"repo_id\"]} @ {wrapper.identity[\"revision\"]})')\n"
+        f"print(f'✓ Stage: {{STAGE}} | Methods: {{METHODS}} | Budgets: {{BUDGETS}} | Reward: {{REWARD_MODE}} (λ={{REWARD_LAMBDA}}{beta_print}) | Sim Cap: {{SIM_CAP_MULTIPLIER}}B | Total Test Pool: {{len(base_ctx[\"examples\"])}} questions | Batch Size: {{BATCH_SIZE}}')\n"
+    ))
+
+    # Section 7: Run Primary 200 Test Samples
+    cells.append(nbf.v4.new_markdown_cell(
+        "## 7. Execute Part 1: Primary Test Set (Original 200 Test Questions)\n"
+        "Evaluates the exact 200 predetermined test questions (`sample_slice=(0, 200)`) from `configs/gsm8k/experiment_samples.json`."
+    ))
+    cells.append(nbf.v4.new_code_cell(
+        "from time import perf_counter\n"
+        "from dlm_project.tasks.gsm8k.experiment_2 import run_e2_stage\n\n"
+        "ctx_200 = context(\n"
+        "    stage=STAGE,\n"
+        "    methods=METHODS,\n"
+        "    budgets=BUDGETS,\n"
+        "    sample_slice=(0, 200),\n"
+        "    reward_mode=REWARD_MODE,\n"
+        "    reward_lambda=REWARD_LAMBDA,\n"
+        + beta_arg
+        + "    sim_cap_multiplier=SIM_CAP_MULTIPLIER,\n"
+        ")\n"
+        "ctx_200['setup'] = dict(base_ctx.get('setup', {}))\n"
+        f"print('Starting Part 1 (Primary 200 Test Questions) with E2 {upper} reward...')\n"
+        "t0 = perf_counter()\n"
+        "q_rows_200, agg_rows_200 = run_e2_stage(\n"
+        "    wrapper,\n"
+        "    ctx_200,\n"
+        "    OUTPUT_DIR / 'primary_200',\n"
+        "    methods=METHODS,\n"
+        "    budgets=BUDGETS,\n"
+        "    max_depth=MAX_SEARCH_DEPTH,\n"
+        "    num_candidates=MIN_CANDIDATES,\n"
+        "    resume=RESUME,\n"
+        "    batch_size=BATCH_SIZE,\n"
+        ")\n"
+        "print(f'Part 1 Complete in {(perf_counter() - t0) / 60:.2f} minutes ({len(q_rows_200)} checkpoint outcomes).')\n"
+    ))
+
+    # Section 8: Run Extended 300 Test Samples
+    cells.append(nbf.v4.new_markdown_cell(
+        "## 8. Execute Part 2: Extended Test Set (Additional 300 Test Questions)\n"
+        "Evaluates the additional 300 predetermined test questions (`sample_slice=(200, 500)`) from `configs/gsm8k/experiment_samples_500.json`."
+    ))
+    cells.append(nbf.v4.new_code_cell(
+        "ctx_300 = context(\n"
+        "    stage=STAGE,\n"
+        "    methods=METHODS,\n"
+        "    budgets=BUDGETS,\n"
+        "    sample_slice=(200, 500),\n"
+        "    reward_mode=REWARD_MODE,\n"
+        "    reward_lambda=REWARD_LAMBDA,\n"
+        + beta_arg
+        + "    sim_cap_multiplier=SIM_CAP_MULTIPLIER,\n"
+        ")\n"
+        "ctx_300['setup'] = dict(base_ctx.get('setup', {}))\n"
+        f"print('Starting Part 2 (Extended 300 Test Questions) with E2 {upper} reward...')\n"
+        "t0 = perf_counter()\n"
+        "q_rows_300, agg_rows_300 = run_e2_stage(\n"
+        "    wrapper,\n"
+        "    ctx_300,\n"
+        "    OUTPUT_DIR / 'extended_300',\n"
+        "    methods=METHODS,\n"
+        "    budgets=BUDGETS,\n"
+        "    max_depth=MAX_SEARCH_DEPTH,\n"
+        "    num_candidates=MIN_CANDIDATES,\n"
+        "    resume=RESUME,\n"
+        "    batch_size=BATCH_SIZE,\n"
+        ")\n"
+        "print(f'Part 2 Complete in {(perf_counter() - t0) / 60:.2f} minutes ({len(q_rows_300)} checkpoint outcomes).')\n"
+    ))
+
+    # Section 9: Aggregate & Paired Results
+    cells.append(nbf.v4.new_markdown_cell(
+        "## 9. Results & Paired Comparisons (Primary 200, Extended 300, and Combined 500 Test Questions)\n"
+        "Display aggregate accuracy, Wilson 95% confidence intervals, NFE utilization, and paired McNemar exact tests comparing AB-MEDAL vs. MEDAL across Primary 200, Extended 300, and Combined 500 test questions."
+    ))
+    cells.append(nbf.v4.new_code_cell(
+        "import pandas as pd\n"
+        "from IPython.display import display\n"
+        "from scripts.run_e2 import compute_paired_comparison\n"
+        "from dlm_project.experiments.sweep_report import write_csv\n"
+        "from dlm_project.tasks.gsm8k.experiment_2 import compute_e2_aggregate_rows\n\n"
+        "summaries_dir = OUTPUT_DIR / 'summaries'\n"
+        "summaries_dir.mkdir(parents=True, exist_ok=True)\n\n"
+        "agg_cols = [\n"
+        "    'search_budget', 'method', 'sample_count', 'accuracy_percent',\n"
+        "    'ci_95_low', 'ci_95_high', 'parse_rate', 'mean_nfe_utilization',\n"
+        "    'mean_search_nfe', 'mean_completion_nfe', 'mean_total_nfe',\n"
+        "    'mean_selected_depth', 'mean_total_wall_seconds',\n"
+        "]\n"
+        "paired_cols = [\n"
+        "    'search_budget', 'paired_questions', 'medal_accuracy', 'ab_medal_accuracy',\n"
+        "    'accuracy_delta_percent', 'ab_medal_only_correct', 'medal_only_correct', 'mcnemar_exact_p',\n"
+        "]\n\n"
+        "combined_q_rows = q_rows_200 + q_rows_300\n"
+        "combined_agg_rows = compute_e2_aggregate_rows(combined_q_rows, STAGE, METHODS, BUDGETS)\n\n"
+        "for title, rows, agg, slug in [\n"
+        "    ('Part 1: Primary 200 Test Questions', q_rows_200, agg_rows_200, 'primary_200'),\n"
+        "    ('Part 2: Extended 300 Test Questions', q_rows_300, agg_rows_300, 'extended_300'),\n"
+        "    ('Combined Pool: All 500 Test Questions', combined_q_rows, combined_agg_rows, 'combined_500'),\n"
+        "]:\n"
+        "    if rows:\n"
+        f"        write_csv(summaries_dir / f'e2_{mode}_{{slug}}_per_question.csv', rows)\n"
+        "    if agg:\n"
+        f"        write_csv(summaries_dir / f'e2_{mode}_{{slug}}_aggregate.csv', agg)\n"
+        "        df_agg = pd.DataFrame(agg)\n"
+        "        print(f'=== {title} Aggregate Metrics ===')\n"
+        "        display(df_agg[[c for c in agg_cols if c in df_agg.columns]])\n"
+        "    paired = compute_paired_comparison(rows, budgets=BUDGETS)\n"
+        "    if paired:\n"
+        "        df_paired = pd.DataFrame(paired)\n"
+        "        print(f'=== {title} Paired Comparison (AB-MEDAL vs. MEDAL) ===')\n"
+        "        display(df_paired[[c for c in paired_cols if c in df_paired.columns]])\n"
+        f"        write_csv(summaries_dir / f'e2_{mode}_{{slug}}_paired_comparison.csv', paired)\n\n"
+        "if combined_q_rows:\n"
+        f"    write_csv(summaries_dir / 'e2_{mode}_test_per_question.csv', combined_q_rows)\n"
+        "    write_csv(summaries_dir / 'e2_test_per_question.csv', combined_q_rows)\n"
+        "if combined_agg_rows:\n"
+        f"    write_csv(summaries_dir / 'e2_{mode}_test_aggregate.csv', combined_agg_rows)\n"
+        "    write_csv(summaries_dir / 'e2_test_aggregate.csv', combined_agg_rows)\n"
+        "paired_combined = compute_paired_comparison(combined_q_rows, budgets=BUDGETS)\n"
+        "if paired_combined:\n"
+        f"    write_csv(summaries_dir / 'e2_{mode}_test_paired_comparison.csv', paired_combined)\n"
+        "    write_csv(summaries_dir / 'e2_test_paired_comparison.csv', paired_combined)\n"
+    ))
+
+    # Section 10: Interactive Search Tree & Decision Trace Inspector
+    cells.append(nbf.v4.new_markdown_cell(
+        "## 10. Interactive Search Tree & Decision Trace Inspector\n"
+        "Inspect the search tree topology, candidate nodes, and decision trace for any evaluated test question."
+    ))
+    cells.append(nbf.v4.new_code_cell(
+        "from dlm_project.tasks.gsm8k.tree_viz import print_ascii_tree, summarize_decision_trace\n"
+        "import json\n\n"
+        "INSPECT_SPLIT = 'primary_200'  # 'primary_200' or 'extended_300'\n"
+        "INSPECT_QUESTION_IDX = 0\n"
+        "INSPECT_BUDGET = 256  # 256 or 512\n\n"
+        "split_ctx = ctx_200 if INSPECT_SPLIT == 'primary_200' else ctx_300\n"
+        "sample_ex_id = split_ctx['examples'][INSPECT_QUESTION_IDX]['example_id']\n"
+        "chk_dir = OUTPUT_DIR / INSPECT_SPLIT / STAGE / 'ab_medal' / sample_ex_id / f'checkpoints/{INSPECT_BUDGET}'\n"
+        "tree_json = chk_dir / 'tree.json'\n"
+        "metrics_json = chk_dir / 'metrics.json'\n\n"
+        "if tree_json.is_file():\n"
+        "    print(f'=== AB-MEDAL Search Tree at B={INSPECT_BUDGET} for {sample_ex_id} ===')\n"
+        "    print(print_ascii_tree(tree_json, max_depth=5, max_children_per_node=3))\n\n"
+        "if metrics_json.is_file():\n"
+        "    met = json.loads(metrics_json.read_text())\n"
+        "    print(f'=== Checkpoint Metrics ({sample_ex_id} @ B={INSPECT_BUDGET}) ===')\n"
+        "    print(f'  Selected Node: {met[\"selected_node_id\"]} | Depth: {met[\"selected_depth\"]} | Q: {met[\"selected_q\"]:.4f}')\n"
+        "    print(f'  Exact Match: {met[\"exact_match\"]} | Pred: {met[\"predicted_answer\"]} | Ref: {met[\"reference_answer\"]}')\n"
+        "    print(f'  NFE Utilization: {met.get(\"nfe_utilization\", 1.0)*100:.1f}% | Sims: {met.get(\"simulations_completed\", \"N/A\")}/{met.get(\"simulation_cap\", \"N/A\")}')\n"
+    ))
+
+    # Section 11: E3 Offline Metric Extraction & Publication Figures
+    cells.append(nbf.v4.new_markdown_cell(
+        "## 11. E3 Offline Metric Extraction & Publication Figures\n"
+        "Run offline tree allocation, branching dynamics, and structural analysis on saved test checkpoints (zero GPU compute), and generate 6 publication figures."
+    ))
+    cells.append(nbf.v4.new_code_cell(
+        "import shutil\n"
+        "from dlm_project.tasks.gsm8k.e3_analysis import analyze_e3_stage\n"
+        "from IPython.display import Image, display, Markdown\n\n"
+        "# Build combined trace directory linking primary_200 and extended_300\n"
+        "combined_results_dir = OUTPUT_DIR / 'combined_500' / STAGE\n"
+        "combined_results_dir.mkdir(parents=True, exist_ok=True)\n"
+        "for part_dir in [OUTPUT_DIR / 'primary_200' / STAGE, OUTPUT_DIR / 'extended_300' / STAGE]:\n"
+        "    if part_dir.is_dir():\n"
+        "        for m in METHODS:\n"
+        "            m_src = part_dir / m\n"
+        "            if m_src.is_dir():\n"
+        "                m_dst = combined_results_dir / m\n"
+        "                m_dst.mkdir(parents=True, exist_ok=True)\n"
+        "                for q_dir in m_src.iterdir():\n"
+        "                    if q_dir.is_dir() and not (m_dst / q_dir.name).exists():\n"
+        "                        try:\n"
+        "                            (m_dst / q_dir.name).symlink_to(q_dir.resolve(), target_is_directory=True)\n"
+        "                        except OSError:\n"
+        "                            shutil.copytree(q_dir, m_dst / q_dir.name)\n\n"
+        "# Select results directory: combined_500 if populated, else primary_200\n"
+        "has_combined = any((combined_results_dir / m).is_dir() and any((combined_results_dir / m).iterdir()) for m in METHODS)\n"
+        "test_results_dir = combined_results_dir if has_combined else (OUTPUT_DIR / 'primary_200' / STAGE)\n"
+        "e3_output_dir = OUTPUT_DIR / ('combined_500' if has_combined else 'primary_200') / 'summaries'\n"
+        "e3_output_dir.mkdir(parents=True, exist_ok=True)\n\n"
+        "print(f'Running E3 Offline Tree Analysis on {test_results_dir}...')\n"
+        "e3_q, e3_agg = analyze_e3_stage(\n"
+        "    results_dir=test_results_dir,\n"
+        "    output_dir=e3_output_dir,\n"
+        "    stage=STAGE,\n"
+        "    methods=tuple(METHODS),\n"
+        "    budgets=tuple(BUDGETS),\n"
+        ")\n"
+        "print(f'✓ E3 Analysis Completed successfully: {len(e3_q)} question outcomes evaluated.')\n\n"
+        "figures_dir = e3_output_dir / 'e3_figures'\n"
+        "fig_titles = {\n"
+        "    'fig1_nfe_by_depth': 'Figure 1: NFE Allocation by Tree Depth — MEDAL vs AB-MEDAL across budgets',\n"
+        "    'fig2_branching_factors': 'Figure 2: Branching Factor Distribution — Children per expanded parent',\n"
+        "    'fig3_candidate_density': 'Figure 3: Candidate Density vs Depth — Minimum-C availability and selection depth',\n"
+        "    'fig4_root_subtrees': 'Figure 4: Root-Subtree Compute Concentration — Search effort across root branches',\n"
+        "    'fig5_reward_redundancy': 'Figure 5: Reward and Search Redundancy — Negative IG rates and duplicate states',\n"
+        "    'fig6_accuracy_vs_budget': 'Figure 6: Accuracy vs Search Budget — Performance scaling curve',\n"
+        "}\n\n"
+        "for fig_key, title in fig_titles.items():\n"
+        "    png_path = figures_dir / f'{fig_key}.png'\n"
+        "    if png_path.is_file():\n"
+        "        display(Markdown(f'### {title}'))\n"
+        "        display(Image(filename=str(png_path), width=750))\n"
+    ))
+
+    # Section 12: Drive Flush
+    cells.append(nbf.v4.new_markdown_cell(
+        "## 12. Synchronize All Artifacts to Google Drive\n"
+        "Flush and sync all in-flight buffers to Google Drive."
+    ))
+    cells.append(nbf.v4.new_code_cell(
+        "if IN_COLAB:\n"
+        "    from google.colab import drive\n"
+        "    drive.flush_and_unmount()\n"
+        "    print('Google Drive flushed successfully.')\n"
+    ))
+
+    nb.cells = cells
+    out_path = NOTEBOOKS_DIR / spec["test_filename"]
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w") as f:
+        nbf.write(nb, f)
+    print(f"Generated {out_path} ({len(cells)} cells)")
+    return out_path
+
+
 def create_e2_srig_dev_notebook():
     _create_e2_reward_dev_notebook(REWARD_NOTEBOOK_SPECS["srig"])
 
@@ -1410,12 +1858,20 @@ def create_e2_srig_eval_notebook():
     _create_e2_reward_eval_notebook(REWARD_NOTEBOOK_SPECS["srig"])
 
 
+def create_e2_srig_test_notebook():
+    return _create_e2_reward_test_notebook(REWARD_NOTEBOOK_SPECS["srig"])
+
+
 def create_e2_cmer_dev_notebook():
     _create_e2_reward_dev_notebook(REWARD_NOTEBOOK_SPECS["cmer"])
 
 
 def create_e2_cmer_eval_notebook():
     _create_e2_reward_eval_notebook(REWARD_NOTEBOOK_SPECS["cmer"])
+
+
+def create_e2_cmer_test_notebook():
+    return _create_e2_reward_test_notebook(REWARD_NOTEBOOK_SPECS["cmer"])
 
 
 def create_e2_swd_dev_notebook():
@@ -1431,8 +1887,10 @@ def main():
     create_e2_eval_notebook()
     create_e2_srig_dev_notebook()
     create_e2_srig_eval_notebook()
+    create_e2_srig_test_notebook()
     create_e2_cmer_dev_notebook()
     create_e2_cmer_eval_notebook()
+    create_e2_cmer_test_notebook()
     create_e2_swd_dev_notebook()
     create_e2_swd_eval_notebook()
 
