@@ -1,4 +1,4 @@
-"""E2 SWD uses the same frozen test questions and prompts as E1 on CARC."""
+"""E2 SWD and CMER use the same frozen test questions and prompts as E1 on CARC."""
 
 import csv
 import json
@@ -13,9 +13,10 @@ from tests.tasks.test_experiment_1 import mock_wrapper
 
 
 @pytest.mark.parametrize("count", [None, 2, 200, 201, 500])
-def test_test_pool_matches_e1_content_order_and_prompts(count):
+@pytest.mark.parametrize("reward_mode", ["swd", "cmer"])
+def test_test_pool_matches_e1_content_order_and_prompts(count, reward_mode):
     reference = e1.context(stage="test", num_samples=count)
-    actual = e2.context(stage="test", num_samples=count, reward_mode="swd")
+    actual = e2.context(stage="test", num_samples=count, reward_mode=reward_mode)
     assert actual["stage"] == actual["norm_stage"] == "test"
     assert actual["examples"] == reference["examples"]
     assert actual["manifest_hash"] == reference["manifest_hash"]
@@ -28,10 +29,19 @@ def test_test_pool_matches_e1_content_order_and_prompts(count):
         assert build_prompt(row["question"], actual["common"]["prompt"]) == build_prompt(
             old["question"], reference["common"]["prompt"])
         assert example_seed(row["row_id"]) == example_seed(old["row_id"])
-    assert actual["reward_mode"] == "swd"
+    assert actual["reward_mode"] == reward_mode
     assert actual["reward_lambda"] == actual["reward_beta"] == 1.0
     assert actual["sim_cap_multiplier"] == 4
     assert actual["budgets"] == [256, 512]
+
+
+def test_cmer_single_run_preserves_notebook_200_plus_300_order_and_batch_boundaries():
+    full = e2.context(stage="test", num_samples=500, reward_mode="cmer")["examples"]
+    primary = e2.context(stage="test", sample_slice=(0, 200), reward_mode="cmer")["examples"]
+    extended = e2.context(stage="test", sample_slice=(200, 500), reward_mode="cmer")["examples"]
+    assert full == primary + extended
+    batches = lambda rows: [rows[i:i + 8] for i in range(0, len(rows), 8)]
+    assert batches(full) == batches(primary) + batches(extended)
 
 
 def test_existing_eval_splits_and_prefix_limit_remain_distinct_from_test():
@@ -86,7 +96,8 @@ def _fake_checkpoint_rows(ctx, methods, budgets):
     ]
 
 
-def test_cli_forwards_500_swd_test_settings_and_reports_test_artifacts(tmp_path, monkeypatch):
+@pytest.mark.parametrize("reward_mode", ["swd", "cmer"])
+def test_cli_forwards_500_test_settings_and_reports_test_artifacts(tmp_path, monkeypatch, reward_mode):
     loads, runs, offline, reporting = [], [], [], []
     wrapper = SimpleNamespace()
 
@@ -110,7 +121,7 @@ def test_cli_forwards_500_swd_test_settings_and_reports_test_artifacts(tmp_path,
     assert cli.main([
         "--stage", "test", "--num-samples", "500", "--batch-size", "8",
         "--methods", "medal", "ab_medal", "--budgets", "256", "512",
-        "--reward-mode", "swd", "--reward-beta", "1.0", "--reward-lambda", "1.0",
+        "--reward-mode", reward_mode, "--reward-lambda", "1.0",
         "--sim-cap-multiplier", "4", "--max-depth", "10", "--num-candidates", "3",
         "--device", "cpu", "--model-path", "/prepared/llada", "--local-files-only",
         "--run-e3", "--profile-resources", "--output-dir", str(tmp_path),
@@ -120,7 +131,7 @@ def test_cli_forwards_500_swd_test_settings_and_reports_test_artifacts(tmp_path,
     ctx, directory, kwargs = runs[0]
     assert len(ctx["examples"]) == 500
     assert ctx["examples"] == e1.context(stage="test", num_samples=500)["examples"]
-    assert ctx["reward_mode"] == "swd"
+    assert ctx["reward_mode"] == reward_mode
     assert ctx["reward_beta"] == ctx["reward_lambda"] == 1.0
     assert ctx["sim_cap_multiplier"] == 4
     assert loads[0][1] == {"model_path": "/prepared/llada", "device": "cpu", "local_files_only": True}
@@ -156,22 +167,33 @@ def test_cli_rejects_eval_split_for_test_before_model_loading(monkeypatch):
         cli.main(["--stage", "test", "--eval-split", "extended_50", "--device", "cpu"])
 
 
-def test_test_stage_swd_saves_completion_markers_and_resumes_without_forwards(tmp_path, monkeypatch):
+@pytest.mark.parametrize("reward_mode", ["swd", "cmer"])
+def test_test_stage_saves_trees_and_resumes_without_forwards(tmp_path, monkeypatch, reward_mode):
     wrapper = mock_wrapper()
-    ctx = e2.context(stage="test", num_samples=2, reward_mode="swd")
+    ctx = e2.context(stage="test", num_samples=2, reward_mode=reward_mode)
     ctx["common"]["generation"] = {"gen_length": 8, "steps": 8, "block_length": 8}
     monkeypatch.setattr(e2.os, "sync", lambda: None, raising=False)
     options = {"methods": ("medal", "ab_medal"), "budgets": (4, 8),
                "max_depth": 4, "num_candidates": 2, "batch_size": 2}
     rows, aggregate = e2.run_e2_stage(wrapper, ctx, tmp_path, **options)
     assert len(rows) == 8 and len(aggregate) == 4
-    assert all(row["reward_mode"] == "swd" and row["reward_beta"] == 1.0 for row in rows)
+    assert all(row["reward_mode"] == reward_mode and row["reward_beta"] == 1.0 for row in rows)
+    for row in rows:
+        question_dir = tmp_path / "test" / row["method"] / row["example_id"]
+        assert (question_dir / "trace.jsonl").stat().st_size > 0
+        assert (question_dir / "nodes.jsonl").stat().st_size > 0
+        tree = json.loads((question_dir / "checkpoints" / str(row["search_budget"]) / "tree.json").read_text())
+        nodes = {node["node_id"]: node for node in tree["nodes"]}
+        assert row["selected_node_id"] in nodes
+        assert sum(node["parent_id"] is None for node in nodes.values()) == 1
+        assert all(node["parent_id"] is None or node["parent_id"] in nodes for node in nodes.values())
+        assert all(node["state"] for node in nodes.values())
     for example in ctx["examples"]:
         for method in options["methods"]:
             assert e2.is_question_complete(tmp_path / "test", method, example["example_id"], options["budgets"])
     manifest = json.loads((tmp_path / "run_manifest.json").read_text())
     assert manifest["stage"] == "test" and manifest["status"] == "completed"
-    assert manifest["reward_mode"] == "swd" and manifest["reward_beta"] == 1.0
+    assert manifest["reward_mode"] == reward_mode and manifest["reward_beta"] == 1.0
     assert (tmp_path / "summaries/e2_test_aggregate.csv").is_file()
     assert (tmp_path / "summaries/e2_test_per_question.csv").is_file()
     monkeypatch.setattr(type(wrapper.model), "__call__", lambda *args, **kwargs: pytest.fail("Resumed completed example performed inference"))

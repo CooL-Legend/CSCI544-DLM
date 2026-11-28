@@ -220,6 +220,73 @@ measurements for the new SWD run rather than treating E1 measurements as SWD
 measurements. This direct launcher does not depend on the separate benchmark
 gate described below.
 
+## Group 37: two-step CMER on the same 500 test questions
+
+`scripts/run_carc_e2_cmer_test.sbatch` adapts the
+[CMER Test notebook on `adi-e2`](https://github.com/CooL-Legend/CSCI544-DLM/blob/08efc305b35311c3643eb77f1a8b6b0ac8e86c7c/notebooks/gsm8k/E2_Experiment_CMER_Test.ipynb).
+It combines the notebook's primary 200 and extended 300 questions into one
+500-question run, preserving their order and the same frozen test pool as E1
+and SWD. Batch size is increased from the notebook's 2 to the requested 8.
+
+The search uses **CMER: common-mask entropy reduction**, with the notebook's
+two-step lookahead, one-step fallback, and standard LLaDA confidence completion.
+Both MEDAL and AB-MEDAL run at checkpoints 256 and 512, with maximum depth 10,
+minimum 3 candidates and simulation cap `4 * B`. Lambda `1.0` is passed for
+notebook consistency but does not enter the CMER reward formula.
+
+The launcher defaults to **500 questions, batch 8, one A40, 48 hours**, account
+`xiangren_1987`, partition `gpu`, 4 CPUs and 64 GB host RAM. It reuses:
+
+| Setting | Path |
+| --- | --- |
+| Environment | `/project2/xiangren_1987/group_37/envs/dlm` |
+| Model | `/project2/xiangren_1987/group_37/model-cache` |
+| Dataset cache | `/project2/xiangren_1987/group_37/datasets` |
+| Results | `REPO_DIR/results/e2_cmer_test_500` |
+| Slurm logs | `results/slurm/e2-cmer-<jobid>.out` and `.err` |
+
+Questions and answers are read from repository manifests. No environment
+installation or model/dataset download takes place. The same path overrides
+and writable runtime metadata directory as the SWD launcher are supported.
+
+Submit the full experiment from the repository root:
+
+```bash
+cd /home1/xchen664/CSCI544-DLM
+mkdir -p results/slurm
+sbatch scripts/run_carc_e2_cmer_test.sbatch 500 8
+```
+
+For a separate two-question smoke run:
+
+```bash
+ARTIFACT_ROOT="$PWD/results/e2_cmer_debug_smoke" sbatch \
+  --partition=debug --gpus-per-task=a40:1 --time=01:00:00 \
+  --job-name=e2-cmer-smoke scripts/run_carc_e2_cmer_test.sbatch 2 2
+```
+
+Results use the same E2/E3 layout as SWD, in the separate CMER directory:
+
+- `summaries/e2_test_aggregate.csv`: accuracy, NFE and timing by method/budget.
+- `summaries/e2_test_paired_comparison.csv`: paired MEDAL/AB-MEDAL comparisons.
+- `summaries/e2_test_per_question.csv`: predictions and scores for each outcome.
+- `test/<method>/<example_id>/checkpoints/<budget>/tree.json`: checkpoint trees
+  with node states, parent/child links, actions, rewards, visits and Q values.
+- Per-question `nodes.jsonl`, `trace.jsonl`, checkpoint completions, offline E3
+  diagnostics and resource profiles are also retained.
+
+A complete run produces four aggregate rows with `sample_count=500`, two paired
+rows with `paired_questions=500`, and 2,000 checkpoint trees. Check that
+`run_manifest.json` reports `completed` and Slurm reports `COMPLETED`, exit `0:0`.
+The shared E3 labels such as "Negative IG" refer to CMER immediate rewards for
+this run; virtual lookahead states are not all attached search-tree nodes.
+
+Resume is enabled. After a timeout, resubmit with the **same output directory,
+batch size and source/configuration**. Completed compatible question/method
+results are reused; interrupted searches are recomputed. Use a separate
+directory for smoke runs or changed settings. A two-question smoke run verifies
+the pipeline, not full batch-8 GPU memory or runtime.
+
 ## Existing notebook and benchmark workflow
 
 The sections below retain the original Jupyter and measured-pilot/production
